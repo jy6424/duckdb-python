@@ -13,6 +13,7 @@ This module wraps the scikit-build-core build backend because:
 Also see https://peps.python.org/pep-0517/#in-tree-build-backends.
 """
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -239,10 +240,13 @@ def build_wheel(
         config_settings = config_settings or {}
         duckdb_version = _read_duckdb_long_version()
     elif _FORCED_PEP440_VERSION is not None:
-        duckdb_version = pep440_to_git_tag(strip_post_from_version(_FORCED_PEP440_VERSION))
+        duckdb_version = os.getenv("OVERRIDE_GIT_DESCRIBE") or pep440_to_git_tag(
+            strip_post_from_version(_FORCED_PEP440_VERSION)
+        )
 
     # We add the found version to the OVERRIDE_GIT_DESCRIBE cmake var
     if duckdb_version is not None:
+        config_settings = config_settings or {}
         _skbuild_config_add(_SKBUILD_CMAKE_OVERRIDE_GIT_DESCRIBE, duckdb_version, config_settings)
         _log(f"{_SKBUILD_CMAKE_OVERRIDE_GIT_DESCRIBE} set to {duckdb_version}")
     else:

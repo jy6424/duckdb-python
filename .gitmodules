@@ -1,6 +1,6 @@
 [submodule "external/duckdb"]
 	path = external/duckdb
-	url = https://github.com/duckdb/duckdb.git
-	branch = main
+	url = https://github.com/jy6424/duckdb.git
+	branch = gpu-offload
 [submodule]
 	recurse = true
