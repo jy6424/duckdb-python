@@ -113,6 +113,7 @@ extern "C" int duckdb_gpu_probe_i64(const int64_t *keys, const uint8_t *validity
 	uint32_t *d_probe_sel = nullptr;
 	uint32_t *d_build_sel = nullptr;
 	unsigned long long *d_count = nullptr;
+	unsigned long long result_count = 0;
 
 	const auto keys_bytes = count * sizeof(int64_t);
 	const auto validity_bytes = count * sizeof(uint8_t);
@@ -153,7 +154,6 @@ extern "C" int duckdb_gpu_probe_i64(const int64_t *keys, const uint8_t *validity
 		goto cleanup;
 	}
 
-	unsigned long long result_count = 0;
 	error |= CheckCuda(cudaMemcpy(&result_count, d_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost),
 	                   "copy count to host");
 	if (error || result_count > count) {
@@ -193,6 +193,7 @@ extern "C" int duckdb_gpu_groupby_count(const uint64_t *addresses, const uint8_t
 	uint64_t *d_unique_addresses = nullptr;
 	uint64_t *d_counts = nullptr;
 	unsigned long long *d_unique_count = nullptr;
+	unsigned long long result_count = 0;
 
 	const auto addresses_bytes = count * sizeof(uint64_t);
 	const auto validity_bytes = count * sizeof(uint8_t);
@@ -229,7 +230,6 @@ extern "C" int duckdb_gpu_groupby_count(const uint64_t *addresses, const uint8_t
 		goto cleanup;
 	}
 
-	unsigned long long result_count = 0;
 	error |= CheckCuda(cudaMemcpy(&result_count, d_unique_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost),
 	                   "copy groupby count unique count to host");
 	if (error || result_count > count) {
@@ -270,6 +270,7 @@ extern "C" int duckdb_gpu_probe_u16(const uint16_t *keys, const uint8_t *validit
 	uint32_t *d_probe_sel = nullptr;
 	uint32_t *d_build_sel = nullptr;
 	unsigned long long *d_count = nullptr;
+	unsigned long long result_count = 0;
 
 	const auto keys_bytes = count * sizeof(uint16_t);
 	const auto validity_bytes = count * sizeof(uint8_t);
@@ -310,7 +311,6 @@ extern "C" int duckdb_gpu_probe_u16(const uint16_t *keys, const uint8_t *validit
 		goto cleanup;
 	}
 
-	unsigned long long result_count = 0;
 	error |= CheckCuda(cudaMemcpy(&result_count, d_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost),
 	                   "copy u16 count to host");
 	if (error || result_count > count) {
