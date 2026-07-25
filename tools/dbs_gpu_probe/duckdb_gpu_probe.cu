@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 
 namespace {
 
@@ -95,13 +96,14 @@ int CheckCuda(cudaError_t status, const char *step) {
 	return 1;
 }
 
-struct DeviceBuffer {
-	void *ptr = nullptr;
+struct MappedHostBuffer {
+	void *host_ptr = nullptr;
+	void *device_ptr = nullptr;
 	size_t capacity = 0;
 
-	~DeviceBuffer() {
-		if (ptr) {
-			cudaFree(ptr);
+	~MappedHostBuffer() {
+		if (host_ptr) {
+			cudaFreeHost(host_ptr);
 		}
 	}
 
@@ -109,12 +111,19 @@ struct DeviceBuffer {
 		if (bytes <= capacity) {
 			return 0;
 		}
-		if (ptr) {
-			cudaFree(ptr);
-			ptr = nullptr;
+		if (host_ptr) {
+			cudaFreeHost(host_ptr);
+			host_ptr = nullptr;
+			device_ptr = nullptr;
 			capacity = 0;
 		}
-		if (CheckCuda(cudaMalloc(&ptr, bytes), step)) {
+		if (CheckCuda(cudaHostAlloc(&host_ptr, bytes, cudaHostAllocMapped), step)) {
+			return 1;
+		}
+		if (CheckCuda(cudaHostGetDevicePointer(&device_ptr, host_ptr, 0), step)) {
+			cudaFreeHost(host_ptr);
+			host_ptr = nullptr;
+			device_ptr = nullptr;
 			return 1;
 		}
 		capacity = bytes;
@@ -122,35 +131,40 @@ struct DeviceBuffer {
 	}
 
 	template <class T>
-	T *As() {
-		return reinterpret_cast<T *>(ptr);
+	T *HostAs() {
+		return reinterpret_cast<T *>(host_ptr);
+	}
+
+	template <class T>
+	T *DeviceAs() {
+		return reinterpret_cast<T *>(device_ptr);
 	}
 };
 
 struct ProbeI64Buffers {
-	DeviceBuffer keys;
-	DeviceBuffer validity;
-	DeviceBuffer build_bitmap;
-	DeviceBuffer probe_sel;
-	DeviceBuffer build_sel;
-	DeviceBuffer count;
+	MappedHostBuffer keys;
+	MappedHostBuffer validity;
+	MappedHostBuffer build_bitmap;
+	MappedHostBuffer probe_sel;
+	MappedHostBuffer build_sel;
+	MappedHostBuffer count;
 };
 
 struct ProbeU16Buffers {
-	DeviceBuffer keys;
-	DeviceBuffer validity;
-	DeviceBuffer build_bitmap;
-	DeviceBuffer probe_sel;
-	DeviceBuffer build_sel;
-	DeviceBuffer count;
+	MappedHostBuffer keys;
+	MappedHostBuffer validity;
+	MappedHostBuffer build_bitmap;
+	MappedHostBuffer probe_sel;
+	MappedHostBuffer build_sel;
+	MappedHostBuffer count;
 };
 
 struct GroupByCountBuffers {
-	DeviceBuffer addresses;
-	DeviceBuffer validity;
-	DeviceBuffer unique_addresses;
-	DeviceBuffer counts;
-	DeviceBuffer unique_count;
+	MappedHostBuffer addresses;
+	MappedHostBuffer validity;
+	MappedHostBuffer unique_addresses;
+	MappedHostBuffer counts;
+	MappedHostBuffer unique_count;
 };
 
 } // namespace
@@ -185,22 +199,23 @@ extern "C" int duckdb_gpu_probe_i64(const int64_t *keys, const uint8_t *validity
 		return 1;
 	}
 
-	auto d_keys = buffers.keys.As<int64_t>();
-	auto d_validity = buffers.validity.As<uint8_t>();
-	auto d_build_bitmap = buffers.build_bitmap.As<uint8_t>();
-	auto d_probe_sel = buffers.probe_sel.As<uint32_t>();
-	auto d_build_sel = buffers.build_sel.As<uint32_t>();
-	auto d_count = buffers.count.As<unsigned long long>();
+	auto h_keys = buffers.keys.HostAs<int64_t>();
+	auto h_validity = buffers.validity.HostAs<uint8_t>();
+	auto h_build_bitmap = buffers.build_bitmap.HostAs<uint8_t>();
+	auto h_probe_sel = buffers.probe_sel.HostAs<uint32_t>();
+	auto h_build_sel = buffers.build_sel.HostAs<uint32_t>();
+	auto h_count = buffers.count.HostAs<unsigned long long>();
+	auto d_keys = buffers.keys.DeviceAs<int64_t>();
+	auto d_validity = buffers.validity.DeviceAs<uint8_t>();
+	auto d_build_bitmap = buffers.build_bitmap.DeviceAs<uint8_t>();
+	auto d_probe_sel = buffers.probe_sel.DeviceAs<uint32_t>();
+	auto d_build_sel = buffers.build_sel.DeviceAs<uint32_t>();
+	auto d_count = buffers.count.DeviceAs<unsigned long long>();
 
-	error |= CheckCuda(cudaMemcpy(d_keys, keys, keys_bytes, cudaMemcpyHostToDevice), "copy keys to device");
-	error |=
-	    CheckCuda(cudaMemcpy(d_validity, validity, validity_bytes, cudaMemcpyHostToDevice), "copy validity to device");
-	error |= CheckCuda(cudaMemcpy(d_build_bitmap, build_bitmap, bitmap_bytes, cudaMemcpyHostToDevice),
-	                   "copy build bitmap to device");
-	error |= CheckCuda(cudaMemset(d_count, 0, sizeof(unsigned long long)), "clear count");
-	if (error) {
-		return 1;
-	}
+	std::memcpy(h_keys, keys, keys_bytes);
+	std::memcpy(h_validity, validity, validity_bytes);
+	std::memcpy(h_build_bitmap, build_bitmap, bitmap_bytes);
+	*h_count = 0;
 
 	{
 		constexpr int THREADS_PER_BLOCK = 256;
@@ -209,21 +224,19 @@ extern "C" int duckdb_gpu_probe_i64(const int64_t *keys, const uint8_t *validity
 		                                                       d_build_bitmap, build_size, d_probe_sel, d_build_sel,
 		                                                       d_count);
 		error |= CheckCuda(cudaGetLastError(), "launch probe kernel");
+		error |= CheckCuda(cudaDeviceSynchronize(), "synchronize mapped probe kernel");
 	}
 	if (error) {
 		return 1;
 	}
 
-	error |= CheckCuda(cudaMemcpy(&result_count, d_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost),
-	                   "copy count to host");
+	result_count = *h_count;
 	if (error || result_count > count) {
 		return 1;
 	}
 
-	error |= CheckCuda(cudaMemcpy(probe_sel_out, d_probe_sel, result_count * sizeof(uint32_t), cudaMemcpyDeviceToHost),
-	                   "copy probe selection to host");
-	error |= CheckCuda(cudaMemcpy(build_sel_out, d_build_sel, result_count * sizeof(uint32_t), cudaMemcpyDeviceToHost),
-	                   "copy build selection to host");
+	std::memcpy(probe_sel_out, h_probe_sel, result_count * sizeof(uint32_t));
+	std::memcpy(build_sel_out, h_build_sel, result_count * sizeof(uint32_t));
 	*out_count = static_cast<uint64_t>(result_count);
 	return error ? 1 : 0;
 }
@@ -256,20 +269,20 @@ extern "C" int duckdb_gpu_groupby_count(const uint64_t *addresses, const uint8_t
 		return 1;
 	}
 
-	auto d_addresses = buffers.addresses.As<uint64_t>();
-	auto d_validity = buffers.validity.As<uint8_t>();
-	auto d_unique_addresses = buffers.unique_addresses.As<uint64_t>();
-	auto d_counts = buffers.counts.As<uint64_t>();
-	auto d_unique_count = buffers.unique_count.As<unsigned long long>();
+	auto h_addresses = buffers.addresses.HostAs<uint64_t>();
+	auto h_validity = buffers.validity.HostAs<uint8_t>();
+	auto h_unique_addresses = buffers.unique_addresses.HostAs<uint64_t>();
+	auto h_counts = buffers.counts.HostAs<uint64_t>();
+	auto h_unique_count = buffers.unique_count.HostAs<unsigned long long>();
+	auto d_addresses = buffers.addresses.DeviceAs<uint64_t>();
+	auto d_validity = buffers.validity.DeviceAs<uint8_t>();
+	auto d_unique_addresses = buffers.unique_addresses.DeviceAs<uint64_t>();
+	auto d_counts = buffers.counts.DeviceAs<uint64_t>();
+	auto d_unique_count = buffers.unique_count.DeviceAs<unsigned long long>();
 
-	error |= CheckCuda(cudaMemcpy(d_addresses, addresses, addresses_bytes, cudaMemcpyHostToDevice),
-	                   "copy groupby count addresses to device");
-	error |= CheckCuda(cudaMemcpy(d_validity, validity, validity_bytes, cudaMemcpyHostToDevice),
-	                   "copy groupby count validity to device");
-	error |= CheckCuda(cudaMemset(d_unique_count, 0, sizeof(unsigned long long)), "clear groupby count unique count");
-	if (error) {
-		return 1;
-	}
+	std::memcpy(h_addresses, addresses, addresses_bytes);
+	std::memcpy(h_validity, validity, validity_bytes);
+	*h_unique_count = 0;
 
 	{
 		constexpr int THREADS_PER_BLOCK = 256;
@@ -277,22 +290,19 @@ extern "C" int duckdb_gpu_groupby_count(const uint64_t *addresses, const uint8_t
 		DuckDBGpuGroupByCountKernel<<<blocks, THREADS_PER_BLOCK>>>(d_addresses, d_validity, count, d_unique_addresses,
 		                                                           d_counts, d_unique_count);
 		error |= CheckCuda(cudaGetLastError(), "launch groupby count kernel");
+		error |= CheckCuda(cudaDeviceSynchronize(), "synchronize mapped groupby count kernel");
 	}
 	if (error) {
 		return 1;
 	}
 
-	error |= CheckCuda(cudaMemcpy(&result_count, d_unique_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost),
-	                   "copy groupby count unique count to host");
+	result_count = *h_unique_count;
 	if (error || result_count > count) {
 		return 1;
 	}
 
-	error |= CheckCuda(cudaMemcpy(unique_addresses_out, d_unique_addresses, result_count * sizeof(uint64_t),
-	                              cudaMemcpyDeviceToHost),
-	                   "copy groupby count unique addresses to host");
-	error |= CheckCuda(cudaMemcpy(counts_out, d_counts, result_count * sizeof(uint64_t), cudaMemcpyDeviceToHost),
-	                   "copy groupby count counts to host");
+	std::memcpy(unique_addresses_out, h_unique_addresses, result_count * sizeof(uint64_t));
+	std::memcpy(counts_out, h_counts, result_count * sizeof(uint64_t));
 	*unique_count_out = static_cast<uint64_t>(result_count);
 	return error ? 1 : 0;
 }
@@ -327,22 +337,23 @@ extern "C" int duckdb_gpu_probe_u16(const uint16_t *keys, const uint8_t *validit
 		return 1;
 	}
 
-	auto d_keys = buffers.keys.As<uint16_t>();
-	auto d_validity = buffers.validity.As<uint8_t>();
-	auto d_build_bitmap = buffers.build_bitmap.As<uint8_t>();
-	auto d_probe_sel = buffers.probe_sel.As<uint32_t>();
-	auto d_build_sel = buffers.build_sel.As<uint32_t>();
-	auto d_count = buffers.count.As<unsigned long long>();
+	auto h_keys = buffers.keys.HostAs<uint16_t>();
+	auto h_validity = buffers.validity.HostAs<uint8_t>();
+	auto h_build_bitmap = buffers.build_bitmap.HostAs<uint8_t>();
+	auto h_probe_sel = buffers.probe_sel.HostAs<uint32_t>();
+	auto h_build_sel = buffers.build_sel.HostAs<uint32_t>();
+	auto h_count = buffers.count.HostAs<unsigned long long>();
+	auto d_keys = buffers.keys.DeviceAs<uint16_t>();
+	auto d_validity = buffers.validity.DeviceAs<uint8_t>();
+	auto d_build_bitmap = buffers.build_bitmap.DeviceAs<uint8_t>();
+	auto d_probe_sel = buffers.probe_sel.DeviceAs<uint32_t>();
+	auto d_build_sel = buffers.build_sel.DeviceAs<uint32_t>();
+	auto d_count = buffers.count.DeviceAs<unsigned long long>();
 
-	error |= CheckCuda(cudaMemcpy(d_keys, keys, keys_bytes, cudaMemcpyHostToDevice), "copy u16 keys to device");
-	error |= CheckCuda(cudaMemcpy(d_validity, validity, validity_bytes, cudaMemcpyHostToDevice),
-	                   "copy u16 validity to device");
-	error |= CheckCuda(cudaMemcpy(d_build_bitmap, build_bitmap, bitmap_bytes, cudaMemcpyHostToDevice),
-	                   "copy u16 build bitmap to device");
-	error |= CheckCuda(cudaMemset(d_count, 0, sizeof(unsigned long long)), "clear u16 count");
-	if (error) {
-		return 1;
-	}
+	std::memcpy(h_keys, keys, keys_bytes);
+	std::memcpy(h_validity, validity, validity_bytes);
+	std::memcpy(h_build_bitmap, build_bitmap, bitmap_bytes);
+	*h_count = 0;
 
 	{
 		constexpr int THREADS_PER_BLOCK = 256;
@@ -351,21 +362,19 @@ extern "C" int duckdb_gpu_probe_u16(const uint16_t *keys, const uint8_t *validit
 		                                                       d_build_bitmap, build_size, d_probe_sel, d_build_sel,
 		                                                       d_count);
 		error |= CheckCuda(cudaGetLastError(), "launch u16 probe kernel");
+		error |= CheckCuda(cudaDeviceSynchronize(), "synchronize mapped u16 probe kernel");
 	}
 	if (error) {
 		return 1;
 	}
 
-	error |= CheckCuda(cudaMemcpy(&result_count, d_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost),
-	                   "copy u16 count to host");
+	result_count = *h_count;
 	if (error || result_count > count) {
 		return 1;
 	}
 
-	error |= CheckCuda(cudaMemcpy(probe_sel_out, d_probe_sel, result_count * sizeof(uint32_t), cudaMemcpyDeviceToHost),
-	                   "copy u16 probe selection to host");
-	error |= CheckCuda(cudaMemcpy(build_sel_out, d_build_sel, result_count * sizeof(uint32_t), cudaMemcpyDeviceToHost),
-	                   "copy u16 build selection to host");
+	std::memcpy(probe_sel_out, h_probe_sel, result_count * sizeof(uint32_t));
+	std::memcpy(build_sel_out, h_build_sel, result_count * sizeof(uint32_t));
 	*out_count = static_cast<uint64_t>(result_count);
 	return error ? 1 : 0;
 }
