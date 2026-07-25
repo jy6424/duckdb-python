@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 
@@ -94,6 +95,64 @@ int CheckCuda(cudaError_t status, const char *step) {
 	return 1;
 }
 
+struct DeviceBuffer {
+	void *ptr = nullptr;
+	size_t capacity = 0;
+
+	~DeviceBuffer() {
+		if (ptr) {
+			cudaFree(ptr);
+		}
+	}
+
+	int Ensure(size_t bytes, const char *step) {
+		if (bytes <= capacity) {
+			return 0;
+		}
+		if (ptr) {
+			cudaFree(ptr);
+			ptr = nullptr;
+			capacity = 0;
+		}
+		if (CheckCuda(cudaMalloc(&ptr, bytes), step)) {
+			return 1;
+		}
+		capacity = bytes;
+		return 0;
+	}
+
+	template <class T>
+	T *As() {
+		return reinterpret_cast<T *>(ptr);
+	}
+};
+
+struct ProbeI64Buffers {
+	DeviceBuffer keys;
+	DeviceBuffer validity;
+	DeviceBuffer build_bitmap;
+	DeviceBuffer probe_sel;
+	DeviceBuffer build_sel;
+	DeviceBuffer count;
+};
+
+struct ProbeU16Buffers {
+	DeviceBuffer keys;
+	DeviceBuffer validity;
+	DeviceBuffer build_bitmap;
+	DeviceBuffer probe_sel;
+	DeviceBuffer build_sel;
+	DeviceBuffer count;
+};
+
+struct GroupByCountBuffers {
+	DeviceBuffer addresses;
+	DeviceBuffer validity;
+	DeviceBuffer unique_addresses;
+	DeviceBuffer counts;
+	DeviceBuffer unique_count;
+};
+
 } // namespace
 
 extern "C" int duckdb_gpu_probe_i64(const int64_t *keys, const uint8_t *validity, uint64_t count, int64_t min_value,
@@ -107,13 +166,8 @@ extern "C" int duckdb_gpu_probe_i64(const int64_t *keys, const uint8_t *validity
 		return 0;
 	}
 
-	int64_t *d_keys = nullptr;
-	uint8_t *d_validity = nullptr;
-	uint8_t *d_build_bitmap = nullptr;
-	uint32_t *d_probe_sel = nullptr;
-	uint32_t *d_build_sel = nullptr;
-	unsigned long long *d_count = nullptr;
 	unsigned long long result_count = 0;
+	thread_local ProbeI64Buffers buffers;
 
 	const auto keys_bytes = count * sizeof(int64_t);
 	const auto validity_bytes = count * sizeof(uint8_t);
@@ -121,15 +175,22 @@ extern "C" int duckdb_gpu_probe_i64(const int64_t *keys, const uint8_t *validity
 	const auto output_bytes = count * sizeof(uint32_t);
 
 	int error = 0;
-	error |= CheckCuda(cudaMalloc(&d_keys, keys_bytes), "malloc keys");
-	error |= CheckCuda(cudaMalloc(&d_validity, validity_bytes), "malloc validity");
-	error |= CheckCuda(cudaMalloc(&d_build_bitmap, bitmap_bytes), "malloc build bitmap");
-	error |= CheckCuda(cudaMalloc(&d_probe_sel, output_bytes), "malloc probe selection");
-	error |= CheckCuda(cudaMalloc(&d_build_sel, output_bytes), "malloc build selection");
-	error |= CheckCuda(cudaMalloc(&d_count, sizeof(unsigned long long)), "malloc count");
+	error |= buffers.keys.Ensure(keys_bytes, "resize keys");
+	error |= buffers.validity.Ensure(validity_bytes, "resize validity");
+	error |= buffers.build_bitmap.Ensure(bitmap_bytes, "resize build bitmap");
+	error |= buffers.probe_sel.Ensure(output_bytes, "resize probe selection");
+	error |= buffers.build_sel.Ensure(output_bytes, "resize build selection");
+	error |= buffers.count.Ensure(sizeof(unsigned long long), "resize count");
 	if (error) {
-		goto cleanup;
+		return 1;
 	}
+
+	auto d_keys = buffers.keys.As<int64_t>();
+	auto d_validity = buffers.validity.As<uint8_t>();
+	auto d_build_bitmap = buffers.build_bitmap.As<uint8_t>();
+	auto d_probe_sel = buffers.probe_sel.As<uint32_t>();
+	auto d_build_sel = buffers.build_sel.As<uint32_t>();
+	auto d_count = buffers.count.As<unsigned long long>();
 
 	error |= CheckCuda(cudaMemcpy(d_keys, keys, keys_bytes, cudaMemcpyHostToDevice), "copy keys to device");
 	error |=
@@ -138,7 +199,7 @@ extern "C" int duckdb_gpu_probe_i64(const int64_t *keys, const uint8_t *validity
 	                   "copy build bitmap to device");
 	error |= CheckCuda(cudaMemset(d_count, 0, sizeof(unsigned long long)), "clear count");
 	if (error) {
-		goto cleanup;
+		return 1;
 	}
 
 	{
@@ -148,17 +209,15 @@ extern "C" int duckdb_gpu_probe_i64(const int64_t *keys, const uint8_t *validity
 		                                                       d_build_bitmap, build_size, d_probe_sel, d_build_sel,
 		                                                       d_count);
 		error |= CheckCuda(cudaGetLastError(), "launch probe kernel");
-		error |= CheckCuda(cudaDeviceSynchronize(), "synchronize probe kernel");
 	}
 	if (error) {
-		goto cleanup;
+		return 1;
 	}
 
 	error |= CheckCuda(cudaMemcpy(&result_count, d_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost),
 	                   "copy count to host");
 	if (error || result_count > count) {
-		error = 1;
-		goto cleanup;
+		return 1;
 	}
 
 	error |= CheckCuda(cudaMemcpy(probe_sel_out, d_probe_sel, result_count * sizeof(uint32_t), cudaMemcpyDeviceToHost),
@@ -166,14 +225,6 @@ extern "C" int duckdb_gpu_probe_i64(const int64_t *keys, const uint8_t *validity
 	error |= CheckCuda(cudaMemcpy(build_sel_out, d_build_sel, result_count * sizeof(uint32_t), cudaMemcpyDeviceToHost),
 	                   "copy build selection to host");
 	*out_count = static_cast<uint64_t>(result_count);
-
-cleanup:
-	cudaFree(d_keys);
-	cudaFree(d_validity);
-	cudaFree(d_build_bitmap);
-	cudaFree(d_probe_sel);
-	cudaFree(d_build_sel);
-	cudaFree(d_count);
 	return error ? 1 : 0;
 }
 
@@ -188,26 +239,28 @@ extern "C" int duckdb_gpu_groupby_count(const uint64_t *addresses, const uint8_t
 		return 0;
 	}
 
-	uint64_t *d_addresses = nullptr;
-	uint8_t *d_validity = nullptr;
-	uint64_t *d_unique_addresses = nullptr;
-	uint64_t *d_counts = nullptr;
-	unsigned long long *d_unique_count = nullptr;
 	unsigned long long result_count = 0;
+	thread_local GroupByCountBuffers buffers;
 
 	const auto addresses_bytes = count * sizeof(uint64_t);
 	const auto validity_bytes = count * sizeof(uint8_t);
 	const auto output_bytes = count * sizeof(uint64_t);
 
 	int error = 0;
-	error |= CheckCuda(cudaMalloc(&d_addresses, addresses_bytes), "malloc groupby count addresses");
-	error |= CheckCuda(cudaMalloc(&d_validity, validity_bytes), "malloc groupby count validity");
-	error |= CheckCuda(cudaMalloc(&d_unique_addresses, output_bytes), "malloc groupby count unique addresses");
-	error |= CheckCuda(cudaMalloc(&d_counts, output_bytes), "malloc groupby count output counts");
-	error |= CheckCuda(cudaMalloc(&d_unique_count, sizeof(unsigned long long)), "malloc groupby count unique count");
+	error |= buffers.addresses.Ensure(addresses_bytes, "resize groupby count addresses");
+	error |= buffers.validity.Ensure(validity_bytes, "resize groupby count validity");
+	error |= buffers.unique_addresses.Ensure(output_bytes, "resize groupby count unique addresses");
+	error |= buffers.counts.Ensure(output_bytes, "resize groupby count output counts");
+	error |= buffers.unique_count.Ensure(sizeof(unsigned long long), "resize groupby count unique count");
 	if (error) {
-		goto cleanup;
+		return 1;
 	}
+
+	auto d_addresses = buffers.addresses.As<uint64_t>();
+	auto d_validity = buffers.validity.As<uint8_t>();
+	auto d_unique_addresses = buffers.unique_addresses.As<uint64_t>();
+	auto d_counts = buffers.counts.As<uint64_t>();
+	auto d_unique_count = buffers.unique_count.As<unsigned long long>();
 
 	error |= CheckCuda(cudaMemcpy(d_addresses, addresses, addresses_bytes, cudaMemcpyHostToDevice),
 	                   "copy groupby count addresses to device");
@@ -215,7 +268,7 @@ extern "C" int duckdb_gpu_groupby_count(const uint64_t *addresses, const uint8_t
 	                   "copy groupby count validity to device");
 	error |= CheckCuda(cudaMemset(d_unique_count, 0, sizeof(unsigned long long)), "clear groupby count unique count");
 	if (error) {
-		goto cleanup;
+		return 1;
 	}
 
 	{
@@ -224,17 +277,15 @@ extern "C" int duckdb_gpu_groupby_count(const uint64_t *addresses, const uint8_t
 		DuckDBGpuGroupByCountKernel<<<blocks, THREADS_PER_BLOCK>>>(d_addresses, d_validity, count, d_unique_addresses,
 		                                                           d_counts, d_unique_count);
 		error |= CheckCuda(cudaGetLastError(), "launch groupby count kernel");
-		error |= CheckCuda(cudaDeviceSynchronize(), "synchronize groupby count kernel");
 	}
 	if (error) {
-		goto cleanup;
+		return 1;
 	}
 
 	error |= CheckCuda(cudaMemcpy(&result_count, d_unique_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost),
 	                   "copy groupby count unique count to host");
 	if (error || result_count > count) {
-		error = 1;
-		goto cleanup;
+		return 1;
 	}
 
 	error |= CheckCuda(cudaMemcpy(unique_addresses_out, d_unique_addresses, result_count * sizeof(uint64_t),
@@ -243,13 +294,6 @@ extern "C" int duckdb_gpu_groupby_count(const uint64_t *addresses, const uint8_t
 	error |= CheckCuda(cudaMemcpy(counts_out, d_counts, result_count * sizeof(uint64_t), cudaMemcpyDeviceToHost),
 	                   "copy groupby count counts to host");
 	*unique_count_out = static_cast<uint64_t>(result_count);
-
-cleanup:
-	cudaFree(d_addresses);
-	cudaFree(d_validity);
-	cudaFree(d_unique_addresses);
-	cudaFree(d_counts);
-	cudaFree(d_unique_count);
 	return error ? 1 : 0;
 }
 
@@ -264,13 +308,8 @@ extern "C" int duckdb_gpu_probe_u16(const uint16_t *keys, const uint8_t *validit
 		return 0;
 	}
 
-	uint16_t *d_keys = nullptr;
-	uint8_t *d_validity = nullptr;
-	uint8_t *d_build_bitmap = nullptr;
-	uint32_t *d_probe_sel = nullptr;
-	uint32_t *d_build_sel = nullptr;
-	unsigned long long *d_count = nullptr;
 	unsigned long long result_count = 0;
+	thread_local ProbeU16Buffers buffers;
 
 	const auto keys_bytes = count * sizeof(uint16_t);
 	const auto validity_bytes = count * sizeof(uint8_t);
@@ -278,15 +317,22 @@ extern "C" int duckdb_gpu_probe_u16(const uint16_t *keys, const uint8_t *validit
 	const auto output_bytes = count * sizeof(uint32_t);
 
 	int error = 0;
-	error |= CheckCuda(cudaMalloc(&d_keys, keys_bytes), "malloc u16 keys");
-	error |= CheckCuda(cudaMalloc(&d_validity, validity_bytes), "malloc u16 validity");
-	error |= CheckCuda(cudaMalloc(&d_build_bitmap, bitmap_bytes), "malloc u16 build bitmap");
-	error |= CheckCuda(cudaMalloc(&d_probe_sel, output_bytes), "malloc u16 probe selection");
-	error |= CheckCuda(cudaMalloc(&d_build_sel, output_bytes), "malloc u16 build selection");
-	error |= CheckCuda(cudaMalloc(&d_count, sizeof(unsigned long long)), "malloc u16 count");
+	error |= buffers.keys.Ensure(keys_bytes, "resize u16 keys");
+	error |= buffers.validity.Ensure(validity_bytes, "resize u16 validity");
+	error |= buffers.build_bitmap.Ensure(bitmap_bytes, "resize u16 build bitmap");
+	error |= buffers.probe_sel.Ensure(output_bytes, "resize u16 probe selection");
+	error |= buffers.build_sel.Ensure(output_bytes, "resize u16 build selection");
+	error |= buffers.count.Ensure(sizeof(unsigned long long), "resize u16 count");
 	if (error) {
-		goto cleanup;
+		return 1;
 	}
+
+	auto d_keys = buffers.keys.As<uint16_t>();
+	auto d_validity = buffers.validity.As<uint8_t>();
+	auto d_build_bitmap = buffers.build_bitmap.As<uint8_t>();
+	auto d_probe_sel = buffers.probe_sel.As<uint32_t>();
+	auto d_build_sel = buffers.build_sel.As<uint32_t>();
+	auto d_count = buffers.count.As<unsigned long long>();
 
 	error |= CheckCuda(cudaMemcpy(d_keys, keys, keys_bytes, cudaMemcpyHostToDevice), "copy u16 keys to device");
 	error |= CheckCuda(cudaMemcpy(d_validity, validity, validity_bytes, cudaMemcpyHostToDevice),
@@ -295,7 +341,7 @@ extern "C" int duckdb_gpu_probe_u16(const uint16_t *keys, const uint8_t *validit
 	                   "copy u16 build bitmap to device");
 	error |= CheckCuda(cudaMemset(d_count, 0, sizeof(unsigned long long)), "clear u16 count");
 	if (error) {
-		goto cleanup;
+		return 1;
 	}
 
 	{
@@ -305,17 +351,15 @@ extern "C" int duckdb_gpu_probe_u16(const uint16_t *keys, const uint8_t *validit
 		                                                       d_build_bitmap, build_size, d_probe_sel, d_build_sel,
 		                                                       d_count);
 		error |= CheckCuda(cudaGetLastError(), "launch u16 probe kernel");
-		error |= CheckCuda(cudaDeviceSynchronize(), "synchronize u16 probe kernel");
 	}
 	if (error) {
-		goto cleanup;
+		return 1;
 	}
 
 	error |= CheckCuda(cudaMemcpy(&result_count, d_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost),
 	                   "copy u16 count to host");
 	if (error || result_count > count) {
-		error = 1;
-		goto cleanup;
+		return 1;
 	}
 
 	error |= CheckCuda(cudaMemcpy(probe_sel_out, d_probe_sel, result_count * sizeof(uint32_t), cudaMemcpyDeviceToHost),
@@ -323,13 +367,5 @@ extern "C" int duckdb_gpu_probe_u16(const uint16_t *keys, const uint8_t *validit
 	error |= CheckCuda(cudaMemcpy(build_sel_out, d_build_sel, result_count * sizeof(uint32_t), cudaMemcpyDeviceToHost),
 	                   "copy u16 build selection to host");
 	*out_count = static_cast<uint64_t>(result_count);
-
-cleanup:
-	cudaFree(d_keys);
-	cudaFree(d_validity);
-	cudaFree(d_build_bitmap);
-	cudaFree(d_probe_sel);
-	cudaFree(d_build_sel);
-	cudaFree(d_count);
 	return error ? 1 : 0;
 }
