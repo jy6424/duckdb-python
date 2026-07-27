@@ -88,6 +88,8 @@ __global__ void DuckDBGpuGroupByCountKernel(const uint64_t *addresses, const uin
 	counts_out[out_idx] = local_count;
 }
 
+__device__ double AtomicAddDouble(double *address, double value);
+
 __global__ void DuckDBGpuFusedLatAggKernel(const int64_t *grids, const double *values, const uint8_t *value_validity,
                                            uint64_t count, int64_t grid_min, int64_t grid_max,
                                            const int32_t *grid_to_group, uint64_t build_size, double *sum_out,
@@ -114,7 +116,7 @@ __global__ void DuckDBGpuFusedLatAggKernel(const int64_t *grids, const double *v
 
 	atomicAdd(&row_count_out[group], 1ULL);
 	if (!value_validity || value_validity[row] != 0) {
-		atomicAdd(&sum_out[group], values[row]);
+		AtomicAddDouble(&sum_out[group], values[row]);
 		atomicAdd(&count_out[group], 1ULL);
 	}
 }
@@ -125,6 +127,21 @@ int CheckCuda(cudaError_t status, const char *step) {
 	}
 	std::fprintf(stderr, "[duckdb gpu offload] CUDA %s failed: %s\n", step, cudaGetErrorString(status));
 	return 1;
+}
+
+__device__ double AtomicAddDouble(double *address, double value) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600
+	return atomicAdd(address, value);
+#else
+	auto address_as_ull = reinterpret_cast<unsigned long long *>(address);
+	auto old = *address_as_ull;
+	unsigned long long assumed;
+	do {
+		assumed = old;
+		old = atomicCAS(address_as_ull, assumed, __double_as_longlong(value + __longlong_as_double(assumed)));
+	} while (assumed != old);
+	return __longlong_as_double(old);
+#endif
 }
 
 struct MappedHostBuffer {
