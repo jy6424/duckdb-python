@@ -415,14 +415,14 @@ struct GroupByStatsDoubleBuffers {
 };
 
 struct GroupByDictStatsDoubleBuffers {
-	DeviceBuffer group_ids;
-	DeviceBuffer values;
-	DeviceBuffer validity;
-	DeviceBuffer sums;
-	DeviceBuffer counts;
-	DeviceBuffer row_counts;
-	DeviceBuffer mins;
-	DeviceBuffer maxs;
+	MappedHostBuffer group_ids;
+	MappedHostBuffer values;
+	MappedHostBuffer validity;
+	MappedHostBuffer sums;
+	MappedHostBuffer counts;
+	MappedHostBuffer row_counts;
+	MappedHostBuffer mins;
+	MappedHostBuffer maxs;
 };
 
 struct FusedLatAggBuffers {
@@ -779,24 +779,27 @@ extern "C" int duckdb_gpu_groupby_dict_stats_double(const uint32_t *group_ids, c
 		return 1;
 	}
 
-	auto d_group_ids = buffers.group_ids.As<uint32_t>();
-	auto d_values = buffers.values.As<double>();
-	auto d_validity = buffers.validity.As<uint8_t>();
-	auto d_sums = buffers.sums.As<double>();
-	auto d_counts = buffers.counts.As<unsigned long long>();
-	auto d_row_counts = buffers.row_counts.As<unsigned long long>();
-	auto d_mins = buffers.mins.As<double>();
-	auto d_maxs = buffers.maxs.As<double>();
+	auto h_group_ids = buffers.group_ids.HostAs<uint32_t>();
+	auto h_values = buffers.values.HostAs<double>();
+	auto h_validity = buffers.validity.HostAs<uint8_t>();
+	auto h_sums = buffers.sums.HostAs<double>();
+	auto h_counts = buffers.counts.HostAs<unsigned long long>();
+	auto h_row_counts = buffers.row_counts.HostAs<unsigned long long>();
+	auto h_mins = buffers.mins.HostAs<double>();
+	auto h_maxs = buffers.maxs.HostAs<double>();
 
-	error |= CheckCuda(cudaMemcpy(d_group_ids, group_ids, group_ids_bytes, cudaMemcpyHostToDevice),
-	                   "copy dict stats group ids to device");
-	error |= CheckCuda(cudaMemcpy(d_values, values, values_bytes, cudaMemcpyHostToDevice),
-	                   "copy dict stats values to device");
-	error |= CheckCuda(cudaMemcpy(d_validity, validity, validity_bytes, cudaMemcpyHostToDevice),
-	                   "copy dict stats validity to device");
-	if (error) {
-		return 1;
-	}
+	auto d_group_ids = buffers.group_ids.DeviceAs<uint32_t>();
+	auto d_values = buffers.values.DeviceAs<double>();
+	auto d_validity = buffers.validity.DeviceAs<uint8_t>();
+	auto d_sums = buffers.sums.DeviceAs<double>();
+	auto d_counts = buffers.counts.DeviceAs<unsigned long long>();
+	auto d_row_counts = buffers.row_counts.DeviceAs<unsigned long long>();
+	auto d_mins = buffers.mins.DeviceAs<double>();
+	auto d_maxs = buffers.maxs.DeviceAs<double>();
+
+	std::memcpy(h_group_ids, group_ids, group_ids_bytes);
+	std::memcpy(h_values, values, values_bytes);
+	std::memcpy(h_validity, validity, validity_bytes);
 
 	{
 		constexpr int THREADS_PER_BLOCK = 256;
@@ -809,21 +812,17 @@ extern "C" int duckdb_gpu_groupby_dict_stats_double(const uint32_t *group_ids, c
 		                                                                     group_count, d_sums, d_counts,
 		                                                                     d_row_counts, d_mins, d_maxs);
 		error |= CheckCuda(cudaGetLastError(), "launch dict stats kernel");
+		error |= CheckCuda(cudaDeviceSynchronize(), "sync dict stats kernel");
 	}
 	if (error) {
 		return 1;
 	}
 
-	error |= CheckCuda(cudaMemcpy(sums_out, d_sums, sums_bytes, cudaMemcpyDeviceToHost),
-	                   "copy dict stats sums to host");
-	error |= CheckCuda(cudaMemcpy(counts_out, d_counts, counts_bytes, cudaMemcpyDeviceToHost),
-	                   "copy dict stats counts to host");
-	error |= CheckCuda(cudaMemcpy(row_counts_out, d_row_counts, counts_bytes, cudaMemcpyDeviceToHost),
-	                   "copy dict stats row counts to host");
-	error |= CheckCuda(cudaMemcpy(mins_out, d_mins, mins_bytes, cudaMemcpyDeviceToHost),
-	                   "copy dict stats mins to host");
-	error |= CheckCuda(cudaMemcpy(maxs_out, d_maxs, maxs_bytes, cudaMemcpyDeviceToHost),
-	                   "copy dict stats maxs to host");
+	std::memcpy(sums_out, h_sums, sums_bytes);
+	std::memcpy(counts_out, h_counts, counts_bytes);
+	std::memcpy(row_counts_out, h_row_counts, counts_bytes);
+	std::memcpy(mins_out, h_mins, mins_bytes);
+	std::memcpy(maxs_out, h_maxs, maxs_bytes);
 	return error ? 1 : 0;
 }
 

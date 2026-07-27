@@ -13,6 +13,10 @@ def escape_sql_string(value):
     return value.replace("'", "''")
 
 
+def quote_ident(name):
+    return '"' + name.replace('"', '""') + '"'
+
+
 def bind_fused_function(function):
     function.argtypes = [
         np.ctypeslib.ndpointer(dtype=np.int64, flags="C_CONTIGUOUS"),
@@ -38,51 +42,54 @@ def load_gpu_lib(path):
     return lib
 
 
-def read_grid_mapping(con, grid_path):
+def read_group_mapping(con, dimension_path, join_key, group_column):
     columns = con.execute(
         """
         SELECT
-            grid::BIGINT AS grid_key,
-            lats::DOUBLE AS lat
+            {join_key}::BIGINT AS join_key,
+            {group_column}::DOUBLE AS group_value
         FROM read_parquet('{}')
         """.format(
-            escape_sql_string(grid_path)
+            escape_sql_string(dimension_path),
+            join_key=quote_ident(join_key),
+            group_column=quote_ident(group_column),
         )
     ).fetchnumpy()
-    grids = np.asarray(columns["grid_key"], dtype=np.int64)
-    lats = np.asarray(columns["lat"], dtype=np.float64)
-    if grids.size == 0:
-        raise RuntimeError("empty grid file: {}".format(grid_path))
+    join_keys = np.asarray(columns["join_key"], dtype=np.int64)
+    group_values = np.asarray(columns["group_value"], dtype=np.float64)
+    if join_keys.size == 0:
+        raise RuntimeError("empty dimension file: {}".format(dimension_path))
 
-    grid_min = int(grids.min())
-    grid_max = int(grids.max())
-    build_size = grid_max - grid_min + 1
+    join_min = int(join_keys.min())
+    join_max = int(join_keys.max())
+    build_size = join_max - join_min + 1
     if build_size <= 0:
-        raise RuntimeError("invalid grid range in {}".format(grid_path))
+        raise RuntimeError("invalid join key range in {}".format(dimension_path))
 
-    group_lats, inverse = np.unique(lats, return_inverse=True)
+    groups, inverse = np.unique(group_values, return_inverse=True)
     grid_to_group = np.full(build_size, -1, dtype=np.int32)
-    grid_offsets = (grids - grid_min).astype(np.int64, copy=False)
-    grid_to_group[grid_offsets] = inverse.astype(np.int32, copy=False)
+    join_offsets = (join_keys - join_min).astype(np.int64, copy=False)
+    grid_to_group[join_offsets] = inverse.astype(np.int32, copy=False)
 
-    return grid_min, grid_max, grid_to_group, group_lats.tolist()
+    return join_min, join_max, grid_to_group, groups.tolist()
 
 
-def read_probe_columns(con, parquet_path, var):
+def read_probe_columns(con, parquet_path, join_key, var):
     columns = con.execute(
         """
         SELECT
-            grid::BIGINT AS grid_key,
+            {join_key}::BIGINT AS join_key,
             COALESCE({var}, 0)::DOUBLE AS value,
             CASE WHEN {var} IS NULL THEN 0 ELSE 1 END::UTINYINT AS value_valid
         FROM read_parquet('{path}')
         """.format(
-            var='"' + var.replace('"', '""') + '"',
+            join_key=quote_ident(join_key),
+            var=quote_ident(var),
             path=escape_sql_string(parquet_path),
         )
     ).fetchnumpy()
 
-    grids = np.asarray(columns["grid_key"], dtype=np.int64)
+    grids = np.asarray(columns["join_key"], dtype=np.int64)
     values = np.asarray(columns["value"], dtype=np.float64)
     validity = np.asarray(columns["value_valid"], dtype=np.uint8)
     return grids, values, validity
@@ -92,6 +99,11 @@ def main():
     parser = argparse.ArgumentParser(description="Experimental fused GPU join+lat aggregate path")
     parser.add_argument("base_dir")
     parser.add_argument("--var", default="qicps")
+    parser.add_argument("--join-key", default="grid")
+    parser.add_argument("--group-column", default="lats")
+    parser.add_argument("--fact-file", default="time-levs-grid.parquet")
+    parser.add_argument("--dimension-file", default="grid.parquet")
+    parser.add_argument("--max-files", type=int, default=0, help="Process only the first N files when N > 0")
     parser.add_argument(
         "--mode",
         choices=["device", "mapped"],
@@ -106,7 +118,9 @@ def main():
     )
     args = parser.parse_args()
 
-    parquet_paths = sorted(glob.glob(os.path.join(args.base_dir, "UP-*", "time-levs-grid.parquet")))
+    parquet_paths = sorted(glob.glob(os.path.join(args.base_dir, "UP-*", args.fact_file)))
+    if args.max_files > 0:
+        parquet_paths = parquet_paths[: args.max_files]
     if not parquet_paths:
         raise RuntimeError("no input parquet files found below {}".format(args.base_dir))
 
@@ -125,10 +139,12 @@ def main():
     start = time.time()
     for parquet_path in parquet_paths:
         print("reading: {}".format(parquet_path))
-        grid_path = os.path.join(os.path.dirname(parquet_path), "grid.parquet")
+        grid_path = os.path.join(os.path.dirname(parquet_path), args.dimension_file)
 
-        grid_min, grid_max, grid_to_group, group_lats = read_grid_mapping(con, grid_path)
-        grids, values, validity = read_probe_columns(con, parquet_path, args.var)
+        grid_min, grid_max, grid_to_group, group_lats = read_group_mapping(
+            con, grid_path, args.join_key, args.group_column
+        )
+        grids, values, validity = read_probe_columns(con, parquet_path, args.join_key, args.var)
 
         group_count = len(group_lats)
         sums = np.zeros(group_count, dtype=np.float64)
@@ -167,7 +183,7 @@ def main():
     print(total_rows)
 
     if args.print_averages:
-        print("\n[Avg {} by latitude across Parquet files]".format(args.var))
+        print("\n[Avg {} by {} across Parquet files]".format(args.var, args.group_column))
         for lat in sorted(total_sum.keys()):
             count = total_count[lat]
             if count == 0:
