@@ -32,6 +32,8 @@ namespace py = pybind11;
 
 namespace duckdb {
 
+void RegisterDBSGPUFused(py::module_ &m);
+
 enum PySQLTokenType : uint8_t {
 	PY_SQL_TOKEN_IDENTIFIER = 0,
 	PY_SQL_TOKEN_NUMERIC_CONSTANT,
@@ -1105,6 +1107,7 @@ PYBIND11_MODULE(DUCKDB_PYTHON_LIB_NAME, m) { // NOLINT
 	      "Tokenizes a SQL string, returning a list of (position, type) tuples that can be "
 	      "used for e.g., syntax highlighting",
 	      py::arg("query"));
+	RegisterDBSGPUFused(m);
 	py::enum_<PySQLTokenType>(m, "token_type", py::module_local())
 	    .value("identifier", PySQLTokenType::PY_SQL_TOKEN_IDENTIFIER)
 	    .value("numeric_const", PySQLTokenType::PY_SQL_TOKEN_NUMERIC_CONSTANT)

@@ -15,6 +15,7 @@ add_subdirectory(arrow)
 add_library(
   python_src OBJECT
   dataframe.cpp
+  dbs_gpu_fused.cpp
   duckdb_python.cpp
   importer.cpp
   map.cpp
