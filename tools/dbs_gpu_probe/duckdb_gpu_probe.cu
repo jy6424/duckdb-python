@@ -174,8 +174,9 @@ __global__ void DuckDBGpuInitDictStatsDoubleKernel(uint64_t group_count, double 
 	sums_out[group] = 0;
 	counts_out[group] = 0;
 	row_counts_out[group] = 0;
-	mins_out[group] = CUDART_INF;
-	maxs_out[group] = -CUDART_INF;
+	const auto positive_infinity = __longlong_as_double(0x7ff0000000000000ULL);
+	mins_out[group] = positive_infinity;
+	maxs_out[group] = -positive_infinity;
 }
 
 __global__ void DuckDBGpuGroupByDictStatsDoubleKernel(const uint32_t *group_ids, const double *values,
