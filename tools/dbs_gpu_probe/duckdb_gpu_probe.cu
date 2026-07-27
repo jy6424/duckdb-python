@@ -248,10 +248,10 @@ struct GroupByCountBuffers {
 };
 
 struct FusedLatAggBuffers {
-	MappedHostBuffer grids;
-	MappedHostBuffer values;
-	MappedHostBuffer value_validity;
-	MappedHostBuffer grid_to_group;
+	DeviceBuffer grids;
+	DeviceBuffer values;
+	DeviceBuffer value_validity;
+	DeviceBuffer grid_to_group;
 	DeviceBuffer sums;
 	DeviceBuffer counts;
 	DeviceBuffer row_counts;
@@ -510,26 +510,24 @@ extern "C" int duckdb_gpu_fused_lat_agg_i64_double(const int64_t *grids, const d
 		return 1;
 	}
 
-	auto h_grids = buffers.grids.HostAs<int64_t>();
-	auto h_values = buffers.values.HostAs<double>();
-	auto h_value_validity = buffers.value_validity.HostAs<uint8_t>();
-	auto h_grid_to_group = buffers.grid_to_group.HostAs<int32_t>();
-	auto d_grids = buffers.grids.DeviceAs<int64_t>();
-	auto d_values = buffers.values.DeviceAs<double>();
-	auto d_value_validity = buffers.value_validity.DeviceAs<uint8_t>();
-	auto d_grid_to_group = buffers.grid_to_group.DeviceAs<int32_t>();
+	auto d_grids = buffers.grids.As<int64_t>();
+	auto d_values = buffers.values.As<double>();
+	auto d_value_validity = buffers.value_validity.As<uint8_t>();
+	auto d_grid_to_group = buffers.grid_to_group.As<int32_t>();
 	auto d_sums = buffers.sums.As<double>();
 	auto d_counts = buffers.counts.As<unsigned long long>();
 	auto d_row_counts = buffers.row_counts.As<unsigned long long>();
 
-	std::memcpy(h_grids, grids, grid_bytes);
-	std::memcpy(h_values, values, value_bytes);
+	error |= CheckCuda(cudaMemcpy(d_grids, grids, grid_bytes, cudaMemcpyHostToDevice), "copy fused grids to device");
+	error |= CheckCuda(cudaMemcpy(d_values, values, value_bytes, cudaMemcpyHostToDevice), "copy fused values to device");
 	if (value_validity) {
-		std::memcpy(h_value_validity, value_validity, validity_bytes);
+		error |= CheckCuda(cudaMemcpy(d_value_validity, value_validity, validity_bytes, cudaMemcpyHostToDevice),
+		                   "copy fused value validity to device");
 	} else {
-		std::memset(h_value_validity, 1, validity_bytes);
+		error |= CheckCuda(cudaMemset(d_value_validity, 1, validity_bytes), "set fused value validity");
 	}
-	std::memcpy(h_grid_to_group, grid_to_group, build_bytes);
+	error |= CheckCuda(cudaMemcpy(d_grid_to_group, grid_to_group, build_bytes, cudaMemcpyHostToDevice),
+	                   "copy fused grid to group to device");
 
 	error |= CheckCuda(cudaMemset(d_sums, 0, sum_bytes), "clear fused sums");
 	error |= CheckCuda(cudaMemset(d_counts, 0, count_bytes), "clear fused counts");
