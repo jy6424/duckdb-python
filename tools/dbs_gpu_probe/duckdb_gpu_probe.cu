@@ -160,6 +160,50 @@ __global__ void DuckDBGpuGroupByStatsDoubleKernel(const uint64_t *addresses, con
 }
 
 __device__ double AtomicAddDouble(double *address, double value);
+__device__ double AtomicMinDouble(double *address, double value);
+__device__ double AtomicMaxDouble(double *address, double value);
+
+__global__ void DuckDBGpuInitDictStatsDoubleKernel(uint64_t group_count, double *sums_out,
+                                                   unsigned long long *counts_out,
+                                                   unsigned long long *row_counts_out, double *mins_out,
+                                                   double *maxs_out) {
+	const auto group = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	if (group >= group_count) {
+		return;
+	}
+	sums_out[group] = 0;
+	counts_out[group] = 0;
+	row_counts_out[group] = 0;
+	mins_out[group] = CUDART_INF;
+	maxs_out[group] = -CUDART_INF;
+}
+
+__global__ void DuckDBGpuGroupByDictStatsDoubleKernel(const uint32_t *group_ids, const double *values,
+                                                      const uint8_t *validity, uint64_t count, uint64_t group_count,
+                                                      double *sums_out, unsigned long long *counts_out,
+                                                      unsigned long long *row_counts_out, double *mins_out,
+                                                      double *maxs_out) {
+	const auto row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	if (row >= count) {
+		return;
+	}
+
+	const auto group = static_cast<uint64_t>(group_ids[row]);
+	if (group >= group_count) {
+		return;
+	}
+
+	atomicAdd(&row_counts_out[group], 1ULL);
+	if (validity && validity[row] == 0) {
+		return;
+	}
+
+	const auto value = values[row];
+	AtomicAddDouble(&sums_out[group], value);
+	atomicAdd(&counts_out[group], 1ULL);
+	AtomicMinDouble(&mins_out[group], value);
+	AtomicMaxDouble(&maxs_out[group], value);
+}
 
 __global__ void DuckDBGpuFusedLatAggKernel(const int64_t *grids, const double *values, const uint8_t *value_validity,
                                            uint64_t count, int64_t grid_min, int64_t grid_max,
@@ -213,6 +257,36 @@ __device__ double AtomicAddDouble(double *address, double value) {
 	} while (assumed != old);
 	return __longlong_as_double(old);
 #endif
+}
+
+__device__ double AtomicMinDouble(double *address, double value) {
+	auto address_as_ull = reinterpret_cast<unsigned long long *>(address);
+	auto old = *address_as_ull;
+	unsigned long long assumed;
+	do {
+		assumed = old;
+		const auto current = __longlong_as_double(assumed);
+		if (current <= value) {
+			break;
+		}
+		old = atomicCAS(address_as_ull, assumed, __double_as_longlong(value));
+	} while (assumed != old);
+	return __longlong_as_double(old);
+}
+
+__device__ double AtomicMaxDouble(double *address, double value) {
+	auto address_as_ull = reinterpret_cast<unsigned long long *>(address);
+	auto old = *address_as_ull;
+	unsigned long long assumed;
+	do {
+		assumed = old;
+		const auto current = __longlong_as_double(assumed);
+		if (current >= value) {
+			break;
+		}
+		old = atomicCAS(address_as_ull, assumed, __double_as_longlong(value));
+	} while (assumed != old);
+	return __longlong_as_double(old);
 }
 
 struct MappedHostBuffer {
@@ -337,6 +411,17 @@ struct GroupByStatsDoubleBuffers {
 	DeviceBuffer mins;
 	DeviceBuffer maxs;
 	DeviceBuffer unique_count;
+};
+
+struct GroupByDictStatsDoubleBuffers {
+	DeviceBuffer group_ids;
+	DeviceBuffer values;
+	DeviceBuffer validity;
+	DeviceBuffer sums;
+	DeviceBuffer counts;
+	DeviceBuffer row_counts;
+	DeviceBuffer mins;
+	DeviceBuffer maxs;
 };
 
 struct FusedLatAggBuffers {
@@ -657,6 +742,87 @@ extern "C" int duckdb_gpu_groupby_stats_double(const uint64_t *addresses, const 
 	error |= CheckCuda(cudaMemcpy(maxs_out, d_maxs, result_count * sizeof(double), cudaMemcpyDeviceToHost),
 	                   "copy groupby stats maxs to host");
 	*unique_count_out = static_cast<uint64_t>(result_count);
+	return error ? 1 : 0;
+}
+
+extern "C" int duckdb_gpu_groupby_dict_stats_double(const uint32_t *group_ids, const double *values,
+                                                    const uint8_t *validity, uint64_t count, uint64_t group_count,
+                                                    double *sums_out, uint64_t *counts_out, uint64_t *row_counts_out,
+                                                    double *mins_out, double *maxs_out) {
+	if (!group_ids || !values || !validity || !sums_out || !counts_out || !row_counts_out || !mins_out || !maxs_out) {
+		return 1;
+	}
+	if (group_count == 0) {
+		return 0;
+	}
+
+	thread_local GroupByDictStatsDoubleBuffers buffers;
+	const auto group_ids_bytes = count * sizeof(uint32_t);
+	const auto values_bytes = count * sizeof(double);
+	const auto validity_bytes = count * sizeof(uint8_t);
+	const auto sums_bytes = group_count * sizeof(double);
+	const auto counts_bytes = group_count * sizeof(unsigned long long);
+	const auto mins_bytes = group_count * sizeof(double);
+	const auto maxs_bytes = group_count * sizeof(double);
+
+	int error = 0;
+	error |= buffers.group_ids.Ensure(group_ids_bytes, "resize dict stats group ids");
+	error |= buffers.values.Ensure(values_bytes, "resize dict stats values");
+	error |= buffers.validity.Ensure(validity_bytes, "resize dict stats validity");
+	error |= buffers.sums.Ensure(sums_bytes, "resize dict stats sums");
+	error |= buffers.counts.Ensure(counts_bytes, "resize dict stats counts");
+	error |= buffers.row_counts.Ensure(counts_bytes, "resize dict stats row counts");
+	error |= buffers.mins.Ensure(mins_bytes, "resize dict stats mins");
+	error |= buffers.maxs.Ensure(maxs_bytes, "resize dict stats maxs");
+	if (error) {
+		return 1;
+	}
+
+	auto d_group_ids = buffers.group_ids.As<uint32_t>();
+	auto d_values = buffers.values.As<double>();
+	auto d_validity = buffers.validity.As<uint8_t>();
+	auto d_sums = buffers.sums.As<double>();
+	auto d_counts = buffers.counts.As<unsigned long long>();
+	auto d_row_counts = buffers.row_counts.As<unsigned long long>();
+	auto d_mins = buffers.mins.As<double>();
+	auto d_maxs = buffers.maxs.As<double>();
+
+	error |= CheckCuda(cudaMemcpy(d_group_ids, group_ids, group_ids_bytes, cudaMemcpyHostToDevice),
+	                   "copy dict stats group ids to device");
+	error |= CheckCuda(cudaMemcpy(d_values, values, values_bytes, cudaMemcpyHostToDevice),
+	                   "copy dict stats values to device");
+	error |= CheckCuda(cudaMemcpy(d_validity, validity, validity_bytes, cudaMemcpyHostToDevice),
+	                   "copy dict stats validity to device");
+	if (error) {
+		return 1;
+	}
+
+	{
+		constexpr int THREADS_PER_BLOCK = 256;
+		auto blocks = static_cast<unsigned int>((group_count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+		DuckDBGpuInitDictStatsDoubleKernel<<<blocks, THREADS_PER_BLOCK>>>(group_count, d_sums, d_counts, d_row_counts,
+		                                                                  d_mins, d_maxs);
+		error |= CheckCuda(cudaGetLastError(), "launch dict stats init kernel");
+		blocks = static_cast<unsigned int>((count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+		DuckDBGpuGroupByDictStatsDoubleKernel<<<blocks, THREADS_PER_BLOCK>>>(d_group_ids, d_values, d_validity, count,
+		                                                                     group_count, d_sums, d_counts,
+		                                                                     d_row_counts, d_mins, d_maxs);
+		error |= CheckCuda(cudaGetLastError(), "launch dict stats kernel");
+	}
+	if (error) {
+		return 1;
+	}
+
+	error |= CheckCuda(cudaMemcpy(sums_out, d_sums, sums_bytes, cudaMemcpyDeviceToHost),
+	                   "copy dict stats sums to host");
+	error |= CheckCuda(cudaMemcpy(counts_out, d_counts, counts_bytes, cudaMemcpyDeviceToHost),
+	                   "copy dict stats counts to host");
+	error |= CheckCuda(cudaMemcpy(row_counts_out, d_row_counts, counts_bytes, cudaMemcpyDeviceToHost),
+	                   "copy dict stats row counts to host");
+	error |= CheckCuda(cudaMemcpy(mins_out, d_mins, mins_bytes, cudaMemcpyDeviceToHost),
+	                   "copy dict stats mins to host");
+	error |= CheckCuda(cudaMemcpy(maxs_out, d_maxs, maxs_bytes, cudaMemcpyDeviceToHost),
+	                   "copy dict stats maxs to host");
 	return error ? 1 : 0;
 }
 
