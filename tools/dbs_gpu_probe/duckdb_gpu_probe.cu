@@ -88,6 +88,77 @@ __global__ void DuckDBGpuGroupByCountKernel(const uint64_t *addresses, const uin
 	counts_out[out_idx] = local_count;
 }
 
+__global__ void DuckDBGpuGroupBySumDoubleKernel(const uint64_t *addresses, const double *values,
+                                                const uint8_t *validity, uint64_t count,
+                                                uint64_t *unique_addresses_out, double *sums_out,
+                                                unsigned long long *unique_count_out) {
+	const auto row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	if (row >= count || validity[row] == 0) {
+		return;
+	}
+
+	const auto address = addresses[row];
+	for (uint64_t i = 0; i < row; i++) {
+		if (validity[i] != 0 && addresses[i] == address) {
+			return;
+		}
+	}
+
+	double local_sum = 0;
+	for (uint64_t i = row; i < count; i++) {
+		if (validity[i] != 0 && addresses[i] == address) {
+			local_sum += values[i];
+		}
+	}
+
+	const auto out_idx = atomicAdd(unique_count_out, 1ULL);
+	unique_addresses_out[out_idx] = address;
+	sums_out[out_idx] = local_sum;
+}
+
+__global__ void DuckDBGpuGroupByStatsDoubleKernel(const uint64_t *addresses, const double *values,
+                                                  const uint8_t *validity, uint64_t count,
+                                                  uint64_t *unique_addresses_out, double *sums_out,
+                                                  unsigned long long *counts_out, double *mins_out, double *maxs_out,
+                                                  unsigned long long *unique_count_out) {
+	const auto row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	if (row >= count || validity[row] == 0) {
+		return;
+	}
+
+	const auto address = addresses[row];
+	for (uint64_t i = 0; i < row; i++) {
+		if (validity[i] != 0 && addresses[i] == address) {
+			return;
+		}
+	}
+
+	double local_sum = 0;
+	double local_min = values[row];
+	double local_max = values[row];
+	unsigned long long local_count = 0;
+	for (uint64_t i = row; i < count; i++) {
+		if (validity[i] != 0 && addresses[i] == address) {
+			const auto value = values[i];
+			local_sum += value;
+			local_count++;
+			if (value < local_min) {
+				local_min = value;
+			}
+			if (value > local_max) {
+				local_max = value;
+			}
+		}
+	}
+
+	const auto out_idx = atomicAdd(unique_count_out, 1ULL);
+	unique_addresses_out[out_idx] = address;
+	sums_out[out_idx] = local_sum;
+	counts_out[out_idx] = local_count;
+	mins_out[out_idx] = local_min;
+	maxs_out[out_idx] = local_max;
+}
+
 __device__ double AtomicAddDouble(double *address, double value);
 
 __global__ void DuckDBGpuFusedLatAggKernel(const int64_t *grids, const double *values, const uint8_t *value_validity,
@@ -247,11 +318,42 @@ struct GroupByCountBuffers {
 	MappedHostBuffer unique_count;
 };
 
+struct GroupBySumDoubleBuffers {
+	DeviceBuffer addresses;
+	DeviceBuffer values;
+	DeviceBuffer validity;
+	DeviceBuffer unique_addresses;
+	DeviceBuffer sums;
+	DeviceBuffer unique_count;
+};
+
+struct GroupByStatsDoubleBuffers {
+	DeviceBuffer addresses;
+	DeviceBuffer values;
+	DeviceBuffer validity;
+	DeviceBuffer unique_addresses;
+	DeviceBuffer sums;
+	DeviceBuffer counts;
+	DeviceBuffer mins;
+	DeviceBuffer maxs;
+	DeviceBuffer unique_count;
+};
+
 struct FusedLatAggBuffers {
 	DeviceBuffer grids;
 	DeviceBuffer values;
 	DeviceBuffer value_validity;
 	DeviceBuffer grid_to_group;
+	DeviceBuffer sums;
+	DeviceBuffer counts;
+	DeviceBuffer row_counts;
+};
+
+struct MappedFusedLatAggBuffers {
+	MappedHostBuffer grids;
+	MappedHostBuffer values;
+	MappedHostBuffer value_validity;
+	MappedHostBuffer grid_to_group;
 	DeviceBuffer sums;
 	DeviceBuffer counts;
 	DeviceBuffer row_counts;
@@ -393,6 +495,167 @@ extern "C" int duckdb_gpu_groupby_count(const uint64_t *addresses, const uint8_t
 
 	std::memcpy(unique_addresses_out, h_unique_addresses, result_count * sizeof(uint64_t));
 	std::memcpy(counts_out, h_counts, result_count * sizeof(uint64_t));
+	*unique_count_out = static_cast<uint64_t>(result_count);
+	return error ? 1 : 0;
+}
+
+extern "C" int duckdb_gpu_groupby_sum_double(const uint64_t *addresses, const double *values, const uint8_t *validity,
+                                             uint64_t count, uint64_t *unique_addresses_out, double *sums_out,
+                                             uint64_t *unique_count_out) {
+	if (!addresses || !values || !validity || !unique_addresses_out || !sums_out || !unique_count_out) {
+		return 1;
+	}
+	if (count == 0) {
+		*unique_count_out = 0;
+		return 0;
+	}
+
+	unsigned long long result_count = 0;
+	thread_local GroupBySumDoubleBuffers buffers;
+
+	const auto addresses_bytes = count * sizeof(uint64_t);
+	const auto values_bytes = count * sizeof(double);
+	const auto validity_bytes = count * sizeof(uint8_t);
+	const auto unique_addresses_bytes = count * sizeof(uint64_t);
+	const auto sums_bytes = count * sizeof(double);
+
+	int error = 0;
+	error |= buffers.addresses.Ensure(addresses_bytes, "resize groupby sum addresses");
+	error |= buffers.values.Ensure(values_bytes, "resize groupby sum values");
+	error |= buffers.validity.Ensure(validity_bytes, "resize groupby sum validity");
+	error |= buffers.unique_addresses.Ensure(unique_addresses_bytes, "resize groupby sum unique addresses");
+	error |= buffers.sums.Ensure(sums_bytes, "resize groupby sum output sums");
+	error |= buffers.unique_count.Ensure(sizeof(unsigned long long), "resize groupby sum unique count");
+	if (error) {
+		return 1;
+	}
+
+	auto d_addresses = buffers.addresses.As<uint64_t>();
+	auto d_values = buffers.values.As<double>();
+	auto d_validity = buffers.validity.As<uint8_t>();
+	auto d_unique_addresses = buffers.unique_addresses.As<uint64_t>();
+	auto d_sums = buffers.sums.As<double>();
+	auto d_unique_count = buffers.unique_count.As<unsigned long long>();
+
+	error |= CheckCuda(cudaMemcpy(d_addresses, addresses, addresses_bytes, cudaMemcpyHostToDevice),
+	                   "copy groupby sum addresses to device");
+	error |= CheckCuda(cudaMemcpy(d_values, values, values_bytes, cudaMemcpyHostToDevice),
+	                   "copy groupby sum values to device");
+	error |= CheckCuda(cudaMemcpy(d_validity, validity, validity_bytes, cudaMemcpyHostToDevice),
+	                   "copy groupby sum validity to device");
+	error |= CheckCuda(cudaMemset(d_unique_count, 0, sizeof(unsigned long long)), "clear groupby sum unique count");
+	if (error) {
+		return 1;
+	}
+
+	{
+		constexpr int THREADS_PER_BLOCK = 256;
+		const auto blocks = static_cast<unsigned int>((count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+		DuckDBGpuGroupBySumDoubleKernel<<<blocks, THREADS_PER_BLOCK>>>(d_addresses, d_values, d_validity, count,
+		                                                               d_unique_addresses, d_sums, d_unique_count);
+		error |= CheckCuda(cudaGetLastError(), "launch groupby sum double kernel");
+		error |= CheckCuda(cudaMemcpy(&result_count, d_unique_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost),
+		                   "copy groupby sum unique count to host");
+	}
+	if (error || result_count > count) {
+		return 1;
+	}
+
+	error |= CheckCuda(cudaMemcpy(unique_addresses_out, d_unique_addresses, result_count * sizeof(uint64_t),
+	                             cudaMemcpyDeviceToHost),
+	                   "copy groupby sum unique addresses to host");
+	error |= CheckCuda(cudaMemcpy(sums_out, d_sums, result_count * sizeof(double), cudaMemcpyDeviceToHost),
+	                   "copy groupby sums to host");
+	*unique_count_out = static_cast<uint64_t>(result_count);
+	return error ? 1 : 0;
+}
+
+extern "C" int duckdb_gpu_groupby_stats_double(const uint64_t *addresses, const double *values, const uint8_t *validity,
+                                               uint64_t count, uint64_t *unique_addresses_out, double *sums_out,
+                                               uint64_t *counts_out, double *mins_out, double *maxs_out,
+                                               uint64_t *unique_count_out) {
+	if (!addresses || !values || !validity || !unique_addresses_out || !sums_out || !counts_out || !mins_out ||
+	    !maxs_out || !unique_count_out) {
+		return 1;
+	}
+	if (count == 0) {
+		*unique_count_out = 0;
+		return 0;
+	}
+
+	unsigned long long result_count = 0;
+	thread_local GroupByStatsDoubleBuffers buffers;
+
+	const auto addresses_bytes = count * sizeof(uint64_t);
+	const auto values_bytes = count * sizeof(double);
+	const auto validity_bytes = count * sizeof(uint8_t);
+	const auto unique_addresses_bytes = count * sizeof(uint64_t);
+	const auto sums_bytes = count * sizeof(double);
+	const auto counts_bytes = count * sizeof(unsigned long long);
+	const auto mins_bytes = count * sizeof(double);
+	const auto maxs_bytes = count * sizeof(double);
+
+	int error = 0;
+	error |= buffers.addresses.Ensure(addresses_bytes, "resize groupby stats addresses");
+	error |= buffers.values.Ensure(values_bytes, "resize groupby stats values");
+	error |= buffers.validity.Ensure(validity_bytes, "resize groupby stats validity");
+	error |= buffers.unique_addresses.Ensure(unique_addresses_bytes, "resize groupby stats unique addresses");
+	error |= buffers.sums.Ensure(sums_bytes, "resize groupby stats sums");
+	error |= buffers.counts.Ensure(counts_bytes, "resize groupby stats counts");
+	error |= buffers.mins.Ensure(mins_bytes, "resize groupby stats mins");
+	error |= buffers.maxs.Ensure(maxs_bytes, "resize groupby stats maxs");
+	error |= buffers.unique_count.Ensure(sizeof(unsigned long long), "resize groupby stats unique count");
+	if (error) {
+		return 1;
+	}
+
+	auto d_addresses = buffers.addresses.As<uint64_t>();
+	auto d_values = buffers.values.As<double>();
+	auto d_validity = buffers.validity.As<uint8_t>();
+	auto d_unique_addresses = buffers.unique_addresses.As<uint64_t>();
+	auto d_sums = buffers.sums.As<double>();
+	auto d_counts = buffers.counts.As<unsigned long long>();
+	auto d_mins = buffers.mins.As<double>();
+	auto d_maxs = buffers.maxs.As<double>();
+	auto d_unique_count = buffers.unique_count.As<unsigned long long>();
+
+	error |= CheckCuda(cudaMemcpy(d_addresses, addresses, addresses_bytes, cudaMemcpyHostToDevice),
+	                   "copy groupby stats addresses to device");
+	error |= CheckCuda(cudaMemcpy(d_values, values, values_bytes, cudaMemcpyHostToDevice),
+	                   "copy groupby stats values to device");
+	error |= CheckCuda(cudaMemcpy(d_validity, validity, validity_bytes, cudaMemcpyHostToDevice),
+	                   "copy groupby stats validity to device");
+	error |= CheckCuda(cudaMemset(d_unique_count, 0, sizeof(unsigned long long)), "clear groupby stats unique count");
+	if (error) {
+		return 1;
+	}
+
+	{
+		constexpr int THREADS_PER_BLOCK = 256;
+		const auto blocks = static_cast<unsigned int>((count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+		DuckDBGpuGroupByStatsDoubleKernel<<<blocks, THREADS_PER_BLOCK>>>(d_addresses, d_values, d_validity, count,
+		                                                                 d_unique_addresses, d_sums, d_counts,
+		                                                                 d_mins, d_maxs, d_unique_count);
+		error |= CheckCuda(cudaGetLastError(), "launch groupby stats double kernel");
+		error |= CheckCuda(cudaMemcpy(&result_count, d_unique_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost),
+		                   "copy groupby stats unique count to host");
+	}
+	if (error || result_count > count) {
+		return 1;
+	}
+
+	error |= CheckCuda(cudaMemcpy(unique_addresses_out, d_unique_addresses, result_count * sizeof(uint64_t),
+	                             cudaMemcpyDeviceToHost),
+	                   "copy groupby stats unique addresses to host");
+	error |= CheckCuda(cudaMemcpy(sums_out, d_sums, result_count * sizeof(double), cudaMemcpyDeviceToHost),
+	                   "copy groupby stats sums to host");
+	error |= CheckCuda(cudaMemcpy(counts_out, d_counts, result_count * sizeof(unsigned long long),
+	                             cudaMemcpyDeviceToHost),
+	                   "copy groupby stats counts to host");
+	error |= CheckCuda(cudaMemcpy(mins_out, d_mins, result_count * sizeof(double), cudaMemcpyDeviceToHost),
+	                   "copy groupby stats mins to host");
+	error |= CheckCuda(cudaMemcpy(maxs_out, d_maxs, result_count * sizeof(double), cudaMemcpyDeviceToHost),
+	                   "copy groupby stats maxs to host");
 	*unique_count_out = static_cast<uint64_t>(result_count);
 	return error ? 1 : 0;
 }
@@ -554,5 +817,97 @@ extern "C" int duckdb_gpu_fused_lat_agg_i64_double(const int64_t *grids, const d
 	                   "copy fused counts to host");
 	error |= CheckCuda(cudaMemcpy(row_count_out, d_row_counts, count_bytes, cudaMemcpyDeviceToHost),
 	                   "copy fused row counts to host");
+	return error ? 1 : 0;
+}
+
+extern "C" int duckdb_gpu_fused_lat_agg_i64_double_mapped(const int64_t *grids, const double *values,
+                                                          const uint8_t *value_validity, uint64_t count,
+                                                          int64_t grid_min, int64_t grid_max,
+                                                          const int32_t *grid_to_group, uint64_t build_size,
+                                                          uint64_t group_count, double *sum_out, uint64_t *count_out,
+                                                          uint64_t *row_count_out) {
+	if (!grids || !values || !grid_to_group || !sum_out || !count_out || !row_count_out) {
+		return 1;
+	}
+	if (group_count == 0) {
+		return 0;
+	}
+	if (count == 0) {
+		std::memset(sum_out, 0, group_count * sizeof(double));
+		std::memset(count_out, 0, group_count * sizeof(uint64_t));
+		std::memset(row_count_out, 0, group_count * sizeof(uint64_t));
+		return 0;
+	}
+	if (grid_max < grid_min || build_size == 0) {
+		return 1;
+	}
+
+	thread_local MappedFusedLatAggBuffers buffers;
+	const auto grid_bytes = count * sizeof(int64_t);
+	const auto value_bytes = count * sizeof(double);
+	const auto validity_bytes = count * sizeof(uint8_t);
+	const auto build_bytes = build_size * sizeof(int32_t);
+	const auto sum_bytes = group_count * sizeof(double);
+	const auto count_bytes = group_count * sizeof(unsigned long long);
+
+	int error = 0;
+	error |= buffers.grids.Ensure(grid_bytes, "resize mapped fused grids");
+	error |= buffers.values.Ensure(value_bytes, "resize mapped fused values");
+	error |= buffers.value_validity.Ensure(validity_bytes, "resize mapped fused value validity");
+	error |= buffers.grid_to_group.Ensure(build_bytes, "resize mapped fused grid to group");
+	error |= buffers.sums.Ensure(sum_bytes, "resize mapped fused sums");
+	error |= buffers.counts.Ensure(count_bytes, "resize mapped fused counts");
+	error |= buffers.row_counts.Ensure(count_bytes, "resize mapped fused row counts");
+	if (error) {
+		return 1;
+	}
+
+	auto h_grids = buffers.grids.HostAs<int64_t>();
+	auto h_values = buffers.values.HostAs<double>();
+	auto h_value_validity = buffers.value_validity.HostAs<uint8_t>();
+	auto h_grid_to_group = buffers.grid_to_group.HostAs<int32_t>();
+	auto d_grids = buffers.grids.DeviceAs<int64_t>();
+	auto d_values = buffers.values.DeviceAs<double>();
+	auto d_value_validity = buffers.value_validity.DeviceAs<uint8_t>();
+	auto d_grid_to_group = buffers.grid_to_group.DeviceAs<int32_t>();
+	auto d_sums = buffers.sums.As<double>();
+	auto d_counts = buffers.counts.As<unsigned long long>();
+	auto d_row_counts = buffers.row_counts.As<unsigned long long>();
+
+	std::memcpy(h_grids, grids, grid_bytes);
+	std::memcpy(h_values, values, value_bytes);
+	if (value_validity) {
+		std::memcpy(h_value_validity, value_validity, validity_bytes);
+	} else {
+		std::memset(h_value_validity, 1, validity_bytes);
+	}
+	std::memcpy(h_grid_to_group, grid_to_group, build_bytes);
+
+	error |= CheckCuda(cudaMemset(d_sums, 0, sum_bytes), "clear mapped fused sums");
+	error |= CheckCuda(cudaMemset(d_counts, 0, count_bytes), "clear mapped fused counts");
+	error |= CheckCuda(cudaMemset(d_row_counts, 0, count_bytes), "clear mapped fused row counts");
+	if (error) {
+		return 1;
+	}
+
+	{
+		constexpr int THREADS_PER_BLOCK = 256;
+		const auto blocks = static_cast<unsigned int>((count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+		DuckDBGpuFusedLatAggKernel<<<blocks, THREADS_PER_BLOCK>>>(d_grids, d_values, d_value_validity, count, grid_min,
+		                                                          grid_max, d_grid_to_group, build_size, d_sums,
+		                                                          d_counts, d_row_counts);
+		error |= CheckCuda(cudaGetLastError(), "launch mapped fused lat aggregate kernel");
+		error |= CheckCuda(cudaDeviceSynchronize(), "synchronize mapped fused lat aggregate kernel");
+	}
+	if (error) {
+		return 1;
+	}
+
+	error |= CheckCuda(cudaMemcpy(sum_out, d_sums, sum_bytes, cudaMemcpyDeviceToHost),
+	                   "copy mapped fused sums to host");
+	error |= CheckCuda(cudaMemcpy(count_out, d_counts, count_bytes, cudaMemcpyDeviceToHost),
+	                   "copy mapped fused counts to host");
+	error |= CheckCuda(cudaMemcpy(row_count_out, d_row_counts, count_bytes, cudaMemcpyDeviceToHost),
+	                   "copy mapped fused row counts to host");
 	return error ? 1 : 0;
 }

@@ -13,9 +13,8 @@ def escape_sql_string(value):
     return value.replace("'", "''")
 
 
-def load_gpu_lib(path):
-    lib = ctypes.CDLL(path)
-    lib.duckdb_gpu_fused_lat_agg_i64_double.argtypes = [
+def bind_fused_function(function):
+    function.argtypes = [
         np.ctypeslib.ndpointer(dtype=np.int64, flags="C_CONTIGUOUS"),
         np.ctypeslib.ndpointer(dtype=np.float64, flags="C_CONTIGUOUS"),
         np.ctypeslib.ndpointer(dtype=np.uint8, flags="C_CONTIGUOUS"),
@@ -29,7 +28,13 @@ def load_gpu_lib(path):
         np.ctypeslib.ndpointer(dtype=np.uint64, flags="C_CONTIGUOUS"),
         np.ctypeslib.ndpointer(dtype=np.uint64, flags="C_CONTIGUOUS"),
     ]
-    lib.duckdb_gpu_fused_lat_agg_i64_double.restype = ctypes.c_int
+    function.restype = ctypes.c_int
+
+
+def load_gpu_lib(path):
+    lib = ctypes.CDLL(path)
+    bind_fused_function(lib.duckdb_gpu_fused_lat_agg_i64_double)
+    bind_fused_function(lib.duckdb_gpu_fused_lat_agg_i64_double_mapped)
     return lib
 
 
@@ -87,6 +92,12 @@ def main():
     parser = argparse.ArgumentParser(description="Experimental fused GPU join+lat aggregate path")
     parser.add_argument("base_dir")
     parser.add_argument("--var", default="qicps")
+    parser.add_argument(
+        "--mode",
+        choices=["device", "mapped"],
+        default="device",
+        help="device uses cudaMemcpy HtoD; mapped uses cudaHostAllocMapped zero-copy inputs",
+    )
     parser.add_argument("--print-averages", action="store_true")
     parser.add_argument(
         "--lib",
@@ -100,6 +111,11 @@ def main():
         raise RuntimeError("no input parquet files found below {}".format(args.base_dir))
 
     gpu = load_gpu_lib(args.lib)
+    fused_agg = (
+        gpu.duckdb_gpu_fused_lat_agg_i64_double_mapped
+        if args.mode == "mapped"
+        else gpu.duckdb_gpu_fused_lat_agg_i64_double
+    )
     con = duckdb.connect()
 
     total_sum = {}
@@ -119,7 +135,7 @@ def main():
         counts = np.zeros(group_count, dtype=np.uint64)
         row_counts = np.zeros(group_count, dtype=np.uint64)
 
-        rc = gpu.duckdb_gpu_fused_lat_agg_i64_double(
+        rc = fused_agg(
             grids,
             values,
             validity,
