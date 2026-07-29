@@ -6,11 +6,19 @@
 
 #include <chrono>
 #include <algorithm>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <dlfcn.h>
+#include <exception>
+#include <functional>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <utility>
 
 namespace py = pybind11;
 
@@ -22,6 +30,29 @@ using FusedLatAggFunc = int (*)(const int64_t *grids, const double *values, cons
                                 uint64_t count, int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group,
                                 uint64_t build_size, uint64_t group_count, double *sum_out, uint64_t *count_out,
                                 uint64_t *row_count_out);
+using FusedLatAggPipelineCreateFunc = void *(*)(uint32_t slot_count, int mapped);
+using FusedLatAggPipelineSubmitFunc = int (*)(void *handle, uint32_t slot_idx, const int64_t *grids,
+                                              const double *values, const uint8_t *value_validity, uint64_t count,
+                                              int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group,
+                                              uint64_t build_size, uint64_t group_count);
+using FusedLatAggPipelineResetFunc = int (*)(void *handle, uint32_t slot_idx, int64_t grid_min, int64_t grid_max,
+                                             const int32_t *grid_to_group, uint64_t build_size,
+                                             uint64_t group_count);
+using FusedLatAggPipelineSubmitAccumulateFunc = int (*)(void *handle, uint32_t slot_idx, const int64_t *grids,
+                                                        const double *values, const uint8_t *value_validity,
+                                                        uint64_t count);
+using FusedLatAggPipelineWaitFunc = int (*)(void *handle, uint32_t slot_idx, double *sum_out, uint64_t *count_out,
+                                            uint64_t *row_count_out);
+using FusedLatAggPipelineDestroyFunc = void (*)(void *handle);
+
+struct FusedLatAggPipelineFuncs {
+	FusedLatAggPipelineCreateFunc create = nullptr;
+	FusedLatAggPipelineSubmitFunc submit = nullptr;
+	FusedLatAggPipelineResetFunc reset = nullptr;
+	FusedLatAggPipelineSubmitAccumulateFunc submit_accumulate = nullptr;
+	FusedLatAggPipelineWaitFunc wait = nullptr;
+	FusedLatAggPipelineDestroyFunc destroy = nullptr;
+};
 
 static string EscapeSQLString(const string &value) {
 	string result;
@@ -60,6 +91,19 @@ static string ParentPath(const string &path) {
 	return path.substr(0, slash);
 }
 
+static idx_t ReadEnvIdx(const char *name, idx_t default_value) {
+	auto value = std::getenv(name);
+	if (!value || !value[0]) {
+		return default_value;
+	}
+	char *end = nullptr;
+	auto parsed = std::strtoull(value, &end, 10);
+	if (!end || *end != '\0' || parsed == 0) {
+		return default_value;
+	}
+	return static_cast<idx_t>(parsed);
+}
+
 static FusedLatAggFunc LoadFusedLatAgg(const string &path_p, bool mapped) {
 	static void *device_handle = nullptr;
 	static void *mapped_handle = nullptr;
@@ -93,6 +137,46 @@ static FusedLatAggFunc LoadFusedLatAgg(const string &path_p, bool mapped) {
 		throw InvalidInputException("Failed to load GPU helper symbol '%s': %s", symbol, dlerror());
 	}
 	return func;
+}
+
+static FusedLatAggPipelineFuncs LoadFusedLatAggPipeline(const string &path_p) {
+	static void *handle = nullptr;
+	static FusedLatAggPipelineFuncs funcs;
+	if (funcs.create && funcs.submit && funcs.reset && funcs.submit_accumulate && funcs.wait && funcs.destroy) {
+		return funcs;
+	}
+
+	string path = path_p;
+	if (path.empty()) {
+		const char *env_path = std::getenv("DUCKDB_GPU_PROBE_LIB");
+		if (env_path && env_path[0]) {
+			path = env_path;
+		} else {
+			path = "libduckdb_gpu_probe.so";
+		}
+	}
+
+	handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+	if (!handle) {
+		throw InvalidInputException("Failed to load GPU helper library '%s': %s", path, dlerror());
+	}
+
+	funcs.create = reinterpret_cast<FusedLatAggPipelineCreateFunc>(
+	    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_create"));
+	funcs.submit = reinterpret_cast<FusedLatAggPipelineSubmitFunc>(
+	    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_submit_i64_double"));
+	funcs.reset = reinterpret_cast<FusedLatAggPipelineResetFunc>(
+	    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_reset_i64_double"));
+	funcs.submit_accumulate = reinterpret_cast<FusedLatAggPipelineSubmitAccumulateFunc>(
+	    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_submit_accumulate_i64_double"));
+	funcs.wait =
+	    reinterpret_cast<FusedLatAggPipelineWaitFunc>(dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_wait"));
+	funcs.destroy =
+	    reinterpret_cast<FusedLatAggPipelineDestroyFunc>(dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_destroy"));
+	if (!funcs.create || !funcs.submit || !funcs.reset || !funcs.submit_accumulate || !funcs.wait || !funcs.destroy) {
+		throw InvalidInputException("Failed to load GPU fused pipeline symbols from '%s'", path);
+	}
+	return funcs;
 }
 
 static unique_ptr<QueryResult> RunStreamingQuery(Connection &connection, const string &query) {
@@ -185,44 +269,372 @@ struct ProbeColumns {
 	vector<uint8_t> validity;
 };
 
-static ProbeColumns ReadProbeColumns(Connection &connection, const string &fact_path, const string &join_key,
-                                     const string &payload_column) {
-	auto query = StringUtil::Format(
+template <class T>
+class BlockingQueue {
+public:
+	explicit BlockingQueue(idx_t capacity_p = 0) : capacity(capacity_p) {
+	}
+
+	void Push(T item) {
+		{
+			std::unique_lock<std::mutex> guard(lock);
+			condition.wait(guard, [&] { return closed || capacity == 0 || items.size() < capacity; });
+			if (closed) {
+				return;
+			}
+			items.push_back(std::move(item));
+		}
+		condition.notify_all();
+	}
+
+	bool Pop(T &result) {
+		std::unique_lock<std::mutex> guard(lock);
+		condition.wait(guard, [&] { return closed || !items.empty(); });
+		if (items.empty()) {
+			return false;
+		}
+		result = std::move(items.front());
+		items.pop_front();
+		condition.notify_all();
+		return true;
+	}
+
+	void Close() {
+		{
+			std::lock_guard<std::mutex> guard(lock);
+			closed = true;
+		}
+		condition.notify_all();
+	}
+
+private:
+	std::mutex lock;
+	std::condition_variable condition;
+	std::deque<T> items;
+	idx_t capacity;
+	bool closed = false;
+};
+
+struct PipelineRawBatch {
+	string fact_path;
+	std::shared_ptr<GroupMapping> mapping;
+	vector<int64_t> join_keys;
+	vector<double> values;
+	vector<uint8_t> value_validity;
+	vector<uint8_t> join_validity;
+};
+
+struct PipelineInputBatch {
+	string fact_path;
+	std::shared_ptr<GroupMapping> mapping;
+	ProbeColumns probe;
+};
+
+struct PipelineOutputBatch {
+	string fact_path;
+	std::shared_ptr<GroupMapping> mapping;
+	vector<double> sums;
+	vector<uint64_t> counts;
+	vector<uint64_t> row_counts;
+};
+
+struct PipelinePendingBatch {
+	bool active = false;
+	idx_t slot = 0;
+	string fact_path;
+	std::shared_ptr<GroupMapping> mapping;
+	ProbeColumns probe;
+	vector<double> sums;
+	vector<uint64_t> counts;
+	vector<uint64_t> row_counts;
+};
+
+static string BuildProbeQuery(const string &fact_path, const string &join_key, const string &payload_column) {
+	return StringUtil::Format(
 	    "SELECT %s::BIGINT AS join_key, COALESCE(%s, 0)::DOUBLE AS value, "
 	    "CASE WHEN %s IS NULL THEN 0 ELSE 1 END::UTINYINT AS value_valid FROM read_parquet('%s')",
 	    QuoteIdentifier(join_key), QuoteIdentifier(payload_column), QuoteIdentifier(payload_column),
 	    EscapeSQLString(fact_path));
-	auto result = RunStreamingQuery(connection, query);
+}
+
+static void AppendProbeChunk(DataChunk &chunk, ProbeColumns &columns) {
+	auto count = chunk.size();
+	auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
+	auto value_data = FlatVector::GetData<double>(chunk.data[1]);
+	auto valid_data = FlatVector::GetData<uint8_t>(chunk.data[2]);
+	auto &join_validity = FlatVector::Validity(chunk.data[0]);
+
+	columns.join_keys.clear();
+	columns.values.clear();
+	columns.validity.clear();
+	columns.join_keys.reserve(count);
+	columns.values.reserve(count);
+	columns.validity.reserve(count);
+
+	for (idx_t row = 0; row < count; row++) {
+		if (!join_validity.RowIsValid(row)) {
+			continue;
+		}
+		columns.join_keys.push_back(join_data[row]);
+		columns.values.push_back(value_data[row]);
+		columns.validity.push_back(valid_data[row]);
+	}
+}
+
+static void AppendRawProbeChunk(DataChunk &chunk, PipelineRawBatch &batch) {
+	auto count = chunk.size();
+	auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
+	auto value_data = FlatVector::GetData<double>(chunk.data[1]);
+	auto valid_data = FlatVector::GetData<uint8_t>(chunk.data[2]);
+	auto &join_validity = FlatVector::Validity(chunk.data[0]);
+
+	batch.join_keys.resize(count);
+	batch.values.resize(count);
+	batch.value_validity.resize(count);
+	batch.join_validity.resize(count);
+
+	for (idx_t row = 0; row < count; row++) {
+		batch.join_keys[row] = join_data[row];
+		batch.values[row] = value_data[row];
+		batch.value_validity[row] = valid_data[row];
+		batch.join_validity[row] = join_validity.RowIsValid(row) ? 1 : 0;
+	}
+}
+
+static idx_t PreparedRowCount(const PipelineInputBatch &batch) {
+	return batch.probe.join_keys.size();
+}
+
+static void AppendPreparedRows(PipelineInputBatch &batch, PipelineRawBatch raw) {
+	if (batch.fact_path.empty()) {
+		batch.fact_path = std::move(raw.fact_path);
+		batch.mapping = std::move(raw.mapping);
+	}
+	auto count = raw.join_keys.size();
+	batch.probe.join_keys.reserve(batch.probe.join_keys.size() + count);
+	batch.probe.values.reserve(batch.probe.values.size() + count);
+	batch.probe.validity.reserve(batch.probe.validity.size() + count);
+
+	for (idx_t row = 0; row < count; row++) {
+		if (raw.join_validity[row] == 0) {
+			continue;
+		}
+		batch.probe.join_keys.push_back(raw.join_keys[row]);
+		batch.probe.values.push_back(raw.values[row]);
+		batch.probe.validity.push_back(raw.value_validity[row]);
+	}
+}
+
+static ProbeColumns ReadProbeColumns(Connection &connection, const string &fact_path, const string &join_key,
+                                     const string &payload_column) {
+	auto result = RunStreamingQuery(connection, BuildProbeQuery(fact_path, join_key, payload_column));
 	ProbeColumns columns;
+	ProbeColumns chunk_columns;
 
 	while (true) {
 		auto chunk = result->Fetch();
 		if (!chunk || chunk->size() == 0) {
 			break;
 		}
-		auto count = chunk->size();
-		auto join_data = FlatVector::GetData<int64_t>(chunk->data[0]);
-		auto value_data = FlatVector::GetData<double>(chunk->data[1]);
-		auto valid_data = FlatVector::GetData<uint8_t>(chunk->data[2]);
-		auto &join_validity = FlatVector::Validity(chunk->data[0]);
-		for (idx_t row = 0; row < count; row++) {
-			if (!join_validity.RowIsValid(row)) {
-				continue;
-			}
-			columns.join_keys.push_back(join_data[row]);
-			columns.values.push_back(value_data[row]);
-			columns.validity.push_back(valid_data[row]);
-		}
+		AppendProbeChunk(*chunk, chunk_columns);
+		columns.join_keys.insert(columns.join_keys.end(), chunk_columns.join_keys.begin(), chunk_columns.join_keys.end());
+		columns.values.insert(columns.values.end(), chunk_columns.values.begin(), chunk_columns.values.end());
+		columns.validity.insert(columns.validity.end(), chunk_columns.validity.begin(), chunk_columns.validity.end());
 	}
 	return columns;
+}
+
+static void MergeFusedResult(std::map<double, double> &total_sum, std::map<double, uint64_t> &total_count,
+                             uint64_t &total_rows, const GroupMapping &mapping, const vector<double> &sums,
+                             const vector<uint64_t> &counts, const vector<uint64_t> &row_counts) {
+	auto group_count = mapping.group_values.size();
+	for (idx_t group = 0; group < group_count; group++) {
+		auto row_count = row_counts[group];
+		if (row_count == 0) {
+			continue;
+		}
+		auto group_value = mapping.group_values[group];
+		total_sum[group_value] += sums[group];
+		total_count[group_value] += counts[group];
+		total_rows += row_count;
+	}
+}
+
+static void ReadPipelineRawBatches(DuckDB &db, const vector<string> &fact_paths, const string &payload_column,
+                                   const string &join_key, const string &group_column, const string &dimension_file,
+                                   BlockingQueue<PipelineRawBatch> &raw_queue, std::exception_ptr &error_out,
+                                   std::mutex &error_lock) {
+	try {
+		Connection connection(db);
+		for (auto &fact_path : fact_paths) {
+			auto dimension_path = ParentPath(fact_path) + "/" + dimension_file;
+			auto mapping =
+			    std::make_shared<GroupMapping>(ReadGroupMapping(connection, dimension_path, join_key, group_column));
+			auto result = RunStreamingQuery(connection, BuildProbeQuery(fact_path, join_key, payload_column));
+
+			while (true) {
+				auto chunk = result->Fetch();
+				if (!chunk || chunk->size() == 0) {
+					break;
+				}
+
+				PipelineRawBatch batch;
+				batch.fact_path = fact_path;
+				batch.mapping = mapping;
+				AppendRawProbeChunk(*chunk, batch);
+				raw_queue.Push(std::move(batch));
+			}
+		}
+	} catch (...) {
+		std::lock_guard<std::mutex> guard(error_lock);
+		if (!error_out) {
+			error_out = std::current_exception();
+		}
+	}
+	raw_queue.Close();
+}
+
+static void PreparePipelineInputBatches(BlockingQueue<PipelineRawBatch> &raw_queue,
+                                        BlockingQueue<PipelineInputBatch> &input_queue,
+                                        std::exception_ptr &error_out, std::mutex &error_lock) {
+	try {
+		auto target_batch_rows = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_ROWS", 65536);
+		auto target_batch_chunks = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_CHUNKS", 32);
+		PipelineInputBatch current;
+		idx_t current_chunks = 0;
+
+		auto flush_current = [&]() {
+			if (PreparedRowCount(current) > 0) {
+				input_queue.Push(std::move(current));
+			}
+			current = PipelineInputBatch();
+			current_chunks = 0;
+		};
+
+		PipelineRawBatch raw;
+		while (raw_queue.Pop(raw)) {
+			auto raw_rows = raw.join_keys.size();
+			auto boundary = !current.fact_path.empty() &&
+			                (current.fact_path != raw.fact_path || current.mapping != raw.mapping);
+			auto would_exceed_rows =
+			    PreparedRowCount(current) > 0 && PreparedRowCount(current) + raw_rows > target_batch_rows;
+			auto would_exceed_chunks = current_chunks >= target_batch_chunks;
+			if (boundary || would_exceed_rows || would_exceed_chunks) {
+				flush_current();
+			}
+
+			AppendPreparedRows(current, std::move(raw));
+			current_chunks++;
+			if (PreparedRowCount(current) >= target_batch_rows || current_chunks >= target_batch_chunks) {
+				flush_current();
+			}
+		}
+		flush_current();
+	} catch (...) {
+		std::lock_guard<std::mutex> guard(error_lock);
+		if (!error_out) {
+			error_out = std::current_exception();
+		}
+	}
+	input_queue.Close();
+}
+
+static void RunPipelineGPUWorker(FusedLatAggPipelineFuncs pipeline, void *handle,
+                                 BlockingQueue<PipelineInputBatch> &input_queue,
+                                 BlockingQueue<PipelineOutputBatch> &output_queue, std::exception_ptr &error_out,
+                                 std::mutex &error_lock) {
+	try {
+		constexpr idx_t ACCUMULATOR_SLOT = 0;
+		PipelinePendingBatch pending;
+		PipelineInputBatch batch;
+
+		auto flush_pending = [&]() {
+			if (!pending.active) {
+				return;
+			}
+			auto rc = pipeline.wait(handle, static_cast<uint32_t>(ACCUMULATOR_SLOT), pending.sums.data(),
+			                        pending.counts.data(), pending.row_counts.data());
+			if (rc != 0) {
+				throw InvalidInputException("GPU fused pipeline wait failed for '%s'", pending.fact_path);
+			}
+
+			PipelineOutputBatch output;
+			output.fact_path = pending.fact_path;
+			output.mapping = pending.mapping;
+			output.sums = std::move(pending.sums);
+			output.counts = std::move(pending.counts);
+			output.row_counts = std::move(pending.row_counts);
+			output_queue.Push(std::move(output));
+			pending = PipelinePendingBatch();
+		};
+
+		auto reset_for_file = [&](PipelineInputBatch &input) {
+			auto group_count = input.mapping->group_values.size();
+			auto rc = pipeline.reset(handle, static_cast<uint32_t>(ACCUMULATOR_SLOT), input.mapping->join_min,
+			                         input.mapping->join_max, input.mapping->join_to_group.data(),
+			                         static_cast<uint64_t>(input.mapping->join_to_group.size()),
+			                         static_cast<uint64_t>(group_count));
+			if (rc != 0) {
+				throw InvalidInputException("GPU fused pipeline accumulator reset failed for '%s'", input.fact_path);
+			}
+			pending.active = true;
+			pending.slot = ACCUMULATOR_SLOT;
+			pending.fact_path = input.fact_path;
+			pending.mapping = input.mapping;
+			pending.sums.assign(group_count, 0);
+			pending.counts.assign(group_count, 0);
+			pending.row_counts.assign(group_count, 0);
+		};
+
+		while (input_queue.Pop(batch)) {
+			if (!pending.active || pending.fact_path != batch.fact_path || pending.mapping != batch.mapping) {
+				flush_pending();
+				reset_for_file(batch);
+			}
+
+			auto rc = pipeline.submit_accumulate(
+			    handle, static_cast<uint32_t>(ACCUMULATOR_SLOT), batch.probe.join_keys.data(),
+			    batch.probe.values.data(), batch.probe.validity.data(), static_cast<uint64_t>(batch.probe.join_keys.size()));
+			if (rc != 0) {
+				throw InvalidInputException("GPU fused pipeline accumulate submit failed for '%s'", batch.fact_path);
+			}
+		}
+
+		flush_pending();
+	} catch (...) {
+		std::lock_guard<std::mutex> guard(error_lock);
+		if (!error_out) {
+			error_out = std::current_exception();
+		}
+	}
+	output_queue.Close();
+}
+
+static void RunPipelineMergeWorker(BlockingQueue<PipelineOutputBatch> &output_queue,
+                                   std::map<double, double> &total_sum,
+                                   std::map<double, uint64_t> &total_count, uint64_t &total_rows,
+                                   std::exception_ptr &error_out, std::mutex &error_lock) {
+	try {
+		PipelineOutputBatch output;
+		while (output_queue.Pop(output)) {
+			MergeFusedResult(total_sum, total_count, total_rows, *output.mapping, output.sums, output.counts,
+			                 output.row_counts);
+		}
+	} catch (...) {
+		std::lock_guard<std::mutex> guard(error_lock);
+		if (!error_out) {
+			error_out = std::current_exception();
+		}
+	}
 }
 
 static py::dict DBSGPUFusedLatPipeline(const py::iterable &fact_paths_p, const string &payload_column,
                                        const string &join_key, const string &group_column,
                                        const string &dimension_file, const string &lib_path, const string &mode) {
-	const bool mapped = mode == "mapped";
-	if (!mapped && mode != "device") {
-		throw InvalidInputException("mode must be either 'device' or 'mapped'");
+	const bool pipeline_mode = mode == "pipeline-device" || mode == "pipeline-mapped";
+	const bool mapped = mode == "mapped" || mode == "pipeline-mapped";
+	if (!mapped && mode != "device" && !pipeline_mode) {
+		throw InvalidInputException("mode must be 'device', 'mapped', 'pipeline-device', or 'pipeline-mapped'");
 	}
 
 	vector<string> fact_paths;
@@ -236,42 +648,91 @@ static py::dict DBSGPUFusedLatPipeline(const py::iterable &fact_paths_p, const s
 	auto start = std::chrono::steady_clock::now();
 	DuckDB db(nullptr);
 	Connection connection(db);
-	auto fused_agg = LoadFusedLatAgg(lib_path, mapped);
 
 	std::map<double, double> total_sum;
 	std::map<double, uint64_t> total_count;
 	uint64_t total_rows = 0;
 
-	for (auto &fact_path : fact_paths) {
-		auto dimension_path = ParentPath(fact_path) + "/" + dimension_file;
-		auto mapping = ReadGroupMapping(connection, dimension_path, join_key, group_column);
-		auto probe = ReadProbeColumns(connection, fact_path, join_key, payload_column);
-		if (probe.join_keys.empty()) {
-			continue;
+	if (pipeline_mode) {
+		auto pipeline = LoadFusedLatAggPipeline(lib_path);
+		constexpr idx_t PIPELINE_SLOTS = 2;
+		void *handle = pipeline.create(static_cast<uint32_t>(PIPELINE_SLOTS), mapped ? 1 : 0);
+		if (!handle) {
+			throw InvalidInputException("Failed to create GPU fused pipeline");
 		}
 
-		auto group_count = mapping.group_values.size();
-		vector<double> sums(group_count, 0);
-		vector<uint64_t> counts(group_count, 0);
-		vector<uint64_t> row_counts(group_count, 0);
+		BlockingQueue<PipelineRawBatch> raw_queue(8);
+		BlockingQueue<PipelineInputBatch> input_queue(8);
+		BlockingQueue<PipelineOutputBatch> output_queue(8);
+		std::exception_ptr worker_error;
+		std::mutex worker_error_lock;
 
-		auto rc = fused_agg(probe.join_keys.data(), probe.values.data(), probe.validity.data(),
-		                    static_cast<uint64_t>(probe.join_keys.size()), mapping.join_min, mapping.join_max,
-		                    mapping.join_to_group.data(), static_cast<uint64_t>(mapping.join_to_group.size()),
-		                    static_cast<uint64_t>(group_count), sums.data(), counts.data(), row_counts.data());
-		if (rc != 0) {
-			throw InvalidInputException("GPU fused aggregate failed for '%s'", fact_path);
+		std::thread reader_thread(ReadPipelineRawBatches, std::ref(db), std::cref(fact_paths),
+		                          std::cref(payload_column), std::cref(join_key), std::cref(group_column),
+		                          std::cref(dimension_file), std::ref(raw_queue), std::ref(worker_error),
+		                          std::ref(worker_error_lock));
+		std::thread prepare_thread(PreparePipelineInputBatches, std::ref(raw_queue), std::ref(input_queue),
+		                           std::ref(worker_error), std::ref(worker_error_lock));
+		std::thread gpu_thread(RunPipelineGPUWorker, pipeline, handle, std::ref(input_queue), std::ref(output_queue),
+		                       std::ref(worker_error), std::ref(worker_error_lock));
+		std::thread merge_thread(RunPipelineMergeWorker, std::ref(output_queue), std::ref(total_sum),
+		                         std::ref(total_count), std::ref(total_rows), std::ref(worker_error),
+		                         std::ref(worker_error_lock));
+
+		try {
+			reader_thread.join();
+			prepare_thread.join();
+			gpu_thread.join();
+			merge_thread.join();
+			pipeline.destroy(handle);
+
+			if (worker_error) {
+				std::rethrow_exception(worker_error);
+			}
+		} catch (...) {
+			raw_queue.Close();
+			input_queue.Close();
+			output_queue.Close();
+			if (reader_thread.joinable()) {
+				reader_thread.join();
+			}
+			if (prepare_thread.joinable()) {
+				prepare_thread.join();
+			}
+			if (gpu_thread.joinable()) {
+				gpu_thread.join();
+			}
+			if (merge_thread.joinable()) {
+				merge_thread.join();
+			}
+			pipeline.destroy(handle);
+			throw;
 		}
+	} else {
+		auto fused_agg = LoadFusedLatAgg(lib_path, mapped);
 
-		for (idx_t group = 0; group < group_count; group++) {
-			auto row_count = row_counts[group];
-			if (row_count == 0) {
+		for (auto &fact_path : fact_paths) {
+			auto dimension_path = ParentPath(fact_path) + "/" + dimension_file;
+			auto mapping = ReadGroupMapping(connection, dimension_path, join_key, group_column);
+			auto probe = ReadProbeColumns(connection, fact_path, join_key, payload_column);
+			if (probe.join_keys.empty()) {
 				continue;
 			}
-			auto group_value = mapping.group_values[group];
-			total_sum[group_value] += sums[group];
-			total_count[group_value] += counts[group];
-			total_rows += row_count;
+
+			auto group_count = mapping.group_values.size();
+			vector<double> sums(group_count, 0);
+			vector<uint64_t> counts(group_count, 0);
+			vector<uint64_t> row_counts(group_count, 0);
+
+			auto rc = fused_agg(probe.join_keys.data(), probe.values.data(), probe.validity.data(),
+			                    static_cast<uint64_t>(probe.join_keys.size()), mapping.join_min, mapping.join_max,
+			                    mapping.join_to_group.data(), static_cast<uint64_t>(mapping.join_to_group.size()),
+			                    static_cast<uint64_t>(group_count), sums.data(), counts.data(), row_counts.data());
+			if (rc != 0) {
+				throw InvalidInputException("GPU fused aggregate failed for '%s'", fact_path);
+			}
+
+			MergeFusedResult(total_sum, total_count, total_rows, mapping, sums, counts, row_counts);
 		}
 	}
 
@@ -297,7 +758,8 @@ static py::dict DBSGPUFusedLatPipeline(const py::iterable &fact_paths_p, const s
 void RegisterDBSGPUFused(py::module_ &m) {
 	m.def("dbs_gpu_fused_lat_pipeline", &DBSGPUFusedLatPipeline, py::arg("fact_paths"),
 	      py::arg("payload_column") = "qicps", py::arg("join_key") = "grid", py::arg("group_column") = "lats",
-	      py::arg("dimension_file") = "grid.parquet", py::arg("lib_path") = "", py::arg("mode") = "device");
+	      py::arg("dimension_file") = "grid.parquet", py::arg("lib_path") = "",
+	      py::arg("mode") = "pipeline-device");
 }
 
 } // namespace duckdb

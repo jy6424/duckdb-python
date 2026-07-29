@@ -445,6 +445,63 @@ struct MappedFusedLatAggBuffers {
 	DeviceBuffer row_counts;
 };
 
+struct FusedLatAggPipelineSlot {
+	DeviceBuffer grids;
+	DeviceBuffer values;
+	DeviceBuffer value_validity;
+	DeviceBuffer grid_to_group;
+	MappedHostBuffer mapped_grids;
+	MappedHostBuffer mapped_values;
+	MappedHostBuffer mapped_value_validity;
+	MappedHostBuffer mapped_grid_to_group;
+	DeviceBuffer sums;
+	DeviceBuffer counts;
+	DeviceBuffer row_counts;
+	cudaStream_t stream = nullptr;
+	bool active = false;
+	bool mapped = false;
+	uint64_t count = 0;
+	uint64_t group_count = 0;
+	uint64_t build_size = 0;
+	int64_t grid_min = 0;
+	int64_t grid_max = 0;
+
+	~FusedLatAggPipelineSlot() {
+		if (stream) {
+			cudaStreamSynchronize(stream);
+			cudaStreamDestroy(stream);
+		}
+	}
+
+	int EnsureStream() {
+		if (stream) {
+			return 0;
+		}
+		return CheckCuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create fused pipeline stream");
+	}
+};
+
+struct FusedLatAggPipelineState {
+	explicit FusedLatAggPipelineState(uint32_t slot_count_p, bool mapped_p)
+	    : slot_count(slot_count_p), slots(new FusedLatAggPipelineSlot[slot_count_p]) {
+		for (uint32_t slot = 0; slot < slot_count; slot++) {
+			slots[slot].mapped = mapped_p;
+		}
+	}
+
+	~FusedLatAggPipelineState() {
+		for (uint32_t slot = 0; slot < slot_count; slot++) {
+			if (slots[slot].stream) {
+				cudaStreamSynchronize(slots[slot].stream);
+			}
+		}
+		delete[] slots;
+	}
+
+	uint32_t slot_count;
+	FusedLatAggPipelineSlot *slots;
+};
+
 } // namespace
 
 extern "C" int duckdb_gpu_probe_i64(const int64_t *keys, const uint8_t *validity, uint64_t count, int64_t min_value,
@@ -1076,4 +1133,343 @@ extern "C" int duckdb_gpu_fused_lat_agg_i64_double_mapped(const int64_t *grids, 
 	error |= CheckCuda(cudaMemcpy(row_count_out, d_row_counts, count_bytes, cudaMemcpyDeviceToHost),
 	                   "copy mapped fused row counts to host");
 	return error ? 1 : 0;
+}
+
+extern "C" void *duckdb_gpu_fused_lat_agg_pipeline_create(uint32_t slot_count, int mapped) {
+	if (slot_count == 0) {
+		slot_count = 2;
+	}
+	auto state = new FusedLatAggPipelineState(slot_count, mapped != 0);
+	for (uint32_t slot = 0; slot < slot_count; slot++) {
+		if (state->slots[slot].EnsureStream()) {
+			delete state;
+			return nullptr;
+		}
+	}
+	return state;
+}
+
+extern "C" int duckdb_gpu_fused_lat_agg_pipeline_submit_i64_double(
+    void *handle, uint32_t slot_idx, const int64_t *grids, const double *values, const uint8_t *value_validity,
+    uint64_t count, int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group, uint64_t build_size,
+    uint64_t group_count) {
+	if (!handle || !grids || !values || !grid_to_group || group_count == 0) {
+		return 1;
+	}
+	if (grid_max < grid_min || build_size == 0) {
+		return 1;
+	}
+
+	auto state = reinterpret_cast<FusedLatAggPipelineState *>(handle);
+	if (slot_idx >= state->slot_count) {
+		return 1;
+	}
+	auto &slot = state->slots[slot_idx];
+	if (slot.EnsureStream()) {
+		return 1;
+	}
+	if (slot.active) {
+		if (CheckCuda(cudaStreamSynchronize(slot.stream), "wait active fused pipeline slot before reuse")) {
+			return 1;
+		}
+		slot.active = false;
+	}
+
+	const auto grid_bytes = count * sizeof(int64_t);
+	const auto value_bytes = count * sizeof(double);
+	const auto validity_bytes = count * sizeof(uint8_t);
+	const auto build_bytes = build_size * sizeof(int32_t);
+	const auto sum_bytes = group_count * sizeof(double);
+	const auto count_bytes = group_count * sizeof(unsigned long long);
+
+	int error = 0;
+	error |= slot.sums.Ensure(sum_bytes, "resize pipeline fused sums");
+	error |= slot.counts.Ensure(count_bytes, "resize pipeline fused counts");
+	error |= slot.row_counts.Ensure(count_bytes, "resize pipeline fused row counts");
+	if (slot.mapped) {
+		error |= slot.mapped_grids.Ensure(grid_bytes, "resize mapped pipeline fused grids");
+		error |= slot.mapped_values.Ensure(value_bytes, "resize mapped pipeline fused values");
+		error |= slot.mapped_value_validity.Ensure(validity_bytes, "resize mapped pipeline fused value validity");
+		error |= slot.mapped_grid_to_group.Ensure(build_bytes, "resize mapped pipeline fused grid to group");
+	} else {
+		error |= slot.grids.Ensure(grid_bytes, "resize pipeline fused grids");
+		error |= slot.values.Ensure(value_bytes, "resize pipeline fused values");
+		error |= slot.value_validity.Ensure(validity_bytes, "resize pipeline fused value validity");
+		error |= slot.grid_to_group.Ensure(build_bytes, "resize pipeline fused grid to group");
+	}
+	if (error) {
+		return 1;
+	}
+
+	int64_t *d_grids = nullptr;
+	double *d_values = nullptr;
+	uint8_t *d_value_validity = nullptr;
+	int32_t *d_grid_to_group = nullptr;
+	auto d_sums = slot.sums.As<double>();
+	auto d_counts = slot.counts.As<unsigned long long>();
+	auto d_row_counts = slot.row_counts.As<unsigned long long>();
+
+	if (slot.mapped) {
+		auto h_grids = slot.mapped_grids.HostAs<int64_t>();
+		auto h_values = slot.mapped_values.HostAs<double>();
+		auto h_value_validity = slot.mapped_value_validity.HostAs<uint8_t>();
+		auto h_grid_to_group = slot.mapped_grid_to_group.HostAs<int32_t>();
+		std::memcpy(h_grids, grids, grid_bytes);
+		std::memcpy(h_values, values, value_bytes);
+		if (value_validity) {
+			std::memcpy(h_value_validity, value_validity, validity_bytes);
+		} else {
+			std::memset(h_value_validity, 1, validity_bytes);
+		}
+		std::memcpy(h_grid_to_group, grid_to_group, build_bytes);
+
+		d_grids = slot.mapped_grids.DeviceAs<int64_t>();
+		d_values = slot.mapped_values.DeviceAs<double>();
+		d_value_validity = slot.mapped_value_validity.DeviceAs<uint8_t>();
+		d_grid_to_group = slot.mapped_grid_to_group.DeviceAs<int32_t>();
+	} else {
+		d_grids = slot.grids.As<int64_t>();
+		d_values = slot.values.As<double>();
+		d_value_validity = slot.value_validity.As<uint8_t>();
+		d_grid_to_group = slot.grid_to_group.As<int32_t>();
+		error |= CheckCuda(cudaMemcpyAsync(d_grids, grids, grid_bytes, cudaMemcpyHostToDevice, slot.stream),
+		                   "async copy pipeline fused grids to device");
+		error |= CheckCuda(cudaMemcpyAsync(d_values, values, value_bytes, cudaMemcpyHostToDevice, slot.stream),
+		                   "async copy pipeline fused values to device");
+		if (value_validity) {
+			error |= CheckCuda(cudaMemcpyAsync(d_value_validity, value_validity, validity_bytes,
+			                                  cudaMemcpyHostToDevice, slot.stream),
+			                   "async copy pipeline fused value validity to device");
+		} else {
+			error |= CheckCuda(cudaMemsetAsync(d_value_validity, 1, validity_bytes, slot.stream),
+			                   "async set pipeline fused value validity");
+		}
+		error |= CheckCuda(cudaMemcpyAsync(d_grid_to_group, grid_to_group, build_bytes, cudaMemcpyHostToDevice,
+		                                  slot.stream),
+		                   "async copy pipeline fused grid to group to device");
+	}
+
+	error |= CheckCuda(cudaMemsetAsync(d_sums, 0, sum_bytes, slot.stream), "async clear pipeline fused sums");
+	error |= CheckCuda(cudaMemsetAsync(d_counts, 0, count_bytes, slot.stream), "async clear pipeline fused counts");
+	error |=
+	    CheckCuda(cudaMemsetAsync(d_row_counts, 0, count_bytes, slot.stream), "async clear pipeline fused row counts");
+	if (error) {
+		return 1;
+	}
+
+	constexpr int THREADS_PER_BLOCK = 256;
+	const auto blocks = static_cast<unsigned int>((count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+	DuckDBGpuFusedLatAggKernel<<<blocks, THREADS_PER_BLOCK, 0, slot.stream>>>(
+	    d_grids, d_values, d_value_validity, count, grid_min, grid_max, d_grid_to_group, build_size, d_sums, d_counts,
+	    d_row_counts);
+	error |= CheckCuda(cudaGetLastError(), "launch pipeline fused lat aggregate kernel");
+	if (error) {
+		return 1;
+	}
+
+	slot.count = count;
+	slot.group_count = group_count;
+	slot.active = true;
+	return 0;
+}
+
+extern "C" int duckdb_gpu_fused_lat_agg_pipeline_reset_i64_double(void *handle, uint32_t slot_idx,
+                                                                   int64_t grid_min, int64_t grid_max,
+                                                                   const int32_t *grid_to_group,
+                                                                   uint64_t build_size, uint64_t group_count) {
+	if (!handle || !grid_to_group || group_count == 0) {
+		return 1;
+	}
+	if (grid_max < grid_min || build_size == 0) {
+		return 1;
+	}
+
+	auto state = reinterpret_cast<FusedLatAggPipelineState *>(handle);
+	if (slot_idx >= state->slot_count) {
+		return 1;
+	}
+	auto &slot = state->slots[slot_idx];
+	if (slot.EnsureStream()) {
+		return 1;
+	}
+	if (slot.active) {
+		if (CheckCuda(cudaStreamSynchronize(slot.stream), "wait fused pipeline slot before accumulator reset")) {
+			return 1;
+		}
+		slot.active = false;
+	}
+
+	const auto build_bytes = build_size * sizeof(int32_t);
+	const auto sum_bytes = group_count * sizeof(double);
+	const auto count_bytes = group_count * sizeof(unsigned long long);
+
+	int error = 0;
+	error |= slot.sums.Ensure(sum_bytes, "resize pipeline accumulator sums");
+	error |= slot.counts.Ensure(count_bytes, "resize pipeline accumulator counts");
+	error |= slot.row_counts.Ensure(count_bytes, "resize pipeline accumulator row counts");
+	if (slot.mapped) {
+		error |= slot.mapped_grid_to_group.Ensure(build_bytes, "resize mapped pipeline accumulator grid to group");
+	} else {
+		error |= slot.grid_to_group.Ensure(build_bytes, "resize pipeline accumulator grid to group");
+	}
+	if (error) {
+		return 1;
+	}
+
+	if (slot.mapped) {
+		std::memcpy(slot.mapped_grid_to_group.HostAs<int32_t>(), grid_to_group, build_bytes);
+	} else {
+		error |= CheckCuda(cudaMemcpyAsync(slot.grid_to_group.As<int32_t>(), grid_to_group, build_bytes,
+		                                  cudaMemcpyHostToDevice, slot.stream),
+		                   "async copy pipeline accumulator grid to group to device");
+	}
+	error |= CheckCuda(cudaMemsetAsync(slot.sums.As<double>(), 0, sum_bytes, slot.stream),
+	                   "async clear pipeline accumulator sums");
+	error |= CheckCuda(cudaMemsetAsync(slot.counts.As<unsigned long long>(), 0, count_bytes, slot.stream),
+	                   "async clear pipeline accumulator counts");
+	error |= CheckCuda(cudaMemsetAsync(slot.row_counts.As<unsigned long long>(), 0, count_bytes, slot.stream),
+	                   "async clear pipeline accumulator row counts");
+	if (error) {
+		return 1;
+	}
+
+	slot.count = 0;
+	slot.group_count = group_count;
+	slot.build_size = build_size;
+	slot.grid_min = grid_min;
+	slot.grid_max = grid_max;
+	slot.active = true;
+	return 0;
+}
+
+extern "C" int duckdb_gpu_fused_lat_agg_pipeline_submit_accumulate_i64_double(
+    void *handle, uint32_t slot_idx, const int64_t *grids, const double *values, const uint8_t *value_validity,
+    uint64_t count) {
+	if (!handle || !grids || !values) {
+		return 1;
+	}
+	if (count == 0) {
+		return 0;
+	}
+
+	auto state = reinterpret_cast<FusedLatAggPipelineState *>(handle);
+	if (slot_idx >= state->slot_count) {
+		return 1;
+	}
+	auto &slot = state->slots[slot_idx];
+	if (slot.EnsureStream()) {
+		return 1;
+	}
+	if (slot.group_count == 0 || slot.build_size == 0) {
+		return 1;
+	}
+
+	const auto grid_bytes = count * sizeof(int64_t);
+	const auto value_bytes = count * sizeof(double);
+	const auto validity_bytes = count * sizeof(uint8_t);
+
+	int error = 0;
+	if (slot.mapped) {
+		if (slot.active) {
+			error |= CheckCuda(cudaStreamSynchronize(slot.stream),
+			                   "sync mapped pipeline accumulator before input overwrite");
+		}
+		error |= slot.mapped_grids.Ensure(grid_bytes, "resize mapped pipeline accumulator grids");
+		error |= slot.mapped_values.Ensure(value_bytes, "resize mapped pipeline accumulator values");
+		error |= slot.mapped_value_validity.Ensure(validity_bytes, "resize mapped pipeline accumulator value validity");
+		if (error) {
+			return 1;
+		}
+		std::memcpy(slot.mapped_grids.HostAs<int64_t>(), grids, grid_bytes);
+		std::memcpy(slot.mapped_values.HostAs<double>(), values, value_bytes);
+		if (value_validity) {
+			std::memcpy(slot.mapped_value_validity.HostAs<uint8_t>(), value_validity, validity_bytes);
+		} else {
+			std::memset(slot.mapped_value_validity.HostAs<uint8_t>(), 1, validity_bytes);
+		}
+	} else {
+		error |= slot.grids.Ensure(grid_bytes, "resize pipeline accumulator grids");
+		error |= slot.values.Ensure(value_bytes, "resize pipeline accumulator values");
+		error |= slot.value_validity.Ensure(validity_bytes, "resize pipeline accumulator value validity");
+		if (error) {
+			return 1;
+		}
+		error |= CheckCuda(cudaMemcpyAsync(slot.grids.As<int64_t>(), grids, grid_bytes, cudaMemcpyHostToDevice,
+		                                  slot.stream),
+		                   "async copy pipeline accumulator grids to device");
+		error |= CheckCuda(cudaMemcpyAsync(slot.values.As<double>(), values, value_bytes, cudaMemcpyHostToDevice,
+		                                  slot.stream),
+		                   "async copy pipeline accumulator values to device");
+		if (value_validity) {
+			error |= CheckCuda(cudaMemcpyAsync(slot.value_validity.As<uint8_t>(), value_validity, validity_bytes,
+			                                  cudaMemcpyHostToDevice, slot.stream),
+			                   "async copy pipeline accumulator value validity to device");
+		} else {
+			error |= CheckCuda(cudaMemsetAsync(slot.value_validity.As<uint8_t>(), 1, validity_bytes, slot.stream),
+			                   "async set pipeline accumulator value validity");
+		}
+	}
+	if (error) {
+		return 1;
+	}
+
+	auto d_grids = slot.mapped ? slot.mapped_grids.DeviceAs<int64_t>() : slot.grids.As<int64_t>();
+	auto d_values = slot.mapped ? slot.mapped_values.DeviceAs<double>() : slot.values.As<double>();
+	auto d_value_validity =
+	    slot.mapped ? slot.mapped_value_validity.DeviceAs<uint8_t>() : slot.value_validity.As<uint8_t>();
+	auto d_grid_to_group = slot.mapped ? slot.mapped_grid_to_group.DeviceAs<int32_t>() : slot.grid_to_group.As<int32_t>();
+
+	constexpr int THREADS_PER_BLOCK = 256;
+	const auto blocks = static_cast<unsigned int>((count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+	DuckDBGpuFusedLatAggKernel<<<blocks, THREADS_PER_BLOCK, 0, slot.stream>>>(
+	    d_grids, d_values, d_value_validity, count, slot.grid_min, slot.grid_max, d_grid_to_group, slot.build_size,
+	    slot.sums.As<double>(), slot.counts.As<unsigned long long>(), slot.row_counts.As<unsigned long long>());
+	error |= CheckCuda(cudaGetLastError(), "launch pipeline accumulator fused lat aggregate kernel");
+	if (error) {
+		return 1;
+	}
+
+	slot.count += count;
+	slot.active = true;
+	return 0;
+}
+
+extern "C" int duckdb_gpu_fused_lat_agg_pipeline_wait(void *handle, uint32_t slot_idx, double *sum_out,
+                                                       uint64_t *count_out, uint64_t *row_count_out) {
+	if (!handle || !sum_out || !count_out || !row_count_out) {
+		return 1;
+	}
+
+	auto state = reinterpret_cast<FusedLatAggPipelineState *>(handle);
+	if (slot_idx >= state->slot_count) {
+		return 1;
+	}
+	auto &slot = state->slots[slot_idx];
+	if (!slot.active) {
+		return 1;
+	}
+
+	const auto group_count = slot.group_count;
+	const auto sum_bytes = group_count * sizeof(double);
+	const auto count_bytes = group_count * sizeof(unsigned long long);
+	int error = 0;
+	error |= CheckCuda(cudaMemcpyAsync(sum_out, slot.sums.As<double>(), sum_bytes, cudaMemcpyDeviceToHost, slot.stream),
+	                   "async copy pipeline fused sums to host");
+	error |= CheckCuda(cudaMemcpyAsync(count_out, slot.counts.As<unsigned long long>(), count_bytes,
+	                                  cudaMemcpyDeviceToHost, slot.stream),
+	                   "async copy pipeline fused counts to host");
+	error |= CheckCuda(cudaMemcpyAsync(row_count_out, slot.row_counts.As<unsigned long long>(), count_bytes,
+	                                  cudaMemcpyDeviceToHost, slot.stream),
+	                   "async copy pipeline fused row counts to host");
+	error |= CheckCuda(cudaStreamSynchronize(slot.stream), "sync pipeline fused slot");
+	if (error) {
+		return 1;
+	}
+	slot.active = false;
+	return 0;
+}
+
+extern "C" void duckdb_gpu_fused_lat_agg_pipeline_destroy(void *handle) {
+	auto state = reinterpret_cast<FusedLatAggPipelineState *>(handle);
+	delete state;
 }
