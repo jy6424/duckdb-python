@@ -80,7 +80,6 @@ from _duckdb import (
     connect,
     create_function,
     cursor,
-    dbs_gpu_fused_lat_pipeline,
     decimal_type,
     default_connection,
     description,
@@ -312,7 +311,6 @@ __all__: list[str] = [
     "connect",
     "create_function",
     "cursor",
-    "dbs_gpu_fused_lat_pipeline",
     "decimal_type",
     "default_connection",
     "description",
@@ -391,3 +389,10 @@ __all__: list[str] = [
     "view",
     "write_csv",
 ]
+
+try:
+    from _duckdb import dbs_gpu_fused_lat_pipeline
+
+    __all__.append("dbs_gpu_fused_lat_pipeline")
+except ImportError:
+    pass
