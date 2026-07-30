@@ -340,12 +340,6 @@ struct PipelineRawBatch {
 	vector<uint8_t> join_validity;
 };
 
-struct DirectPipelineRawBatch {
-	string fact_path;
-	std::shared_ptr<GroupMapping> mapping;
-	unique_ptr<DataChunk> chunk;
-};
-
 struct PipelineInputBatch {
 	string fact_path;
 	std::shared_ptr<GroupMapping> mapping;
@@ -535,41 +529,6 @@ static void ReadPipelineRawBatches(DuckDB &db, const vector<string> &fact_paths,
 	raw_queue.Close();
 }
 
-static void ReadDirectPipelineRawBatches(DuckDB &db, const vector<string> &fact_paths, const string &payload_column,
-                                         const string &join_key, const string &group_column,
-                                         const string &dimension_file,
-                                         BlockingQueue<DirectPipelineRawBatch> &raw_queue,
-                                         std::exception_ptr &error_out, std::mutex &error_lock) {
-	try {
-		Connection connection(db);
-		for (auto &fact_path : fact_paths) {
-			auto dimension_path = ParentPath(fact_path) + "/" + dimension_file;
-			auto mapping =
-			    std::make_shared<GroupMapping>(ReadGroupMapping(connection, dimension_path, join_key, group_column));
-			auto result = RunStreamingQuery(connection, BuildProbeQuery(fact_path, join_key, payload_column));
-
-			while (true) {
-				auto chunk = result->Fetch();
-				if (!chunk || chunk->size() == 0) {
-					break;
-				}
-
-				DirectPipelineRawBatch batch;
-				batch.fact_path = fact_path;
-				batch.mapping = mapping;
-				batch.chunk = std::move(chunk);
-				raw_queue.Push(std::move(batch));
-			}
-		}
-	} catch (...) {
-		std::lock_guard<std::mutex> guard(error_lock);
-		if (!error_out) {
-			error_out = std::current_exception();
-		}
-	}
-	raw_queue.Close();
-}
-
 static void PreparePipelineInputBatches(BlockingQueue<PipelineRawBatch> &raw_queue,
                                         BlockingQueue<PipelineInputBatch> &input_queue,
                                         std::exception_ptr &error_out, std::mutex &error_lock) {
@@ -617,7 +576,7 @@ static void PreparePipelineInputBatches(BlockingQueue<PipelineRawBatch> &raw_que
 
 static void StartDirectPipelineBuffer(FusedLatAggPipelineFuncs pipeline, void *handle,
                                       BlockingQueue<idx_t> &free_slots, idx_t target_batch_rows,
-                                      const DirectPipelineRawBatch &raw, DirectPipelineBuffer &current) {
+                                      const PipelineRawBatch &raw, DirectPipelineBuffer &current) {
 	idx_t slot = 0;
 	if (!free_slots.Pop(slot)) {
 		throw InvalidInputException("GPU fused direct pipeline slot queue closed");
@@ -642,20 +601,16 @@ static void StartDirectPipelineBuffer(FusedLatAggPipelineFuncs pipeline, void *h
 	current.validity = validity;
 }
 
-static idx_t AppendDirectPipelineRows(DataChunk &chunk, idx_t &row_offset, DirectPipelineBuffer &current,
+static idx_t AppendDirectPipelineRows(PipelineRawBatch &raw, idx_t &row_offset, DirectPipelineBuffer &current,
                                       idx_t target_batch_rows) {
-	auto count = chunk.size();
-	auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
-	auto value_data = FlatVector::GetData<double>(chunk.data[1]);
-	auto valid_data = FlatVector::GetData<uint8_t>(chunk.data[2]);
-	auto &join_validity = FlatVector::Validity(chunk.data[0]);
+	auto count = raw.join_keys.size();
 	idx_t appended = 0;
 
 	while (row_offset < count && current.count < target_batch_rows) {
-		if (join_validity.RowIsValid(row_offset)) {
-			current.join_keys[current.count] = join_data[row_offset];
-			current.values[current.count] = value_data[row_offset];
-			current.validity[current.count] = valid_data[row_offset];
+		if (raw.join_validity[row_offset] != 0) {
+			current.join_keys[current.count] = raw.join_keys[row_offset];
+			current.values[current.count] = raw.values[row_offset];
+			current.validity[current.count] = raw.value_validity[row_offset];
 			current.count++;
 			appended++;
 		}
@@ -665,7 +620,7 @@ static idx_t AppendDirectPipelineRows(DataChunk &chunk, idx_t &row_offset, Direc
 }
 
 static void PrepareDirectPipelineInputBatches(FusedLatAggPipelineFuncs pipeline, void *handle,
-                                             BlockingQueue<DirectPipelineRawBatch> &raw_queue,
+                                             BlockingQueue<PipelineRawBatch> &raw_queue,
                                              BlockingQueue<DirectPipelineInputBatch> &input_queue,
                                              BlockingQueue<idx_t> &free_slots, std::exception_ptr &error_out,
                                              std::mutex &error_lock) {
@@ -693,11 +648,11 @@ static void PrepareDirectPipelineInputBatches(FusedLatAggPipelineFuncs pipeline,
 			current = DirectPipelineBuffer();
 		};
 
-		DirectPipelineRawBatch raw;
+		PipelineRawBatch raw;
 		while (raw_queue.Pop(raw)) {
 			idx_t row_offset = 0;
 			bool counted_chunk = false;
-			while (raw.chunk && row_offset < raw.chunk->size()) {
+			while (row_offset < raw.join_keys.size()) {
 				auto boundary = current.active &&
 				                (current.fact_path != raw.fact_path || current.mapping != raw.mapping);
 				if (boundary || current.count >= target_batch_rows || current.chunks >= target_batch_chunks) {
@@ -712,7 +667,7 @@ static void PrepareDirectPipelineInputBatches(FusedLatAggPipelineFuncs pipeline,
 					counted_chunk = true;
 				}
 
-				AppendDirectPipelineRows(*raw.chunk, row_offset, current, target_batch_rows);
+				AppendDirectPipelineRows(raw, row_offset, current, target_batch_rows);
 				if (current.count >= target_batch_rows || current.chunks >= target_batch_chunks) {
 					flush_current();
 					counted_chunk = false;
@@ -945,14 +900,14 @@ static py::dict DBSGPUFusedLatPipeline(const py::iterable &fact_paths_p, const s
 		std::mutex worker_error_lock;
 
 		if (pipeline_direct_mode) {
-			BlockingQueue<DirectPipelineRawBatch> raw_queue(8);
+			BlockingQueue<PipelineRawBatch> raw_queue(8);
 			BlockingQueue<DirectPipelineInputBatch> input_queue(PIPELINE_SLOTS);
 			BlockingQueue<idx_t> free_slots(0);
 			for (idx_t slot = 0; slot < PIPELINE_SLOTS; slot++) {
 				free_slots.Push(slot);
 			}
 
-			std::thread reader_thread(ReadDirectPipelineRawBatches, std::ref(db), std::cref(fact_paths),
+			std::thread reader_thread(ReadPipelineRawBatches, std::ref(db), std::cref(fact_paths),
 			                          std::cref(payload_column), std::cref(join_key), std::cref(group_column),
 			                          std::cref(dimension_file), std::ref(raw_queue), std::ref(worker_error),
 			                          std::ref(worker_error_lock));
