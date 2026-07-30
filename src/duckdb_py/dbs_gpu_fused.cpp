@@ -41,6 +41,11 @@ using FusedLatAggPipelineResetFunc = int (*)(void *handle, uint32_t slot_idx, in
 using FusedLatAggPipelineSubmitAccumulateFunc = int (*)(void *handle, uint32_t slot_idx, const int64_t *grids,
                                                         const double *values, const uint8_t *value_validity,
                                                         uint64_t count);
+using FusedLatAggPipelinePrepareInputFunc = int (*)(void *handle, uint32_t slot_idx, uint64_t capacity,
+                                                    int64_t **grids_out, double **values_out,
+                                                    uint8_t **value_validity_out);
+using FusedLatAggPipelineSubmitPreparedFunc = int (*)(void *handle, uint32_t slot_idx, uint64_t count);
+using FusedLatAggPipelineSyncSlotFunc = int (*)(void *handle, uint32_t slot_idx);
 using FusedLatAggPipelineWaitFunc = int (*)(void *handle, uint32_t slot_idx, double *sum_out, uint64_t *count_out,
                                             uint64_t *row_count_out);
 using FusedLatAggPipelineDestroyFunc = void (*)(void *handle);
@@ -50,6 +55,9 @@ struct FusedLatAggPipelineFuncs {
 	FusedLatAggPipelineSubmitFunc submit = nullptr;
 	FusedLatAggPipelineResetFunc reset = nullptr;
 	FusedLatAggPipelineSubmitAccumulateFunc submit_accumulate = nullptr;
+	FusedLatAggPipelinePrepareInputFunc prepare_input = nullptr;
+	FusedLatAggPipelineSubmitPreparedFunc submit_prepared = nullptr;
+	FusedLatAggPipelineSyncSlotFunc sync_slot = nullptr;
 	FusedLatAggPipelineWaitFunc wait = nullptr;
 	FusedLatAggPipelineDestroyFunc destroy = nullptr;
 };
@@ -142,7 +150,8 @@ static FusedLatAggFunc LoadFusedLatAgg(const string &path_p, bool mapped) {
 static FusedLatAggPipelineFuncs LoadFusedLatAggPipeline(const string &path_p) {
 	static void *handle = nullptr;
 	static FusedLatAggPipelineFuncs funcs;
-	if (funcs.create && funcs.submit && funcs.reset && funcs.submit_accumulate && funcs.wait && funcs.destroy) {
+	if (funcs.create && funcs.submit && funcs.reset && funcs.submit_accumulate && funcs.prepare_input &&
+	    funcs.submit_prepared && funcs.sync_slot && funcs.wait && funcs.destroy) {
 		return funcs;
 	}
 
@@ -169,11 +178,18 @@ static FusedLatAggPipelineFuncs LoadFusedLatAggPipeline(const string &path_p) {
 	    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_reset_i64_double"));
 	funcs.submit_accumulate = reinterpret_cast<FusedLatAggPipelineSubmitAccumulateFunc>(
 	    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_submit_accumulate_i64_double"));
+	funcs.prepare_input = reinterpret_cast<FusedLatAggPipelinePrepareInputFunc>(
+	    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_prepare_input_i64_double"));
+	funcs.submit_prepared = reinterpret_cast<FusedLatAggPipelineSubmitPreparedFunc>(
+	    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_submit_prepared_i64_double"));
+	funcs.sync_slot =
+	    reinterpret_cast<FusedLatAggPipelineSyncSlotFunc>(dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_sync_slot"));
 	funcs.wait =
 	    reinterpret_cast<FusedLatAggPipelineWaitFunc>(dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_wait"));
 	funcs.destroy =
 	    reinterpret_cast<FusedLatAggPipelineDestroyFunc>(dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_destroy"));
-	if (!funcs.create || !funcs.submit || !funcs.reset || !funcs.submit_accumulate || !funcs.wait || !funcs.destroy) {
+	if (!funcs.create || !funcs.submit || !funcs.reset || !funcs.submit_accumulate || !funcs.prepare_input ||
+	    !funcs.submit_prepared || !funcs.sync_slot || !funcs.wait || !funcs.destroy) {
 		throw InvalidInputException("Failed to load GPU fused pipeline symbols from '%s'", path);
 	}
 	return funcs;
@@ -324,10 +340,35 @@ struct PipelineRawBatch {
 	vector<uint8_t> join_validity;
 };
 
+struct DirectPipelineRawBatch {
+	string fact_path;
+	std::shared_ptr<GroupMapping> mapping;
+	unique_ptr<DataChunk> chunk;
+};
+
 struct PipelineInputBatch {
 	string fact_path;
 	std::shared_ptr<GroupMapping> mapping;
 	ProbeColumns probe;
+};
+
+struct DirectPipelineInputBatch {
+	string fact_path;
+	std::shared_ptr<GroupMapping> mapping;
+	idx_t slot = 0;
+	idx_t count = 0;
+};
+
+struct DirectPipelineBuffer {
+	bool active = false;
+	string fact_path;
+	std::shared_ptr<GroupMapping> mapping;
+	idx_t slot = 0;
+	idx_t count = 0;
+	idx_t chunks = 0;
+	int64_t *join_keys = nullptr;
+	double *values = nullptr;
+	uint8_t *validity = nullptr;
 };
 
 struct PipelineOutputBatch {
@@ -494,6 +535,41 @@ static void ReadPipelineRawBatches(DuckDB &db, const vector<string> &fact_paths,
 	raw_queue.Close();
 }
 
+static void ReadDirectPipelineRawBatches(DuckDB &db, const vector<string> &fact_paths, const string &payload_column,
+                                         const string &join_key, const string &group_column,
+                                         const string &dimension_file,
+                                         BlockingQueue<DirectPipelineRawBatch> &raw_queue,
+                                         std::exception_ptr &error_out, std::mutex &error_lock) {
+	try {
+		Connection connection(db);
+		for (auto &fact_path : fact_paths) {
+			auto dimension_path = ParentPath(fact_path) + "/" + dimension_file;
+			auto mapping =
+			    std::make_shared<GroupMapping>(ReadGroupMapping(connection, dimension_path, join_key, group_column));
+			auto result = RunStreamingQuery(connection, BuildProbeQuery(fact_path, join_key, payload_column));
+
+			while (true) {
+				auto chunk = result->Fetch();
+				if (!chunk || chunk->size() == 0) {
+					break;
+				}
+
+				DirectPipelineRawBatch batch;
+				batch.fact_path = fact_path;
+				batch.mapping = mapping;
+				batch.chunk = std::move(chunk);
+				raw_queue.Push(std::move(batch));
+			}
+		}
+	} catch (...) {
+		std::lock_guard<std::mutex> guard(error_lock);
+		if (!error_out) {
+			error_out = std::current_exception();
+		}
+	}
+	raw_queue.Close();
+}
+
 static void PreparePipelineInputBatches(BlockingQueue<PipelineRawBatch> &raw_queue,
                                         BlockingQueue<PipelineInputBatch> &input_queue,
                                         std::exception_ptr &error_out, std::mutex &error_lock) {
@@ -527,6 +603,120 @@ static void PreparePipelineInputBatches(BlockingQueue<PipelineRawBatch> &raw_que
 			current_chunks++;
 			if (PreparedRowCount(current) >= target_batch_rows || current_chunks >= target_batch_chunks) {
 				flush_current();
+			}
+		}
+		flush_current();
+	} catch (...) {
+		std::lock_guard<std::mutex> guard(error_lock);
+		if (!error_out) {
+			error_out = std::current_exception();
+		}
+	}
+	input_queue.Close();
+}
+
+static void StartDirectPipelineBuffer(FusedLatAggPipelineFuncs pipeline, void *handle,
+                                      BlockingQueue<idx_t> &free_slots, idx_t target_batch_rows,
+                                      const DirectPipelineRawBatch &raw, DirectPipelineBuffer &current) {
+	idx_t slot = 0;
+	if (!free_slots.Pop(slot)) {
+		throw InvalidInputException("GPU fused direct pipeline slot queue closed");
+	}
+
+	int64_t *join_keys = nullptr;
+	double *values = nullptr;
+	uint8_t *validity = nullptr;
+	auto rc = pipeline.prepare_input(handle, static_cast<uint32_t>(slot), static_cast<uint64_t>(target_batch_rows),
+	                                 &join_keys, &values, &validity);
+	if (rc != 0 || !join_keys || !values || !validity) {
+		throw InvalidInputException("GPU fused direct pipeline input preparation failed for '%s'", raw.fact_path);
+	}
+
+	current = DirectPipelineBuffer();
+	current.active = true;
+	current.fact_path = raw.fact_path;
+	current.mapping = raw.mapping;
+	current.slot = slot;
+	current.join_keys = join_keys;
+	current.values = values;
+	current.validity = validity;
+}
+
+static idx_t AppendDirectPipelineRows(DataChunk &chunk, idx_t &row_offset, DirectPipelineBuffer &current,
+                                      idx_t target_batch_rows) {
+	auto count = chunk.size();
+	auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
+	auto value_data = FlatVector::GetData<double>(chunk.data[1]);
+	auto valid_data = FlatVector::GetData<uint8_t>(chunk.data[2]);
+	auto &join_validity = FlatVector::Validity(chunk.data[0]);
+	idx_t appended = 0;
+
+	while (row_offset < count && current.count < target_batch_rows) {
+		if (join_validity.RowIsValid(row_offset)) {
+			current.join_keys[current.count] = join_data[row_offset];
+			current.values[current.count] = value_data[row_offset];
+			current.validity[current.count] = valid_data[row_offset];
+			current.count++;
+			appended++;
+		}
+		row_offset++;
+	}
+	return appended;
+}
+
+static void PrepareDirectPipelineInputBatches(FusedLatAggPipelineFuncs pipeline, void *handle,
+                                             BlockingQueue<DirectPipelineRawBatch> &raw_queue,
+                                             BlockingQueue<DirectPipelineInputBatch> &input_queue,
+                                             BlockingQueue<idx_t> &free_slots, std::exception_ptr &error_out,
+                                             std::mutex &error_lock) {
+	try {
+		auto target_batch_rows = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_ROWS", 65536);
+		auto target_batch_chunks = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_CHUNKS", 32);
+		DirectPipelineBuffer current;
+
+		auto flush_current = [&]() {
+			if (!current.active) {
+				return;
+			}
+			if (current.count == 0) {
+				free_slots.Push(current.slot);
+				current = DirectPipelineBuffer();
+				return;
+			}
+
+			DirectPipelineInputBatch batch;
+			batch.fact_path = current.fact_path;
+			batch.mapping = current.mapping;
+			batch.slot = current.slot;
+			batch.count = current.count;
+			input_queue.Push(std::move(batch));
+			current = DirectPipelineBuffer();
+		};
+
+		DirectPipelineRawBatch raw;
+		while (raw_queue.Pop(raw)) {
+			idx_t row_offset = 0;
+			bool counted_chunk = false;
+			while (raw.chunk && row_offset < raw.chunk->size()) {
+				auto boundary = current.active &&
+				                (current.fact_path != raw.fact_path || current.mapping != raw.mapping);
+				if (boundary || current.count >= target_batch_rows || current.chunks >= target_batch_chunks) {
+					flush_current();
+					counted_chunk = false;
+				}
+				if (!current.active) {
+					StartDirectPipelineBuffer(pipeline, handle, free_slots, target_batch_rows, raw, current);
+				}
+				if (!counted_chunk) {
+					current.chunks++;
+					counted_chunk = true;
+				}
+
+				AppendDirectPipelineRows(*raw.chunk, row_offset, current, target_batch_rows);
+				if (current.count >= target_batch_rows || current.chunks >= target_batch_chunks) {
+					flush_current();
+					counted_chunk = false;
+				}
 			}
 		}
 		flush_current();
@@ -610,6 +800,92 @@ static void RunPipelineGPUWorker(FusedLatAggPipelineFuncs pipeline, void *handle
 	output_queue.Close();
 }
 
+static void RunDirectPipelineGPUWorker(FusedLatAggPipelineFuncs pipeline, void *handle, idx_t slot_count,
+                                       BlockingQueue<DirectPipelineInputBatch> &input_queue,
+                                       BlockingQueue<PipelineOutputBatch> &output_queue,
+                                       BlockingQueue<idx_t> &free_slots, std::exception_ptr &error_out,
+                                       std::mutex &error_lock) {
+	try {
+		struct ActiveFile {
+			bool active = false;
+			string fact_path;
+			std::shared_ptr<GroupMapping> mapping;
+		};
+
+		ActiveFile active_file;
+		DirectPipelineInputBatch batch;
+
+		auto flush_active_file = [&]() {
+			if (!active_file.active) {
+				return;
+			}
+			auto group_count = active_file.mapping->group_values.size();
+			for (idx_t slot = 0; slot < slot_count; slot++) {
+				PipelineOutputBatch output;
+				output.fact_path = active_file.fact_path;
+				output.mapping = active_file.mapping;
+				output.sums.assign(group_count, 0);
+				output.counts.assign(group_count, 0);
+				output.row_counts.assign(group_count, 0);
+
+				auto rc = pipeline.wait(handle, static_cast<uint32_t>(slot), output.sums.data(),
+				                        output.counts.data(), output.row_counts.data());
+				if (rc != 0) {
+					throw InvalidInputException("GPU fused direct pipeline wait failed for '%s'",
+					                            active_file.fact_path);
+				}
+				output_queue.Push(std::move(output));
+			}
+			active_file = ActiveFile();
+		};
+
+		auto reset_for_file = [&](const DirectPipelineInputBatch &input) {
+			for (idx_t slot = 0; slot < slot_count; slot++) {
+				auto rc = pipeline.reset(handle, static_cast<uint32_t>(slot), input.mapping->join_min,
+				                         input.mapping->join_max, input.mapping->join_to_group.data(),
+				                         static_cast<uint64_t>(input.mapping->join_to_group.size()),
+				                         static_cast<uint64_t>(input.mapping->group_values.size()));
+				if (rc != 0) {
+					throw InvalidInputException("GPU fused direct pipeline accumulator reset failed for '%s'",
+					                            input.fact_path);
+				}
+			}
+			active_file.active = true;
+			active_file.fact_path = input.fact_path;
+			active_file.mapping = input.mapping;
+		};
+
+		while (input_queue.Pop(batch)) {
+			if (!active_file.active || active_file.fact_path != batch.fact_path ||
+			    active_file.mapping != batch.mapping) {
+				flush_active_file();
+				reset_for_file(batch);
+			}
+
+			auto rc = pipeline.submit_prepared(handle, static_cast<uint32_t>(batch.slot),
+			                                   static_cast<uint64_t>(batch.count));
+			if (rc != 0) {
+				throw InvalidInputException("GPU fused direct pipeline prepared submit failed for '%s'",
+				                            batch.fact_path);
+			}
+			rc = pipeline.sync_slot(handle, static_cast<uint32_t>(batch.slot));
+			if (rc != 0) {
+				throw InvalidInputException("GPU fused direct pipeline slot sync failed for '%s'", batch.fact_path);
+			}
+			free_slots.Push(batch.slot);
+		}
+
+		flush_active_file();
+	} catch (...) {
+		std::lock_guard<std::mutex> guard(error_lock);
+		if (!error_out) {
+			error_out = std::current_exception();
+		}
+	}
+	output_queue.Close();
+	free_slots.Close();
+}
+
 static void RunPipelineMergeWorker(BlockingQueue<PipelineOutputBatch> &output_queue,
                                    std::map<double, double> &total_sum,
                                    std::map<double, uint64_t> &total_count, uint64_t &total_rows,
@@ -631,10 +907,13 @@ static void RunPipelineMergeWorker(BlockingQueue<PipelineOutputBatch> &output_qu
 static py::dict DBSGPUFusedLatPipeline(const py::iterable &fact_paths_p, const string &payload_column,
                                        const string &join_key, const string &group_column,
                                        const string &dimension_file, const string &lib_path, const string &mode) {
-	const bool pipeline_mode = mode == "pipeline-device" || mode == "pipeline-mapped";
+	const bool pipeline_direct_mode = mode == "pipeline-mapped" || mode == "pipeline-managed";
+	const bool pipeline_mode = mode == "pipeline-device" || pipeline_direct_mode;
 	const bool mapped = mode == "mapped" || mode == "pipeline-mapped";
-	if (!mapped && mode != "device" && !pipeline_mode) {
-		throw InvalidInputException("mode must be 'device', 'mapped', 'pipeline-device', or 'pipeline-mapped'");
+	const int pipeline_memory_mode = mode == "pipeline-mapped" ? 1 : (mode == "pipeline-managed" ? 2 : 0);
+	if (!mapped && mode != "device" && mode != "pipeline-managed" && !pipeline_mode) {
+		throw InvalidInputException(
+		    "mode must be 'device', 'mapped', 'pipeline-device', 'pipeline-mapped', or 'pipeline-managed'");
 	}
 
 	vector<string> fact_paths;
@@ -656,57 +935,112 @@ static py::dict DBSGPUFusedLatPipeline(const py::iterable &fact_paths_p, const s
 	if (pipeline_mode) {
 		auto pipeline = LoadFusedLatAggPipeline(lib_path);
 		constexpr idx_t PIPELINE_SLOTS = 2;
-		void *handle = pipeline.create(static_cast<uint32_t>(PIPELINE_SLOTS), mapped ? 1 : 0);
+		void *handle = pipeline.create(static_cast<uint32_t>(PIPELINE_SLOTS), pipeline_memory_mode);
 		if (!handle) {
 			throw InvalidInputException("Failed to create GPU fused pipeline");
 		}
 
-		BlockingQueue<PipelineRawBatch> raw_queue(8);
-		BlockingQueue<PipelineInputBatch> input_queue(8);
 		BlockingQueue<PipelineOutputBatch> output_queue(8);
 		std::exception_ptr worker_error;
 		std::mutex worker_error_lock;
 
-		std::thread reader_thread(ReadPipelineRawBatches, std::ref(db), std::cref(fact_paths),
-		                          std::cref(payload_column), std::cref(join_key), std::cref(group_column),
-		                          std::cref(dimension_file), std::ref(raw_queue), std::ref(worker_error),
-		                          std::ref(worker_error_lock));
-		std::thread prepare_thread(PreparePipelineInputBatches, std::ref(raw_queue), std::ref(input_queue),
-		                           std::ref(worker_error), std::ref(worker_error_lock));
-		std::thread gpu_thread(RunPipelineGPUWorker, pipeline, handle, std::ref(input_queue), std::ref(output_queue),
-		                       std::ref(worker_error), std::ref(worker_error_lock));
-		std::thread merge_thread(RunPipelineMergeWorker, std::ref(output_queue), std::ref(total_sum),
-		                         std::ref(total_count), std::ref(total_rows), std::ref(worker_error),
-		                         std::ref(worker_error_lock));
-
-		try {
-			reader_thread.join();
-			prepare_thread.join();
-			gpu_thread.join();
-			merge_thread.join();
-			pipeline.destroy(handle);
-
-			if (worker_error) {
-				std::rethrow_exception(worker_error);
+		if (pipeline_direct_mode) {
+			BlockingQueue<DirectPipelineRawBatch> raw_queue(8);
+			BlockingQueue<DirectPipelineInputBatch> input_queue(PIPELINE_SLOTS);
+			BlockingQueue<idx_t> free_slots(0);
+			for (idx_t slot = 0; slot < PIPELINE_SLOTS; slot++) {
+				free_slots.Push(slot);
 			}
-		} catch (...) {
-			raw_queue.Close();
-			input_queue.Close();
-			output_queue.Close();
-			if (reader_thread.joinable()) {
+
+			std::thread reader_thread(ReadDirectPipelineRawBatches, std::ref(db), std::cref(fact_paths),
+			                          std::cref(payload_column), std::cref(join_key), std::cref(group_column),
+			                          std::cref(dimension_file), std::ref(raw_queue), std::ref(worker_error),
+			                          std::ref(worker_error_lock));
+			std::thread prepare_thread(PrepareDirectPipelineInputBatches, pipeline, handle, std::ref(raw_queue),
+			                           std::ref(input_queue), std::ref(free_slots), std::ref(worker_error),
+			                           std::ref(worker_error_lock));
+			std::thread gpu_thread(RunDirectPipelineGPUWorker, pipeline, handle, PIPELINE_SLOTS, std::ref(input_queue),
+			                       std::ref(output_queue), std::ref(free_slots), std::ref(worker_error),
+			                       std::ref(worker_error_lock));
+			std::thread merge_thread(RunPipelineMergeWorker, std::ref(output_queue), std::ref(total_sum),
+			                         std::ref(total_count), std::ref(total_rows), std::ref(worker_error),
+			                         std::ref(worker_error_lock));
+
+			try {
 				reader_thread.join();
-			}
-			if (prepare_thread.joinable()) {
 				prepare_thread.join();
-			}
-			if (gpu_thread.joinable()) {
 				gpu_thread.join();
-			}
-			if (merge_thread.joinable()) {
 				merge_thread.join();
+				pipeline.destroy(handle);
+
+				if (worker_error) {
+					std::rethrow_exception(worker_error);
+				}
+			} catch (...) {
+				raw_queue.Close();
+				input_queue.Close();
+				output_queue.Close();
+				free_slots.Close();
+				if (reader_thread.joinable()) {
+					reader_thread.join();
+				}
+				if (prepare_thread.joinable()) {
+					prepare_thread.join();
+				}
+				if (gpu_thread.joinable()) {
+					gpu_thread.join();
+				}
+				if (merge_thread.joinable()) {
+					merge_thread.join();
+				}
+				pipeline.destroy(handle);
+				throw;
 			}
-			pipeline.destroy(handle);
-			throw;
+		} else {
+			BlockingQueue<PipelineRawBatch> raw_queue(8);
+			BlockingQueue<PipelineInputBatch> input_queue(8);
+
+			std::thread reader_thread(ReadPipelineRawBatches, std::ref(db), std::cref(fact_paths),
+			                          std::cref(payload_column), std::cref(join_key), std::cref(group_column),
+			                          std::cref(dimension_file), std::ref(raw_queue), std::ref(worker_error),
+			                          std::ref(worker_error_lock));
+			std::thread prepare_thread(PreparePipelineInputBatches, std::ref(raw_queue), std::ref(input_queue),
+			                           std::ref(worker_error), std::ref(worker_error_lock));
+			std::thread gpu_thread(RunPipelineGPUWorker, pipeline, handle, std::ref(input_queue),
+			                       std::ref(output_queue), std::ref(worker_error), std::ref(worker_error_lock));
+			std::thread merge_thread(RunPipelineMergeWorker, std::ref(output_queue), std::ref(total_sum),
+			                         std::ref(total_count), std::ref(total_rows), std::ref(worker_error),
+			                         std::ref(worker_error_lock));
+
+			try {
+				reader_thread.join();
+				prepare_thread.join();
+				gpu_thread.join();
+				merge_thread.join();
+				pipeline.destroy(handle);
+
+				if (worker_error) {
+					std::rethrow_exception(worker_error);
+				}
+			} catch (...) {
+				raw_queue.Close();
+				input_queue.Close();
+				output_queue.Close();
+				if (reader_thread.joinable()) {
+					reader_thread.join();
+				}
+				if (prepare_thread.joinable()) {
+					prepare_thread.join();
+				}
+				if (gpu_thread.joinable()) {
+					gpu_thread.join();
+				}
+				if (merge_thread.joinable()) {
+					merge_thread.join();
+				}
+				pipeline.destroy(handle);
+				throw;
+			}
 		}
 	} else {
 		auto fused_agg = LoadFusedLatAgg(lib_path, mapped);
@@ -759,7 +1093,7 @@ void RegisterDBSGPUFused(py::module_ &m) {
 	m.def("dbs_gpu_fused_lat_pipeline", &DBSGPUFusedLatPipeline, py::arg("fact_paths"),
 	      py::arg("payload_column") = "qicps", py::arg("join_key") = "grid", py::arg("group_column") = "lats",
 	      py::arg("dimension_file") = "grid.parquet", py::arg("lib_path") = "",
-	      py::arg("mode") = "pipeline-device");
+	      py::arg("mode") = "pipeline-managed");
 }
 
 } // namespace duckdb

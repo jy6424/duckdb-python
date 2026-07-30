@@ -18,8 +18,8 @@ def main():
     parser.add_argument("--max-files", type=int, default=0, help="Process only the first N files when N > 0")
     parser.add_argument(
         "--mode",
-        choices=["device", "mapped", "pipeline-device", "pipeline-mapped"],
-        default="pipeline-device",
+        choices=["device", "mapped", "pipeline-device", "pipeline-mapped", "pipeline-managed"],
+        default="pipeline-managed",
     )
     parser.add_argument("--print-averages", action="store_true")
     parser.add_argument(

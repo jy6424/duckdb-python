@@ -335,6 +335,38 @@ struct MappedHostBuffer {
 	}
 };
 
+struct ManagedBuffer {
+	void *ptr = nullptr;
+	size_t capacity = 0;
+
+	~ManagedBuffer() {
+		if (ptr) {
+			cudaFree(ptr);
+		}
+	}
+
+	int Ensure(size_t bytes, const char *step) {
+		if (bytes <= capacity) {
+			return 0;
+		}
+		if (ptr) {
+			cudaFree(ptr);
+			ptr = nullptr;
+			capacity = 0;
+		}
+		if (CheckCuda(cudaMallocManaged(&ptr, bytes), step)) {
+			return 1;
+		}
+		capacity = bytes;
+		return 0;
+	}
+
+	template <class T>
+	T *As() {
+		return reinterpret_cast<T *>(ptr);
+	}
+};
+
 struct DeviceBuffer {
 	void *ptr = nullptr;
 	size_t capacity = 0;
@@ -454,12 +486,16 @@ struct FusedLatAggPipelineSlot {
 	MappedHostBuffer mapped_values;
 	MappedHostBuffer mapped_value_validity;
 	MappedHostBuffer mapped_grid_to_group;
+	ManagedBuffer managed_grids;
+	ManagedBuffer managed_values;
+	ManagedBuffer managed_value_validity;
+	ManagedBuffer managed_grid_to_group;
 	DeviceBuffer sums;
 	DeviceBuffer counts;
 	DeviceBuffer row_counts;
 	cudaStream_t stream = nullptr;
 	bool active = false;
-	bool mapped = false;
+	int memory_mode = 0;
 	uint64_t count = 0;
 	uint64_t group_count = 0;
 	uint64_t build_size = 0;
@@ -479,13 +515,25 @@ struct FusedLatAggPipelineSlot {
 		}
 		return CheckCuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create fused pipeline stream");
 	}
+
+	bool IsMapped() const {
+		return memory_mode == 1;
+	}
+
+	bool IsManaged() const {
+		return memory_mode == 2;
+	}
+
+	bool IsDevice() const {
+		return memory_mode == 0;
+	}
 };
 
 struct FusedLatAggPipelineState {
-	explicit FusedLatAggPipelineState(uint32_t slot_count_p, bool mapped_p)
+	explicit FusedLatAggPipelineState(uint32_t slot_count_p, int memory_mode_p)
 	    : slot_count(slot_count_p), slots(new FusedLatAggPipelineSlot[slot_count_p]) {
 		for (uint32_t slot = 0; slot < slot_count; slot++) {
-			slots[slot].mapped = mapped_p;
+			slots[slot].memory_mode = memory_mode_p;
 		}
 	}
 
@@ -1139,7 +1187,11 @@ extern "C" void *duckdb_gpu_fused_lat_agg_pipeline_create(uint32_t slot_count, i
 	if (slot_count == 0) {
 		slot_count = 2;
 	}
-	auto state = new FusedLatAggPipelineState(slot_count, mapped != 0);
+	auto memory_mode = mapped;
+	if (memory_mode < 0 || memory_mode > 2) {
+		memory_mode = mapped != 0 ? 1 : 0;
+	}
+	auto state = new FusedLatAggPipelineState(slot_count, memory_mode);
 	for (uint32_t slot = 0; slot < slot_count; slot++) {
 		if (state->slots[slot].EnsureStream()) {
 			delete state;
@@ -1186,11 +1238,16 @@ extern "C" int duckdb_gpu_fused_lat_agg_pipeline_submit_i64_double(
 	error |= slot.sums.Ensure(sum_bytes, "resize pipeline fused sums");
 	error |= slot.counts.Ensure(count_bytes, "resize pipeline fused counts");
 	error |= slot.row_counts.Ensure(count_bytes, "resize pipeline fused row counts");
-	if (slot.mapped) {
+	if (slot.IsMapped()) {
 		error |= slot.mapped_grids.Ensure(grid_bytes, "resize mapped pipeline fused grids");
 		error |= slot.mapped_values.Ensure(value_bytes, "resize mapped pipeline fused values");
 		error |= slot.mapped_value_validity.Ensure(validity_bytes, "resize mapped pipeline fused value validity");
 		error |= slot.mapped_grid_to_group.Ensure(build_bytes, "resize mapped pipeline fused grid to group");
+	} else if (slot.IsManaged()) {
+		error |= slot.managed_grids.Ensure(grid_bytes, "resize managed pipeline fused grids");
+		error |= slot.managed_values.Ensure(value_bytes, "resize managed pipeline fused values");
+		error |= slot.managed_value_validity.Ensure(validity_bytes, "resize managed pipeline fused value validity");
+		error |= slot.managed_grid_to_group.Ensure(build_bytes, "resize managed pipeline fused grid to group");
 	} else {
 		error |= slot.grids.Ensure(grid_bytes, "resize pipeline fused grids");
 		error |= slot.values.Ensure(value_bytes, "resize pipeline fused values");
@@ -1209,7 +1266,7 @@ extern "C" int duckdb_gpu_fused_lat_agg_pipeline_submit_i64_double(
 	auto d_counts = slot.counts.As<unsigned long long>();
 	auto d_row_counts = slot.row_counts.As<unsigned long long>();
 
-	if (slot.mapped) {
+	if (slot.IsMapped()) {
 		auto h_grids = slot.mapped_grids.HostAs<int64_t>();
 		auto h_values = slot.mapped_values.HostAs<double>();
 		auto h_value_validity = slot.mapped_value_validity.HostAs<uint8_t>();
@@ -1227,6 +1284,19 @@ extern "C" int duckdb_gpu_fused_lat_agg_pipeline_submit_i64_double(
 		d_values = slot.mapped_values.DeviceAs<double>();
 		d_value_validity = slot.mapped_value_validity.DeviceAs<uint8_t>();
 		d_grid_to_group = slot.mapped_grid_to_group.DeviceAs<int32_t>();
+	} else if (slot.IsManaged()) {
+		d_grids = slot.managed_grids.As<int64_t>();
+		d_values = slot.managed_values.As<double>();
+		d_value_validity = slot.managed_value_validity.As<uint8_t>();
+		d_grid_to_group = slot.managed_grid_to_group.As<int32_t>();
+		std::memcpy(d_grids, grids, grid_bytes);
+		std::memcpy(d_values, values, value_bytes);
+		if (value_validity) {
+			std::memcpy(d_value_validity, value_validity, validity_bytes);
+		} else {
+			std::memset(d_value_validity, 1, validity_bytes);
+		}
+		std::memcpy(d_grid_to_group, grid_to_group, build_bytes);
 	} else {
 		d_grids = slot.grids.As<int64_t>();
 		d_values = slot.values.As<double>();
@@ -1307,8 +1377,10 @@ extern "C" int duckdb_gpu_fused_lat_agg_pipeline_reset_i64_double(void *handle, 
 	error |= slot.sums.Ensure(sum_bytes, "resize pipeline accumulator sums");
 	error |= slot.counts.Ensure(count_bytes, "resize pipeline accumulator counts");
 	error |= slot.row_counts.Ensure(count_bytes, "resize pipeline accumulator row counts");
-	if (slot.mapped) {
+	if (slot.IsMapped()) {
 		error |= slot.mapped_grid_to_group.Ensure(build_bytes, "resize mapped pipeline accumulator grid to group");
+	} else if (slot.IsManaged()) {
+		error |= slot.managed_grid_to_group.Ensure(build_bytes, "resize managed pipeline accumulator grid to group");
 	} else {
 		error |= slot.grid_to_group.Ensure(build_bytes, "resize pipeline accumulator grid to group");
 	}
@@ -1316,8 +1388,10 @@ extern "C" int duckdb_gpu_fused_lat_agg_pipeline_reset_i64_double(void *handle, 
 		return 1;
 	}
 
-	if (slot.mapped) {
+	if (slot.IsMapped()) {
 		std::memcpy(slot.mapped_grid_to_group.HostAs<int32_t>(), grid_to_group, build_bytes);
+	} else if (slot.IsManaged()) {
+		std::memcpy(slot.managed_grid_to_group.As<int32_t>(), grid_to_group, build_bytes);
 	} else {
 		error |= CheckCuda(cudaMemcpyAsync(slot.grid_to_group.As<int32_t>(), grid_to_group, build_bytes,
 		                                  cudaMemcpyHostToDevice, slot.stream),
@@ -1369,7 +1443,7 @@ extern "C" int duckdb_gpu_fused_lat_agg_pipeline_submit_accumulate_i64_double(
 	const auto validity_bytes = count * sizeof(uint8_t);
 
 	int error = 0;
-	if (slot.mapped) {
+	if (slot.IsMapped()) {
 		if (slot.active) {
 			error |= CheckCuda(cudaStreamSynchronize(slot.stream),
 			                   "sync mapped pipeline accumulator before input overwrite");
@@ -1386,6 +1460,24 @@ extern "C" int duckdb_gpu_fused_lat_agg_pipeline_submit_accumulate_i64_double(
 			std::memcpy(slot.mapped_value_validity.HostAs<uint8_t>(), value_validity, validity_bytes);
 		} else {
 			std::memset(slot.mapped_value_validity.HostAs<uint8_t>(), 1, validity_bytes);
+		}
+	} else if (slot.IsManaged()) {
+		if (slot.active) {
+			error |= CheckCuda(cudaStreamSynchronize(slot.stream),
+			                   "sync managed pipeline accumulator before input overwrite");
+		}
+		error |= slot.managed_grids.Ensure(grid_bytes, "resize managed pipeline accumulator grids");
+		error |= slot.managed_values.Ensure(value_bytes, "resize managed pipeline accumulator values");
+		error |= slot.managed_value_validity.Ensure(validity_bytes, "resize managed pipeline accumulator value validity");
+		if (error) {
+			return 1;
+		}
+		std::memcpy(slot.managed_grids.As<int64_t>(), grids, grid_bytes);
+		std::memcpy(slot.managed_values.As<double>(), values, value_bytes);
+		if (value_validity) {
+			std::memcpy(slot.managed_value_validity.As<uint8_t>(), value_validity, validity_bytes);
+		} else {
+			std::memset(slot.managed_value_validity.As<uint8_t>(), 1, validity_bytes);
 		}
 	} else {
 		error |= slot.grids.Ensure(grid_bytes, "resize pipeline accumulator grids");
@@ -1413,11 +1505,18 @@ extern "C" int duckdb_gpu_fused_lat_agg_pipeline_submit_accumulate_i64_double(
 		return 1;
 	}
 
-	auto d_grids = slot.mapped ? slot.mapped_grids.DeviceAs<int64_t>() : slot.grids.As<int64_t>();
-	auto d_values = slot.mapped ? slot.mapped_values.DeviceAs<double>() : slot.values.As<double>();
-	auto d_value_validity =
-	    slot.mapped ? slot.mapped_value_validity.DeviceAs<uint8_t>() : slot.value_validity.As<uint8_t>();
-	auto d_grid_to_group = slot.mapped ? slot.mapped_grid_to_group.DeviceAs<int32_t>() : slot.grid_to_group.As<int32_t>();
+	auto d_grids = slot.IsMapped() ? slot.mapped_grids.DeviceAs<int64_t>()
+	                               : (slot.IsManaged() ? slot.managed_grids.As<int64_t>() : slot.grids.As<int64_t>());
+	auto d_values = slot.IsMapped() ? slot.mapped_values.DeviceAs<double>()
+	                                : (slot.IsManaged() ? slot.managed_values.As<double>() : slot.values.As<double>());
+	auto d_value_validity = slot.IsMapped()
+	                            ? slot.mapped_value_validity.DeviceAs<uint8_t>()
+	                            : (slot.IsManaged() ? slot.managed_value_validity.As<uint8_t>()
+	                                                : slot.value_validity.As<uint8_t>());
+	auto d_grid_to_group = slot.IsMapped()
+	                           ? slot.mapped_grid_to_group.DeviceAs<int32_t>()
+	                           : (slot.IsManaged() ? slot.managed_grid_to_group.As<int32_t>()
+	                                               : slot.grid_to_group.As<int32_t>());
 
 	constexpr int THREADS_PER_BLOCK = 256;
 	const auto blocks = static_cast<unsigned int>((count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
@@ -1432,6 +1531,122 @@ extern "C" int duckdb_gpu_fused_lat_agg_pipeline_submit_accumulate_i64_double(
 	slot.count += count;
 	slot.active = true;
 	return 0;
+}
+
+extern "C" int duckdb_gpu_fused_lat_agg_pipeline_prepare_input_i64_double(void *handle, uint32_t slot_idx,
+                                                                          uint64_t capacity, int64_t **grids_out,
+                                                                          double **values_out,
+                                                                          uint8_t **value_validity_out) {
+	if (!handle || !grids_out || !values_out || !value_validity_out || capacity == 0) {
+		return 1;
+	}
+
+	auto state = reinterpret_cast<FusedLatAggPipelineState *>(handle);
+	if (slot_idx >= state->slot_count) {
+		return 1;
+	}
+	auto &slot = state->slots[slot_idx];
+	if (slot.EnsureStream()) {
+		return 1;
+	}
+	if (slot.IsDevice()) {
+		return 1;
+	}
+
+	const auto grid_bytes = capacity * sizeof(int64_t);
+	const auto value_bytes = capacity * sizeof(double);
+	const auto validity_bytes = capacity * sizeof(uint8_t);
+
+	int error = 0;
+	if (slot.IsMapped()) {
+		error |= slot.mapped_grids.Ensure(grid_bytes, "resize mapped direct pipeline grids");
+		error |= slot.mapped_values.Ensure(value_bytes, "resize mapped direct pipeline values");
+		error |= slot.mapped_value_validity.Ensure(validity_bytes, "resize mapped direct pipeline value validity");
+		if (error) {
+			return 1;
+		}
+		*grids_out = slot.mapped_grids.HostAs<int64_t>();
+		*values_out = slot.mapped_values.HostAs<double>();
+		*value_validity_out = slot.mapped_value_validity.HostAs<uint8_t>();
+		return 0;
+	}
+
+	error |= slot.managed_grids.Ensure(grid_bytes, "resize managed direct pipeline grids");
+	error |= slot.managed_values.Ensure(value_bytes, "resize managed direct pipeline values");
+	error |= slot.managed_value_validity.Ensure(validity_bytes, "resize managed direct pipeline value validity");
+	if (error) {
+		return 1;
+	}
+	*grids_out = slot.managed_grids.As<int64_t>();
+	*values_out = slot.managed_values.As<double>();
+	*value_validity_out = slot.managed_value_validity.As<uint8_t>();
+	return 0;
+}
+
+extern "C" int duckdb_gpu_fused_lat_agg_pipeline_submit_prepared_i64_double(void *handle, uint32_t slot_idx,
+                                                                            uint64_t count) {
+	if (!handle) {
+		return 1;
+	}
+	if (count == 0) {
+		return 0;
+	}
+
+	auto state = reinterpret_cast<FusedLatAggPipelineState *>(handle);
+	if (slot_idx >= state->slot_count) {
+		return 1;
+	}
+	auto &slot = state->slots[slot_idx];
+	if (slot.EnsureStream()) {
+		return 1;
+	}
+	if (slot.IsDevice() || slot.group_count == 0 || slot.build_size == 0) {
+		return 1;
+	}
+
+	int64_t *d_grids = nullptr;
+	double *d_values = nullptr;
+	uint8_t *d_value_validity = nullptr;
+	int32_t *d_grid_to_group = nullptr;
+	if (slot.IsMapped()) {
+		d_grids = slot.mapped_grids.DeviceAs<int64_t>();
+		d_values = slot.mapped_values.DeviceAs<double>();
+		d_value_validity = slot.mapped_value_validity.DeviceAs<uint8_t>();
+		d_grid_to_group = slot.mapped_grid_to_group.DeviceAs<int32_t>();
+	} else {
+		d_grids = slot.managed_grids.As<int64_t>();
+		d_values = slot.managed_values.As<double>();
+		d_value_validity = slot.managed_value_validity.As<uint8_t>();
+		d_grid_to_group = slot.managed_grid_to_group.As<int32_t>();
+	}
+
+	constexpr int THREADS_PER_BLOCK = 256;
+	const auto blocks = static_cast<unsigned int>((count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+	DuckDBGpuFusedLatAggKernel<<<blocks, THREADS_PER_BLOCK, 0, slot.stream>>>(
+	    d_grids, d_values, d_value_validity, count, slot.grid_min, slot.grid_max, d_grid_to_group, slot.build_size,
+	    slot.sums.As<double>(), slot.counts.As<unsigned long long>(), slot.row_counts.As<unsigned long long>());
+	if (CheckCuda(cudaGetLastError(), "launch prepared pipeline fused lat aggregate kernel")) {
+		return 1;
+	}
+
+	slot.count += count;
+	slot.active = true;
+	return 0;
+}
+
+extern "C" int duckdb_gpu_fused_lat_agg_pipeline_sync_slot(void *handle, uint32_t slot_idx) {
+	if (!handle) {
+		return 1;
+	}
+	auto state = reinterpret_cast<FusedLatAggPipelineState *>(handle);
+	if (slot_idx >= state->slot_count) {
+		return 1;
+	}
+	auto &slot = state->slots[slot_idx];
+	if (slot.EnsureStream()) {
+		return 1;
+	}
+	return CheckCuda(cudaStreamSynchronize(slot.stream), "sync direct pipeline slot");
 }
 
 extern "C" int duckdb_gpu_fused_lat_agg_pipeline_wait(void *handle, uint32_t slot_idx, double *sum_out,
