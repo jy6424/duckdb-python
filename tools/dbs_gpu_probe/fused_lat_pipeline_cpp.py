@@ -8,7 +8,7 @@ import duckdb
 
 
 def main():
-    parser = argparse.ArgumentParser(description="C++ DuckDB fused GPU join+aggregate runner")
+    parser = argparse.ArgumentParser(description="C++ DuckDB fused join+aggregate runner")
     parser.add_argument("base_dir")
     parser.add_argument("--var", default="qicps")
     parser.add_argument("--join-key", default="grid")
@@ -18,7 +18,7 @@ def main():
     parser.add_argument("--max-files", type=int, default=0, help="Process only the first N files when N > 0")
     parser.add_argument(
         "--mode",
-        choices=["device", "mapped", "pipeline-device", "pipeline-mapped", "pipeline-managed"],
+        choices=["device", "mapped", "pipeline-device", "pipeline-mapped", "pipeline-managed", "pipeline-cpu"],
         default="pipeline-managed",
     )
     parser.add_argument("--print-averages", action="store_true")

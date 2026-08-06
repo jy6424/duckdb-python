@@ -841,6 +841,54 @@ static void RunDirectPipelineGPUWorker(FusedLatAggPipelineFuncs pipeline, void *
 	free_slots.Close();
 }
 
+static void RunPipelineCPUWorker(BlockingQueue<PipelineInputBatch> &input_queue,
+                                 BlockingQueue<PipelineOutputBatch> &output_queue, std::exception_ptr &error_out,
+                                 std::mutex &error_lock) {
+	try {
+		PipelineInputBatch batch;
+		while (input_queue.Pop(batch)) {
+			auto group_count = batch.mapping->group_values.size();
+			PipelineOutputBatch output;
+			output.fact_path = batch.fact_path;
+			output.mapping = batch.mapping;
+			output.sums.assign(group_count, 0);
+			output.counts.assign(group_count, 0);
+			output.row_counts.assign(group_count, 0);
+
+			for (idx_t row = 0; row < batch.probe.join_keys.size(); row++) {
+				auto grid = batch.probe.join_keys[row];
+				if (grid < batch.mapping->join_min || grid > batch.mapping->join_max) {
+					continue;
+				}
+
+				auto build_idx = static_cast<idx_t>(grid - batch.mapping->join_min);
+				if (build_idx >= batch.mapping->join_to_group.size()) {
+					continue;
+				}
+
+				auto group = batch.mapping->join_to_group[build_idx];
+				if (group < 0 || static_cast<idx_t>(group) >= group_count) {
+					continue;
+				}
+
+				output.row_counts[group]++;
+				if (batch.probe.validity[row] != 0) {
+					output.sums[group] += batch.probe.values[row];
+					output.counts[group]++;
+				}
+			}
+
+			output_queue.Push(std::move(output));
+		}
+	} catch (...) {
+		std::lock_guard<std::mutex> guard(error_lock);
+		if (!error_out) {
+			error_out = std::current_exception();
+		}
+	}
+	output_queue.Close();
+}
+
 static void RunPipelineMergeWorker(BlockingQueue<PipelineOutputBatch> &output_queue,
                                    std::map<double, double> &total_sum,
                                    std::map<double, uint64_t> &total_count, uint64_t &total_rows,
@@ -862,13 +910,16 @@ static void RunPipelineMergeWorker(BlockingQueue<PipelineOutputBatch> &output_qu
 static py::dict DBSGPUFusedLatPipeline(const py::iterable &fact_paths_p, const string &payload_column,
                                        const string &join_key, const string &group_column,
                                        const string &dimension_file, const string &lib_path, const string &mode) {
+	const bool cpu_pipeline_mode = mode == "pipeline-cpu";
 	const bool pipeline_direct_mode = mode == "pipeline-mapped" || mode == "pipeline-managed";
-	const bool pipeline_mode = mode == "pipeline-device" || pipeline_direct_mode;
+	const bool pipeline_mode = cpu_pipeline_mode || mode == "pipeline-device" || pipeline_direct_mode;
 	const bool mapped = mode == "mapped" || mode == "pipeline-mapped";
 	const int pipeline_memory_mode = mode == "pipeline-mapped" ? 1 : (mode == "pipeline-managed" ? 2 : 0);
-	if (!mapped && mode != "device" && mode != "pipeline-managed" && !pipeline_mode) {
+	if (mode != "device" && mode != "mapped" && mode != "pipeline-device" && mode != "pipeline-mapped" &&
+	    mode != "pipeline-managed" && mode != "pipeline-cpu") {
 		throw InvalidInputException(
-		    "mode must be 'device', 'mapped', 'pipeline-device', 'pipeline-mapped', or 'pipeline-managed'");
+		    "mode must be 'device', 'mapped', 'pipeline-device', 'pipeline-mapped', 'pipeline-managed', or "
+		    "'pipeline-cpu'");
 	}
 
 	vector<string> fact_paths;
@@ -888,6 +939,53 @@ static py::dict DBSGPUFusedLatPipeline(const py::iterable &fact_paths_p, const s
 	uint64_t total_rows = 0;
 
 	if (pipeline_mode) {
+		if (cpu_pipeline_mode) {
+			BlockingQueue<PipelineRawBatch> raw_queue(8);
+			BlockingQueue<PipelineInputBatch> input_queue(8);
+			BlockingQueue<PipelineOutputBatch> output_queue(8);
+			std::exception_ptr worker_error;
+			std::mutex worker_error_lock;
+
+			std::thread reader_thread(ReadPipelineRawBatches, std::ref(db), std::cref(fact_paths),
+			                          std::cref(payload_column), std::cref(join_key), std::cref(group_column),
+			                          std::cref(dimension_file), std::ref(raw_queue), std::ref(worker_error),
+			                          std::ref(worker_error_lock));
+			std::thread prepare_thread(PreparePipelineInputBatches, std::ref(raw_queue), std::ref(input_queue),
+			                           std::ref(worker_error), std::ref(worker_error_lock));
+			std::thread cpu_thread(RunPipelineCPUWorker, std::ref(input_queue), std::ref(output_queue),
+			                       std::ref(worker_error), std::ref(worker_error_lock));
+			std::thread merge_thread(RunPipelineMergeWorker, std::ref(output_queue), std::ref(total_sum),
+			                         std::ref(total_count), std::ref(total_rows), std::ref(worker_error),
+			                         std::ref(worker_error_lock));
+
+			try {
+				reader_thread.join();
+				prepare_thread.join();
+				cpu_thread.join();
+				merge_thread.join();
+
+				if (worker_error) {
+					std::rethrow_exception(worker_error);
+				}
+			} catch (...) {
+				raw_queue.Close();
+				input_queue.Close();
+				output_queue.Close();
+				if (reader_thread.joinable()) {
+					reader_thread.join();
+				}
+				if (prepare_thread.joinable()) {
+					prepare_thread.join();
+				}
+				if (cpu_thread.joinable()) {
+					cpu_thread.join();
+				}
+				if (merge_thread.joinable()) {
+					merge_thread.join();
+				}
+				throw;
+			}
+		} else {
 		auto pipeline = LoadFusedLatAggPipeline(lib_path);
 		constexpr idx_t PIPELINE_SLOTS = 2;
 		void *handle = pipeline.create(static_cast<uint32_t>(PIPELINE_SLOTS), pipeline_memory_mode);
@@ -996,6 +1094,7 @@ static py::dict DBSGPUFusedLatPipeline(const py::iterable &fact_paths_p, const s
 				pipeline.destroy(handle);
 				throw;
 			}
+		}
 		}
 	} else {
 		auto fused_agg = LoadFusedLatAgg(lib_path, mapped);
