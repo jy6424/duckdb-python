@@ -237,13 +237,11 @@ __global__ void DuckDBGpuFusedLatAggKernel(const int64_t *grids, const double *v
 	}
 }
 
-__global__ void DuckDBGpuFusedLatAggMultiKernel(const int64_t *grids, const double *values,
-                                                const uint8_t *value_validity, uint64_t column_count, uint64_t count,
-                                                int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group,
-                                                uint64_t build_size, uint64_t group_count, double *sum_out,
-                                                unsigned long long *count_out,
-                                                unsigned long long *row_count_out) {
-	const auto row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+__device__ void DuckDBGpuFusedLatAggMultiRow(
+    const int64_t *grids, const double *values, const uint8_t *value_validity, uint64_t column_count,
+    uint64_t value_stride, uint64_t count, int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group,
+    uint64_t build_size, uint64_t group_count, double *sum_out, unsigned long long *count_out,
+    unsigned long long *row_count_out, uint64_t row) {
 	if (row >= count) {
 		return;
 	}
@@ -267,13 +265,35 @@ __global__ void DuckDBGpuFusedLatAggMultiKernel(const int64_t *grids, const doub
 	atomicAdd(&row_count_out[group], 1ULL);
 
 	for (uint64_t column = 0; column < column_count; column++) {
-		const auto input_idx = column * count + row;
+		const auto input_idx = column * value_stride + row;
 		if (!value_validity || value_validity[input_idx] != 0) {
 			const auto output_idx = column * group_count + group;
 			AtomicAddDouble(&sum_out[output_idx], values[input_idx]);
 			atomicAdd(&count_out[output_idx], 1ULL);
 		}
 	}
+}
+
+__global__ void DuckDBGpuFusedLatAggMultiKernel(const int64_t *grids, const double *values,
+                                                const uint8_t *value_validity, uint64_t column_count, uint64_t count,
+                                                int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group,
+                                                uint64_t build_size, uint64_t group_count, double *sum_out,
+                                                unsigned long long *count_out,
+                                                unsigned long long *row_count_out) {
+	const auto row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	DuckDBGpuFusedLatAggMultiRow(grids, values, value_validity, column_count, count, count, grid_min, grid_max,
+	                             grid_to_group, build_size, group_count, sum_out, count_out, row_count_out, row);
+}
+
+__global__ void DuckDBGpuFusedLatAggMultiStridedKernel(
+    const int64_t *grids, const double *values, const uint8_t *value_validity, uint64_t column_count,
+    uint64_t value_stride, uint64_t count, int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group,
+    uint64_t build_size, uint64_t group_count, double *sum_out, unsigned long long *count_out,
+    unsigned long long *row_count_out) {
+	const auto row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	DuckDBGpuFusedLatAggMultiRow(grids, values, value_validity, column_count, value_stride, count, grid_min,
+	                             grid_max, grid_to_group, build_size, group_count, sum_out, count_out,
+	                             row_count_out, row);
 }
 
 int CheckCuda(cudaError_t status, const char *step) {
@@ -1242,10 +1262,10 @@ extern "C" int duckdb_gpu_fused_lat_agg_i64_double_mapped(const int64_t *grids, 
 	return error ? 1 : 0;
 }
 
-extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double(
-    const int64_t *grids, const double *values, const uint8_t *value_validity, uint64_t column_count, uint64_t count,
-    int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group, uint64_t build_size, uint64_t group_count,
-    double *sum_out, uint64_t *count_out, uint64_t *row_count_out) {
+extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double_strided(
+    const int64_t *grids, const double *values, const uint8_t *value_validity, uint64_t column_count,
+    uint64_t value_stride, uint64_t count, int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group,
+    uint64_t build_size, uint64_t group_count, double *sum_out, uint64_t *count_out, uint64_t *row_count_out) {
 	if (!grids || !values || !grid_to_group || !sum_out || !count_out || !row_count_out || column_count == 0) {
 		return 1;
 	}
@@ -1262,11 +1282,14 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double(
 	if (grid_max < grid_min || build_size == 0) {
 		return 1;
 	}
+	if (value_stride < count) {
+		return 1;
+	}
 
 	thread_local FusedLatAggMultiBuffers buffers;
 	const auto grid_bytes = count * sizeof(int64_t);
-	const auto value_bytes = column_count * count * sizeof(double);
-	const auto validity_bytes = column_count * count * sizeof(uint8_t);
+	const auto value_bytes = column_count * value_stride * sizeof(double);
+	const auto validity_bytes = column_count * value_stride * sizeof(uint8_t);
 	const auto build_bytes = build_size * sizeof(int32_t);
 	const auto sum_bytes = output_count * sizeof(double);
 	const auto output_count_bytes = output_count * sizeof(unsigned long long);
@@ -1313,9 +1336,9 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double(
 
 	constexpr int THREADS_PER_BLOCK = 256;
 	const auto blocks = static_cast<unsigned int>((count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-	DuckDBGpuFusedLatAggMultiKernel<<<blocks, THREADS_PER_BLOCK>>>(
-	    d_grids, d_values, d_value_validity, column_count, count, grid_min, grid_max, d_grid_to_group, build_size,
-	    group_count, d_sums, d_counts, d_row_counts);
+	DuckDBGpuFusedLatAggMultiStridedKernel<<<blocks, THREADS_PER_BLOCK>>>(
+	    d_grids, d_values, d_value_validity, column_count, value_stride, count, grid_min, grid_max, d_grid_to_group,
+	    build_size, group_count, d_sums, d_counts, d_row_counts);
 	error |= CheckCuda(cudaGetLastError(), "launch multi fused lat aggregate kernel");
 	error |= CheckCuda(cudaDeviceSynchronize(), "synchronize multi fused lat aggregate kernel");
 	if (error) {
@@ -1331,10 +1354,19 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double(
 	return error ? 1 : 0;
 }
 
-extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double_mapped(
+extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double(
     const int64_t *grids, const double *values, const uint8_t *value_validity, uint64_t column_count, uint64_t count,
     int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group, uint64_t build_size, uint64_t group_count,
     double *sum_out, uint64_t *count_out, uint64_t *row_count_out) {
+	return duckdb_gpu_fused_lat_agg_multi_i64_double_strided(
+	    grids, values, value_validity, column_count, count, count, grid_min, grid_max, grid_to_group, build_size,
+	    group_count, sum_out, count_out, row_count_out);
+}
+
+extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double_strided_mapped(
+    const int64_t *grids, const double *values, const uint8_t *value_validity, uint64_t column_count,
+    uint64_t value_stride, uint64_t count, int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group,
+    uint64_t build_size, uint64_t group_count, double *sum_out, uint64_t *count_out, uint64_t *row_count_out) {
 	if (!grids || !values || !grid_to_group || !sum_out || !count_out || !row_count_out || column_count == 0) {
 		return 1;
 	}
@@ -1351,11 +1383,14 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double_mapped(
 	if (grid_max < grid_min || build_size == 0) {
 		return 1;
 	}
+	if (value_stride < count) {
+		return 1;
+	}
 
 	thread_local MappedFusedLatAggMultiBuffers buffers;
 	const auto grid_bytes = count * sizeof(int64_t);
-	const auto value_bytes = column_count * count * sizeof(double);
-	const auto validity_bytes = column_count * count * sizeof(uint8_t);
+	const auto value_bytes = column_count * value_stride * sizeof(double);
+	const auto validity_bytes = column_count * value_stride * sizeof(uint8_t);
 	const auto build_bytes = build_size * sizeof(int32_t);
 	const auto sum_bytes = output_count * sizeof(double);
 	const auto output_count_bytes = output_count * sizeof(unsigned long long);
@@ -1403,9 +1438,9 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double_mapped(
 
 	constexpr int THREADS_PER_BLOCK = 256;
 	const auto blocks = static_cast<unsigned int>((count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-	DuckDBGpuFusedLatAggMultiKernel<<<blocks, THREADS_PER_BLOCK>>>(
-	    d_grids, d_values, d_value_validity, column_count, count, grid_min, grid_max, d_grid_to_group, build_size,
-	    group_count, d_sums, d_counts, d_row_counts);
+	DuckDBGpuFusedLatAggMultiStridedKernel<<<blocks, THREADS_PER_BLOCK>>>(
+	    d_grids, d_values, d_value_validity, column_count, value_stride, count, grid_min, grid_max, d_grid_to_group,
+	    build_size, group_count, d_sums, d_counts, d_row_counts);
 	error |= CheckCuda(cudaGetLastError(), "launch mapped multi fused lat aggregate kernel");
 	error |= CheckCuda(cudaDeviceSynchronize(), "synchronize mapped multi fused lat aggregate kernel");
 	if (error) {
@@ -1419,6 +1454,15 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double_mapped(
 	error |= CheckCuda(cudaMemcpy(row_count_out, d_row_counts, row_count_bytes, cudaMemcpyDeviceToHost),
 	                   "copy mapped multi fused row counts to host");
 	return error ? 1 : 0;
+}
+
+extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double_mapped(
+    const int64_t *grids, const double *values, const uint8_t *value_validity, uint64_t column_count, uint64_t count,
+    int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group, uint64_t build_size, uint64_t group_count,
+    double *sum_out, uint64_t *count_out, uint64_t *row_count_out) {
+	return duckdb_gpu_fused_lat_agg_multi_i64_double_strided_mapped(
+	    grids, values, value_validity, column_count, count, count, grid_min, grid_max, grid_to_group, build_size,
+	    group_count, sum_out, count_out, row_count_out);
 }
 
 extern "C" void *duckdb_gpu_fused_lat_agg_pipeline_create(uint32_t slot_count, int mapped) {

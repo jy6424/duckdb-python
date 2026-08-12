@@ -34,6 +34,12 @@ using FusedLatAggMultiFunc = int (*)(const int64_t *grids, const double *values,
                                      uint64_t column_count, uint64_t count, int64_t grid_min, int64_t grid_max,
                                      const int32_t *grid_to_group, uint64_t build_size, uint64_t group_count,
                                      double *sum_out, uint64_t *count_out, uint64_t *row_count_out);
+using FusedLatAggMultiStridedFunc = int (*)(const int64_t *grids, const double *values,
+                                            const uint8_t *value_validity, uint64_t column_count,
+                                            uint64_t value_stride, uint64_t count, int64_t grid_min,
+                                            int64_t grid_max, const int32_t *grid_to_group, uint64_t build_size,
+                                            uint64_t group_count, double *sum_out, uint64_t *count_out,
+                                            uint64_t *row_count_out);
 using FusedLatAggPipelineCreateFunc = void *(*)(uint32_t slot_count, int mapped);
 using FusedLatAggPipelineSubmitFunc = int (*)(void *handle, uint32_t slot_idx, const int64_t *grids,
                                               const double *values, const uint8_t *value_validity, uint64_t count,
@@ -181,6 +187,42 @@ static FusedLatAggMultiFunc LoadFusedLatAggMulti(const string &path_p, bool mapp
 	const char *symbol =
 	    mapped ? "duckdb_gpu_fused_lat_agg_multi_i64_double_mapped" : "duckdb_gpu_fused_lat_agg_multi_i64_double";
 	func = reinterpret_cast<FusedLatAggMultiFunc>(dlsym(*handle_ptr, symbol));
+	if (!func) {
+		throw InvalidInputException("Failed to load GPU helper symbol '%s': %s", symbol, dlerror());
+	}
+	return func;
+}
+
+static FusedLatAggMultiStridedFunc LoadFusedLatAggMultiStrided(const string &path_p, bool mapped) {
+	static void *device_handle = nullptr;
+	static void *mapped_handle = nullptr;
+	static FusedLatAggMultiStridedFunc device_func = nullptr;
+	static FusedLatAggMultiStridedFunc mapped_func = nullptr;
+
+	void **handle_ptr = mapped ? &mapped_handle : &device_handle;
+	auto &func = mapped ? mapped_func : device_func;
+	if (func) {
+		return func;
+	}
+
+	string path = path_p;
+	if (path.empty()) {
+		const char *env_path = std::getenv("DUCKDB_GPU_PROBE_LIB");
+		if (env_path && env_path[0]) {
+			path = env_path;
+		} else {
+			path = "libduckdb_gpu_probe.so";
+		}
+	}
+
+	*handle_ptr = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+	if (!*handle_ptr) {
+		throw InvalidInputException("Failed to load GPU helper library '%s': %s", path, dlerror());
+	}
+
+	const char *symbol = mapped ? "duckdb_gpu_fused_lat_agg_multi_i64_double_strided_mapped" :
+	                             "duckdb_gpu_fused_lat_agg_multi_i64_double_strided";
+	func = reinterpret_cast<FusedLatAggMultiStridedFunc>(dlsym(*handle_ptr, symbol));
 	if (!func) {
 		throw InvalidInputException("Failed to load GPU helper symbol '%s': %s", symbol, dlerror());
 	}
@@ -442,7 +484,11 @@ struct MultiPipelineRawBatch {
 struct MultiPipelineInputBatch {
 	string fact_path;
 	std::shared_ptr<GroupMapping> mapping;
-	MultiProbeColumns probe;
+	vector<int64_t> join_keys;
+	vector<double> values;
+	vector<uint8_t> validity;
+	idx_t row_count = 0;
+	idx_t value_stride = 0;
 };
 
 struct MultiPipelineOutputBatch {
@@ -537,7 +583,7 @@ static idx_t PreparedRowCount(const PipelineInputBatch &batch) {
 }
 
 static idx_t PreparedRowCount(const MultiPipelineInputBatch &batch) {
-	return batch.probe.join_keys.size();
+	return batch.row_count;
 }
 
 static void AppendPreparedRows(PipelineInputBatch &batch, PipelineRawBatch raw) {
@@ -560,29 +606,33 @@ static void AppendPreparedRows(PipelineInputBatch &batch, PipelineRawBatch raw) 
 	}
 }
 
-static void AppendMultiPreparedRows(MultiPipelineInputBatch &batch, MultiPipelineRawBatch raw, idx_t column_count) {
+static void AppendMultiPreparedRows(MultiPipelineInputBatch &batch, MultiPipelineRawBatch raw, idx_t column_count,
+                                    idx_t target_batch_rows) {
 	if (batch.fact_path.empty()) {
 		batch.fact_path = std::move(raw.fact_path);
 		batch.mapping = std::move(raw.mapping);
-		batch.probe.values.resize(column_count);
-		batch.probe.validity.resize(column_count);
+		batch.value_stride = target_batch_rows;
+		batch.join_keys.reserve(target_batch_rows);
+		batch.values.resize(column_count * target_batch_rows);
+		batch.validity.resize(column_count * target_batch_rows);
 	}
 	auto count = raw.join_keys.size();
-	batch.probe.join_keys.reserve(batch.probe.join_keys.size() + count);
-	for (idx_t column = 0; column < column_count; column++) {
-		batch.probe.values[column].reserve(batch.probe.values[column].size() + count);
-		batch.probe.validity[column].reserve(batch.probe.validity[column].size() + count);
-	}
 
 	for (idx_t row = 0; row < count; row++) {
 		if (raw.join_validity[row] == 0) {
 			continue;
 		}
-		batch.probe.join_keys.push_back(raw.join_keys[row]);
-		for (idx_t column = 0; column < column_count; column++) {
-			batch.probe.values[column].push_back(raw.values[column][row]);
-			batch.probe.validity[column].push_back(raw.validity[column][row]);
+		auto output_row = batch.row_count;
+		if (output_row >= target_batch_rows) {
+			throw InvalidInputException("GPU fused multi pipeline batch row capacity exceeded");
 		}
+		batch.join_keys.push_back(raw.join_keys[row]);
+		for (idx_t column = 0; column < column_count; column++) {
+			auto offset = column * batch.value_stride + output_row;
+			batch.values[offset] = raw.values[column][row];
+			batch.validity[offset] = raw.validity[column][row];
+		}
+		batch.row_count++;
 	}
 }
 
@@ -878,7 +928,7 @@ static void PrepareMultiPipelineInputBatches(BlockingQueue<MultiPipelineRawBatch
 				flush_current();
 			}
 
-			AppendMultiPreparedRows(current, std::move(raw), column_count);
+			AppendMultiPreparedRows(current, std::move(raw), column_count, target_batch_rows);
 			current_chunks++;
 			if (PreparedRowCount(current) >= target_batch_rows || current_chunks >= target_batch_chunks) {
 				flush_current();
@@ -1209,7 +1259,7 @@ static void RunPipelineCPUWorker(BlockingQueue<PipelineInputBatch> &input_queue,
 	output_queue.Close();
 }
 
-static void RunMultiPipelineGPUWorker(FusedLatAggMultiFunc fused_agg,
+static void RunMultiPipelineGPUWorker(FusedLatAggMultiStridedFunc fused_agg,
                                       BlockingQueue<MultiPipelineInputBatch> &input_queue,
                                       BlockingQueue<MultiPipelineOutputBatch> &output_queue,
                                       idx_t column_count, std::exception_ptr &error_out,
@@ -1217,14 +1267,10 @@ static void RunMultiPipelineGPUWorker(FusedLatAggMultiFunc fused_agg,
 	try {
 		MultiPipelineInputBatch batch;
 		while (input_queue.Pop(batch)) {
-			auto row_count = batch.probe.join_keys.size();
+			auto row_count = batch.row_count;
 			if (row_count == 0) {
 				continue;
 			}
-
-			vector<double> values;
-			vector<uint8_t> validity;
-			FlattenMultiProbeColumns(batch.probe, values, validity);
 
 			auto group_count = batch.mapping->group_values.size();
 			MultiPipelineOutputBatch output;
@@ -1235,9 +1281,10 @@ static void RunMultiPipelineGPUWorker(FusedLatAggMultiFunc fused_agg,
 			output.counts.assign(column_count * group_count, 0);
 			output.row_counts.assign(group_count, 0);
 
-			auto rc = fused_agg(batch.probe.join_keys.data(), values.data(), validity.data(),
-			                    static_cast<uint64_t>(column_count), static_cast<uint64_t>(row_count),
-			                    batch.mapping->join_min, batch.mapping->join_max, batch.mapping->join_to_group.data(),
+			auto rc = fused_agg(batch.join_keys.data(), batch.values.data(), batch.validity.data(),
+			                    static_cast<uint64_t>(column_count), static_cast<uint64_t>(batch.value_stride),
+			                    static_cast<uint64_t>(row_count), batch.mapping->join_min, batch.mapping->join_max,
+			                    batch.mapping->join_to_group.data(),
 			                    static_cast<uint64_t>(batch.mapping->join_to_group.size()),
 			                    static_cast<uint64_t>(group_count), output.sums.data(), output.counts.data(),
 			                    output.row_counts.data());
@@ -1557,6 +1604,7 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 	uint64_t total_rows = 0;
 
 	if (pipeline_mode) {
+		auto fused_agg_strided = LoadFusedLatAggMultiStrided(lib_path, mapped);
 		BlockingQueue<MultiPipelineRawBatch> raw_queue(8);
 		BlockingQueue<MultiPipelineInputBatch> input_queue(8);
 		BlockingQueue<MultiPipelineOutputBatch> output_queue(8);
@@ -1569,8 +1617,9 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		                          std::ref(worker_error_lock));
 		std::thread prepare_thread(PrepareMultiPipelineInputBatches, std::ref(raw_queue), std::ref(input_queue),
 		                           column_count, std::ref(worker_error), std::ref(worker_error_lock));
-		std::thread gpu_thread(RunMultiPipelineGPUWorker, fused_agg, std::ref(input_queue), std::ref(output_queue),
-		                       column_count, std::ref(worker_error), std::ref(worker_error_lock));
+		std::thread gpu_thread(RunMultiPipelineGPUWorker, fused_agg_strided, std::ref(input_queue),
+		                       std::ref(output_queue), column_count, std::ref(worker_error),
+		                       std::ref(worker_error_lock));
 		std::thread merge_thread(RunMultiPipelineMergeWorker, std::ref(output_queue), std::ref(total_sums),
 		                         std::ref(total_counts), std::ref(total_row_counts), std::ref(total_rows),
 		                         std::ref(worker_error), std::ref(worker_error_lock));
