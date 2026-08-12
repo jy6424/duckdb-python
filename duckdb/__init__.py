@@ -391,8 +391,9 @@ __all__: list[str] = [
 ]
 
 try:
-    from _duckdb import dbs_gpu_fused_lat_pipeline
+    from _duckdb import dbs_gpu_fused_lat_multi, dbs_gpu_fused_lat_pipeline
 
+    __all__.append("dbs_gpu_fused_lat_multi")
     __all__.append("dbs_gpu_fused_lat_pipeline")
 except ImportError:
     pass

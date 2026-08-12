@@ -30,6 +30,10 @@ using FusedLatAggFunc = int (*)(const int64_t *grids, const double *values, cons
                                 uint64_t count, int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group,
                                 uint64_t build_size, uint64_t group_count, double *sum_out, uint64_t *count_out,
                                 uint64_t *row_count_out);
+using FusedLatAggMultiFunc = int (*)(const int64_t *grids, const double *values, const uint8_t *value_validity,
+                                     uint64_t column_count, uint64_t count, int64_t grid_min, int64_t grid_max,
+                                     const int32_t *grid_to_group, uint64_t build_size, uint64_t group_count,
+                                     double *sum_out, uint64_t *count_out, uint64_t *row_count_out);
 using FusedLatAggPipelineCreateFunc = void *(*)(uint32_t slot_count, int mapped);
 using FusedLatAggPipelineSubmitFunc = int (*)(void *handle, uint32_t slot_idx, const int64_t *grids,
                                               const double *values, const uint8_t *value_validity, uint64_t count,
@@ -141,6 +145,42 @@ static FusedLatAggFunc LoadFusedLatAgg(const string &path_p, bool mapped) {
 
 	const char *symbol = mapped ? "duckdb_gpu_fused_lat_agg_i64_double_mapped" : "duckdb_gpu_fused_lat_agg_i64_double";
 	func = reinterpret_cast<FusedLatAggFunc>(dlsym(*handle_ptr, symbol));
+	if (!func) {
+		throw InvalidInputException("Failed to load GPU helper symbol '%s': %s", symbol, dlerror());
+	}
+	return func;
+}
+
+static FusedLatAggMultiFunc LoadFusedLatAggMulti(const string &path_p, bool mapped) {
+	static void *device_handle = nullptr;
+	static void *mapped_handle = nullptr;
+	static FusedLatAggMultiFunc device_func = nullptr;
+	static FusedLatAggMultiFunc mapped_func = nullptr;
+
+	void **handle_ptr = mapped ? &mapped_handle : &device_handle;
+	auto &func = mapped ? mapped_func : device_func;
+	if (func) {
+		return func;
+	}
+
+	string path = path_p;
+	if (path.empty()) {
+		const char *env_path = std::getenv("DUCKDB_GPU_PROBE_LIB");
+		if (env_path && env_path[0]) {
+			path = env_path;
+		} else {
+			path = "libduckdb_gpu_probe.so";
+		}
+	}
+
+	*handle_ptr = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+	if (!*handle_ptr) {
+		throw InvalidInputException("Failed to load GPU helper library '%s': %s", path, dlerror());
+	}
+
+	const char *symbol =
+	    mapped ? "duckdb_gpu_fused_lat_agg_multi_i64_double_mapped" : "duckdb_gpu_fused_lat_agg_multi_i64_double";
+	func = reinterpret_cast<FusedLatAggMultiFunc>(dlsym(*handle_ptr, symbol));
 	if (!func) {
 		throw InvalidInputException("Failed to load GPU helper symbol '%s': %s", symbol, dlerror());
 	}
@@ -283,6 +323,12 @@ struct ProbeColumns {
 	vector<int64_t> join_keys;
 	vector<double> values;
 	vector<uint8_t> validity;
+};
+
+struct MultiProbeColumns {
+	vector<int64_t> join_keys;
+	vector<vector<double>> values;
+	vector<vector<uint8_t>> validity;
 };
 
 template <class T>
@@ -479,6 +525,80 @@ static ProbeColumns ReadProbeColumns(Connection &connection, const string &fact_
 	return columns;
 }
 
+static string BuildMultiProbeQuery(const string &fact_path, const string &join_key,
+                                   const vector<string> &payload_columns) {
+	string query = "SELECT ";
+	query += QuoteIdentifier(join_key);
+	query += "::BIGINT AS join_key";
+	for (idx_t column = 0; column < payload_columns.size(); column++) {
+		auto quoted = QuoteIdentifier(payload_columns[column]);
+		query += ", COALESCE(" + quoted + ", 0)::DOUBLE AS value_" + std::to_string(column);
+		query += ", CASE WHEN " + quoted + " IS NULL THEN 0 ELSE 1 END::UTINYINT AS valid_" +
+		         std::to_string(column);
+	}
+	query += " FROM read_parquet('" + EscapeSQLString(fact_path) + "')";
+	return query;
+}
+
+static void AppendMultiProbeChunk(DataChunk &chunk, MultiProbeColumns &columns, idx_t column_count) {
+	auto count = chunk.size();
+	auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
+	auto &join_validity = FlatVector::Validity(chunk.data[0]);
+
+	if (columns.values.empty()) {
+		columns.values.resize(column_count);
+		columns.validity.resize(column_count);
+	}
+	for (idx_t column = 0; column < column_count; column++) {
+		columns.values[column].reserve(columns.values[column].size() + count);
+		columns.validity[column].reserve(columns.validity[column].size() + count);
+	}
+	columns.join_keys.reserve(columns.join_keys.size() + count);
+
+	for (idx_t row = 0; row < count; row++) {
+		if (!join_validity.RowIsValid(row)) {
+			continue;
+		}
+		columns.join_keys.push_back(join_data[row]);
+		for (idx_t column = 0; column < column_count; column++) {
+			auto value_data = FlatVector::GetData<double>(chunk.data[1 + column * 2]);
+			auto valid_data = FlatVector::GetData<uint8_t>(chunk.data[2 + column * 2]);
+			columns.values[column].push_back(value_data[row]);
+			columns.validity[column].push_back(valid_data[row]);
+		}
+	}
+}
+
+static MultiProbeColumns ReadMultiProbeColumns(Connection &connection, const string &fact_path, const string &join_key,
+                                               const vector<string> &payload_columns) {
+	auto result = RunStreamingQuery(connection, BuildMultiProbeQuery(fact_path, join_key, payload_columns));
+	MultiProbeColumns columns;
+	columns.values.resize(payload_columns.size());
+	columns.validity.resize(payload_columns.size());
+
+	while (true) {
+		auto chunk = result->Fetch();
+		if (!chunk || chunk->size() == 0) {
+			break;
+		}
+		AppendMultiProbeChunk(*chunk, columns, payload_columns.size());
+	}
+	return columns;
+}
+
+static void FlattenMultiProbeColumns(const MultiProbeColumns &columns, vector<double> &values,
+                                     vector<uint8_t> &validity) {
+	auto row_count = columns.join_keys.size();
+	auto column_count = columns.values.size();
+	values.resize(column_count * row_count);
+	validity.resize(column_count * row_count);
+	for (idx_t column = 0; column < column_count; column++) {
+		std::memcpy(values.data() + column * row_count, columns.values[column].data(), row_count * sizeof(double));
+		std::memcpy(validity.data() + column * row_count, columns.validity[column].data(),
+		            row_count * sizeof(uint8_t));
+	}
+}
+
 static void MergeFusedResult(std::map<double, double> &total_sum, std::map<double, uint64_t> &total_count,
                              uint64_t &total_rows, const GroupMapping &mapping, const vector<double> &sums,
                              const vector<uint64_t> &counts, const vector<uint64_t> &row_counts) {
@@ -493,6 +613,45 @@ static void MergeFusedResult(std::map<double, double> &total_sum, std::map<doubl
 		total_count[group_value] += counts[group];
 		total_rows += row_count;
 	}
+}
+
+static void MergeMultiFusedResult(vector<std::map<double, double>> &total_sums,
+                                  vector<std::map<double, uint64_t>> &total_counts,
+                                  std::map<double, uint64_t> &total_row_counts, uint64_t &total_rows,
+                                  const GroupMapping &mapping, const vector<double> &sums,
+                                  const vector<uint64_t> &counts, const vector<uint64_t> &row_counts,
+                                  idx_t column_count) {
+	auto group_count = mapping.group_values.size();
+	for (idx_t group = 0; group < group_count; group++) {
+		auto row_count = row_counts[group];
+		if (row_count == 0) {
+			continue;
+		}
+		auto group_value = mapping.group_values[group];
+		total_rows += row_count;
+		total_row_counts[group_value] += row_count;
+		for (idx_t column = 0; column < column_count; column++) {
+			auto offset = column * group_count + group;
+			total_sums[column][group_value] += sums[offset];
+			total_counts[column][group_value] += counts[offset];
+		}
+	}
+}
+
+static vector<string> ParsePayloadColumns(const py::object &payload_columns_p) {
+	vector<string> payload_columns;
+	if (py::isinstance<py::str>(payload_columns_p)) {
+		payload_columns.push_back(py::str(payload_columns_p));
+	} else {
+		py::iterable payload_iterable = payload_columns_p.cast<py::iterable>();
+		for (auto item : payload_iterable) {
+			payload_columns.push_back(py::str(item));
+		}
+	}
+	if (payload_columns.empty()) {
+		throw InvalidInputException("payload_columns cannot be empty");
+	}
+	return payload_columns;
 }
 
 static void ReadPipelineRawBatches(DuckDB &db, const vector<string> &fact_paths, const string &payload_column,
@@ -1141,6 +1300,99 @@ static py::dict DBSGPUFusedLatPipeline(const py::iterable &fact_paths_p, const s
 	return result;
 }
 
+static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::object &payload_columns_p,
+                                    const string &join_key, const string &group_column,
+                                    const string &dimension_file, const string &lib_path, const string &mode) {
+	const bool mapped = mode == "mapped";
+	if (mode != "device" && mode != "mapped") {
+		throw InvalidInputException("mode must be 'device' or 'mapped'");
+	}
+
+	vector<string> fact_paths;
+	for (auto item : fact_paths_p) {
+		fact_paths.push_back(py::str(item));
+	}
+	if (fact_paths.empty()) {
+		throw InvalidInputException("fact_paths cannot be empty");
+	}
+	auto payload_columns = ParsePayloadColumns(payload_columns_p);
+	auto column_count = payload_columns.size();
+
+	auto start = std::chrono::steady_clock::now();
+	DuckDB db(nullptr);
+	Connection connection(db);
+	auto fused_agg = LoadFusedLatAggMulti(lib_path, mapped);
+
+	vector<std::map<double, double>> total_sums(column_count);
+	vector<std::map<double, uint64_t>> total_counts(column_count);
+	std::map<double, uint64_t> total_row_counts;
+	uint64_t total_rows = 0;
+
+	for (auto &fact_path : fact_paths) {
+		auto dimension_path = ParentPath(fact_path) + "/" + dimension_file;
+		auto mapping = ReadGroupMapping(connection, dimension_path, join_key, group_column);
+		auto probe = ReadMultiProbeColumns(connection, fact_path, join_key, payload_columns);
+		if (probe.join_keys.empty()) {
+			continue;
+		}
+
+		vector<double> values;
+		vector<uint8_t> validity;
+		FlattenMultiProbeColumns(probe, values, validity);
+
+		auto group_count = mapping.group_values.size();
+		vector<double> sums(column_count * group_count, 0);
+		vector<uint64_t> counts(column_count * group_count, 0);
+		vector<uint64_t> row_counts(group_count, 0);
+
+		auto rc = fused_agg(probe.join_keys.data(), values.data(), validity.data(), static_cast<uint64_t>(column_count),
+		                    static_cast<uint64_t>(probe.join_keys.size()), mapping.join_min, mapping.join_max,
+		                    mapping.join_to_group.data(), static_cast<uint64_t>(mapping.join_to_group.size()),
+		                    static_cast<uint64_t>(group_count), sums.data(), counts.data(), row_counts.data());
+		if (rc != 0) {
+			throw InvalidInputException("GPU fused multi aggregate failed for '%s'", fact_path);
+		}
+
+		MergeMultiFusedResult(total_sums, total_counts, total_row_counts, total_rows, mapping, sums, counts, row_counts,
+		                      column_count);
+	}
+
+	auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+	py::dict result;
+	result["row_count"] = py::int_(total_rows);
+	result["input_file_count"] = py::int_(fact_paths.size());
+	result["query_time"] = py::float_(elapsed);
+
+	py::list payloads;
+	for (auto &payload_column : payload_columns) {
+		payloads.append(payload_column);
+	}
+	result["payload_columns"] = payloads;
+
+	py::list groups;
+	for (auto &entry : total_row_counts) {
+		auto group_value = entry.first;
+		py::dict group;
+		group["group"] = py::float_(group_value);
+		group["row_count"] = py::int_(entry.second);
+		for (idx_t column = 0; column < column_count; column++) {
+			auto &payload_column = payload_columns[column];
+			auto sum = total_sums[column][group_value];
+			auto count = total_counts[column][group_value];
+			group[py::str("sum_" + payload_column)] = py::float_(sum);
+			group[py::str("count_" + payload_column)] = py::int_(count);
+			if (count > 0) {
+				group[py::str("avg_" + payload_column)] = py::float_(sum / static_cast<double>(count));
+			} else {
+				group[py::str("avg_" + payload_column)] = py::none();
+			}
+		}
+		groups.append(group);
+	}
+	result["groups"] = groups;
+	return result;
+}
+
 } // namespace
 
 void RegisterDBSGPUFused(py::module_ &m) {
@@ -1148,6 +1400,10 @@ void RegisterDBSGPUFused(py::module_ &m) {
 	      py::arg("payload_column") = "qicps", py::arg("join_key") = "grid", py::arg("group_column") = "lats",
 	      py::arg("dimension_file") = "grid.parquet", py::arg("lib_path") = "",
 	      py::arg("mode") = "pipeline-managed");
+	m.def("dbs_gpu_fused_lat_multi", &DBSGPUFusedLatMulti, py::arg("fact_paths"),
+	      py::arg("payload_columns") = py::make_tuple("qicps"), py::arg("join_key") = "grid",
+	      py::arg("group_column") = "lats", py::arg("dimension_file") = "grid.parquet", py::arg("lib_path") = "",
+	      py::arg("mode") = "device");
 }
 
 } // namespace duckdb
