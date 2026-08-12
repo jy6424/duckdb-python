@@ -17,7 +17,11 @@ def parse_args():
     parser.add_argument("--join-key", default="grid")
     parser.add_argument("--group-column", default="lats")
     parser.add_argument("--dimension-file", default="grid.parquet")
-    parser.add_argument("--mode", default=os.environ.get("DUCKDB_GPU_MULTI_MODE", "device"), choices=["device", "mapped"])
+    parser.add_argument(
+        "--mode",
+        default=os.environ.get("DUCKDB_GPU_MULTI_MODE", "device"),
+        choices=["device", "mapped", "pipeline-device", "pipeline-mapped"],
+    )
     parser.add_argument(
         "--lib",
         default=os.environ.get(
