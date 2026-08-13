@@ -643,6 +643,50 @@ static void AppendMultiPreparedRows(MultiPipelineInputBatch &batch, MultiPipelin
 	}
 }
 
+static void StartMultiPipelineInputBatch(MultiPipelineInputBatch &batch, const string &fact_path,
+                                         std::shared_ptr<GroupMapping> mapping, idx_t column_count,
+                                         idx_t target_batch_rows) {
+	batch = MultiPipelineInputBatch();
+	batch.fact_path = fact_path;
+	batch.mapping = std::move(mapping);
+	batch.value_stride = target_batch_rows;
+	batch.join_keys.reserve(target_batch_rows);
+	batch.values.resize(column_count * target_batch_rows);
+	batch.validity.resize(column_count * target_batch_rows);
+}
+
+static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChunk &chunk, idx_t &row_offset,
+                                         idx_t column_count, idx_t target_batch_rows) {
+	auto count = chunk.size();
+	auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
+	auto &join_validity = FlatVector::Validity(chunk.data[0]);
+
+	vector<const double *> value_data;
+	vector<const uint8_t *> valid_data;
+	value_data.reserve(column_count);
+	valid_data.reserve(column_count);
+	for (idx_t column = 0; column < column_count; column++) {
+		value_data.push_back(FlatVector::GetData<double>(chunk.data[1 + column * 2]));
+		valid_data.push_back(FlatVector::GetData<uint8_t>(chunk.data[2 + column * 2]));
+	}
+
+	while (row_offset < count && batch.row_count < target_batch_rows) {
+		auto row = row_offset++;
+		if (!join_validity.RowIsValid(row)) {
+			continue;
+		}
+
+		auto output_row = batch.row_count;
+		batch.join_keys.push_back(join_data[row]);
+		for (idx_t column = 0; column < column_count; column++) {
+			auto offset = column * batch.value_stride + output_row;
+			batch.values[offset] = value_data[column][row];
+			batch.validity[offset] = valid_data[column][row];
+		}
+		batch.row_count++;
+	}
+}
+
 static ProbeColumns ReadProbeColumns(Connection &connection, const string &fact_path, const string &join_key,
                                      const string &payload_column) {
 	auto result = RunStreamingQuery(connection, BuildProbeQuery(fact_path, join_key, payload_column));
@@ -893,6 +937,73 @@ static void ReadMultiPipelineRawBatchWorker(DuckDB &db, BlockingQueue<string> &f
 			error_out = std::current_exception();
 		}
 	}
+}
+
+static void ReadPrepareMultiPipelineInputBatches(DuckDB &db, const vector<string> &fact_paths,
+                                                 const vector<string> &payload_columns, const string &join_key,
+                                                 const string &group_column, const string &dimension_file,
+                                                 BlockingQueue<MultiPipelineInputBatch> &input_queue,
+                                                 std::exception_ptr &error_out, std::mutex &error_lock) {
+	try {
+		auto target_batch_rows = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_ROWS", 65536);
+		auto target_batch_chunks = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_CHUNKS", 32);
+		if (target_batch_rows == 0 || target_batch_chunks == 0) {
+			throw InvalidInputException(
+			    "DUCKDB_GPU_PIPELINE_BATCH_ROWS and DUCKDB_GPU_PIPELINE_BATCH_CHUNKS must be > 0");
+		}
+		auto column_count = payload_columns.size();
+		Connection connection(db);
+
+		for (auto &fact_path : fact_paths) {
+			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
+			auto mapping =
+			    std::make_shared<GroupMapping>(ReadGroupMapping(connection, dimension_path, join_key, group_column));
+			auto result = RunStreamingQuery(connection, BuildMultiProbeQuery(fact_path, join_key, payload_columns));
+
+			MultiPipelineInputBatch current;
+			idx_t current_chunks = 0;
+
+			auto flush_current = [&]() {
+				if (PreparedRowCount(current) > 0) {
+					input_queue.Push(std::move(current));
+				}
+				current = MultiPipelineInputBatch();
+				current_chunks = 0;
+			};
+
+			while (true) {
+				auto chunk = result->Fetch();
+				if (!chunk || chunk->size() == 0) {
+					break;
+				}
+
+				idx_t row_offset = 0;
+				while (row_offset < chunk->size()) {
+					if (PreparedRowCount(current) > 0 && current_chunks >= target_batch_chunks) {
+						flush_current();
+					}
+					if (current.fact_path.empty()) {
+						StartMultiPipelineInputBatch(current, fact_path, mapping, column_count, target_batch_rows);
+					}
+					if (current_chunks == 0 || row_offset == 0) {
+						current_chunks++;
+					}
+
+					AppendMultiPreparedChunkRows(current, *chunk, row_offset, column_count, target_batch_rows);
+					if (PreparedRowCount(current) >= target_batch_rows) {
+						flush_current();
+					}
+				}
+			}
+			flush_current();
+		}
+	} catch (...) {
+		std::lock_guard<std::mutex> guard(error_lock);
+		if (!error_out) {
+			error_out = std::current_exception();
+		}
+	}
+	input_queue.Close();
 }
 
 static void PreparePipelineInputBatches(BlockingQueue<PipelineRawBatch> &raw_queue,
@@ -1652,67 +1763,105 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		if (reader_thread_count == 0) {
 			reader_thread_count = 1;
 		}
-		BlockingQueue<string> file_queue(0);
-		BlockingQueue<MultiPipelineRawBatch> raw_queue(8);
 		BlockingQueue<MultiPipelineInputBatch> input_queue(8);
 		BlockingQueue<MultiPipelineOutputBatch> output_queue(8);
 		std::exception_ptr worker_error;
 		std::mutex worker_error_lock;
 
-		for (auto &fact_path : fact_paths) {
-			file_queue.Push(fact_path);
-		}
-		file_queue.Close();
+		if (reader_thread_count == 1) {
+			std::thread reader_prepare_thread(ReadPrepareMultiPipelineInputBatches, std::ref(db), std::cref(fact_paths),
+			                                  std::cref(payload_columns), std::cref(join_key),
+			                                  std::cref(group_column), std::cref(dimension_file),
+			                                  std::ref(input_queue), std::ref(worker_error),
+			                                  std::ref(worker_error_lock));
+			std::thread gpu_thread(RunMultiPipelineGPUWorker, fused_agg_strided, std::ref(input_queue),
+			                       std::ref(output_queue), column_count, std::ref(worker_error),
+			                       std::ref(worker_error_lock));
+			std::thread merge_thread(RunMultiPipelineMergeWorker, std::ref(output_queue), std::ref(total_sums),
+			                         std::ref(total_counts), std::ref(total_row_counts), std::ref(total_rows),
+			                         std::ref(worker_error), std::ref(worker_error_lock));
 
-		vector<std::thread> reader_threads;
-		reader_threads.reserve(reader_thread_count);
-		for (idx_t reader = 0; reader < reader_thread_count; reader++) {
-			reader_threads.emplace_back(ReadMultiPipelineRawBatchWorker, std::ref(db), std::ref(file_queue),
-			                            std::cref(payload_columns), std::cref(join_key), std::cref(group_column),
-			                            std::cref(dimension_file), std::ref(raw_queue), std::ref(worker_error),
-			                            std::ref(worker_error_lock));
-		}
-		std::thread prepare_thread(PrepareMultiPipelineInputBatches, std::ref(raw_queue), std::ref(input_queue),
-		                           column_count, std::ref(worker_error), std::ref(worker_error_lock));
-		std::thread gpu_thread(RunMultiPipelineGPUWorker, fused_agg_strided, std::ref(input_queue),
-		                       std::ref(output_queue), column_count, std::ref(worker_error),
-		                       std::ref(worker_error_lock));
-		std::thread merge_thread(RunMultiPipelineMergeWorker, std::ref(output_queue), std::ref(total_sums),
-		                         std::ref(total_counts), std::ref(total_row_counts), std::ref(total_rows),
-		                         std::ref(worker_error), std::ref(worker_error_lock));
+			try {
+				reader_prepare_thread.join();
+				gpu_thread.join();
+				merge_thread.join();
 
-		try {
-			for (auto &reader_thread : reader_threads) {
-				reader_thread.join();
+				if (worker_error) {
+					std::rethrow_exception(worker_error);
+				}
+			} catch (...) {
+				input_queue.Close();
+				output_queue.Close();
+				if (reader_prepare_thread.joinable()) {
+					reader_prepare_thread.join();
+				}
+				if (gpu_thread.joinable()) {
+					gpu_thread.join();
+				}
+				if (merge_thread.joinable()) {
+					merge_thread.join();
+				}
+				throw;
 			}
-			raw_queue.Close();
-			prepare_thread.join();
-			gpu_thread.join();
-			merge_thread.join();
+		} else {
+			BlockingQueue<string> file_queue(0);
+			BlockingQueue<MultiPipelineRawBatch> raw_queue(8);
 
-			if (worker_error) {
-				std::rethrow_exception(worker_error);
+			for (auto &fact_path : fact_paths) {
+				file_queue.Push(fact_path);
 			}
-		} catch (...) {
-			raw_queue.Close();
-			input_queue.Close();
-			output_queue.Close();
 			file_queue.Close();
-			for (auto &reader_thread : reader_threads) {
-				if (reader_thread.joinable()) {
+
+			vector<std::thread> reader_threads;
+			reader_threads.reserve(reader_thread_count);
+			for (idx_t reader = 0; reader < reader_thread_count; reader++) {
+				reader_threads.emplace_back(ReadMultiPipelineRawBatchWorker, std::ref(db), std::ref(file_queue),
+				                            std::cref(payload_columns), std::cref(join_key), std::cref(group_column),
+				                            std::cref(dimension_file), std::ref(raw_queue), std::ref(worker_error),
+				                            std::ref(worker_error_lock));
+			}
+			std::thread prepare_thread(PrepareMultiPipelineInputBatches, std::ref(raw_queue), std::ref(input_queue),
+			                           column_count, std::ref(worker_error), std::ref(worker_error_lock));
+			std::thread gpu_thread(RunMultiPipelineGPUWorker, fused_agg_strided, std::ref(input_queue),
+			                       std::ref(output_queue), column_count, std::ref(worker_error),
+			                       std::ref(worker_error_lock));
+			std::thread merge_thread(RunMultiPipelineMergeWorker, std::ref(output_queue), std::ref(total_sums),
+			                         std::ref(total_counts), std::ref(total_row_counts), std::ref(total_rows),
+			                         std::ref(worker_error), std::ref(worker_error_lock));
+
+			try {
+				for (auto &reader_thread : reader_threads) {
 					reader_thread.join();
 				}
-			}
-			if (prepare_thread.joinable()) {
+				raw_queue.Close();
 				prepare_thread.join();
-			}
-			if (gpu_thread.joinable()) {
 				gpu_thread.join();
-			}
-			if (merge_thread.joinable()) {
 				merge_thread.join();
+
+				if (worker_error) {
+					std::rethrow_exception(worker_error);
+				}
+			} catch (...) {
+				raw_queue.Close();
+				input_queue.Close();
+				output_queue.Close();
+				file_queue.Close();
+				for (auto &reader_thread : reader_threads) {
+					if (reader_thread.joinable()) {
+						reader_thread.join();
+					}
+				}
+				if (prepare_thread.joinable()) {
+					prepare_thread.join();
+				}
+				if (gpu_thread.joinable()) {
+					gpu_thread.join();
+				}
+				if (merge_thread.joinable()) {
+					merge_thread.join();
+				}
+				throw;
 			}
-			throw;
 		}
 	} else {
 		for (auto &fact_path : fact_paths) {
