@@ -22,6 +22,7 @@ def parse_args():
     parser.add_argument("--join-key", default="grid")
     parser.add_argument("--group-column", default="lats")
     parser.add_argument("--dimension-file", default="grid.parquet")
+    parser.add_argument("--read-mode", default="per-file", choices=["per-file", "glob"])
     parser.add_argument(
         "--mode",
         default=os.environ.get("DUCKDB_GPU_PIPELINE_MODE", "pipeline-device"),
@@ -78,6 +79,14 @@ def main():
     parquet_paths = sorted(glob.glob(os.path.join(args.base_dir, "UP-*", "time-levs-grid.parquet")))
     if not parquet_paths:
         raise SystemExit("no time-levs-grid.parquet files found")
+    grid_paths = sorted(glob.glob(os.path.join(args.base_dir, "UP-*", args.dimension_file)))
+    if args.read_mode == "glob" and not grid_paths:
+        raise SystemExit("no {} files found".format(args.dimension_file))
+    fact_inputs = parquet_paths
+    dimension_file = args.dimension_file
+    if args.read_mode == "glob":
+        fact_inputs = [os.path.join(args.base_dir, "UP-*", "time-levs-grid.parquet")]
+        dimension_file = grid_paths[0]
 
     if args.vars and args.vars.strip().lower() == "all":
         payload_columns = read_auto_payload_columns(parquet_paths[0])
@@ -95,21 +104,21 @@ def main():
 
     if len(payload_columns) == 1:
         result = duckdb.dbs_gpu_fused_lat_pipeline(
-            parquet_paths,
+            fact_inputs,
             payload_column=payload_columns[0],
             join_key=args.join_key,
             group_column=args.group_column,
-            dimension_file=args.dimension_file,
+            dimension_file=dimension_file,
             lib_path=args.lib,
             mode=args.mode,
         )
     else:
         result = duckdb.dbs_gpu_fused_lat_multi(
-            parquet_paths,
+            fact_inputs,
             payload_columns=payload_columns,
             join_key=args.join_key,
             group_column=args.group_column,
-            dimension_file=args.dimension_file,
+            dimension_file=dimension_file,
             lib_path=args.lib,
             mode=args.mode,
         )
@@ -121,7 +130,8 @@ def main():
 
     print("\n[Row Count]")
     print(result["row_count"])
-    print("[number of input file]: {}".format(result["input_file_count"]))
+    print("[number of input file]: {}".format(len(parquet_paths)))
+    print("[read mode]: {}".format(args.read_mode))
     print("[payload columns]: {}".format(",".join(payload_columns)))
     print("[query time]: {:.6f}s".format(float(result["query_time"])))
     print("[wrapper time]: {:.6f}s".format(elapsed))

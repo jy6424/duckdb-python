@@ -109,6 +109,13 @@ static string ParentPath(const string &path) {
 	return path.substr(0, slash);
 }
 
+static string ResolveDimensionPath(const string &fact_path, const string &dimension_file) {
+	if (!dimension_file.empty() && (dimension_file[0] == '/' || dimension_file.find('/') != string::npos)) {
+		return dimension_file;
+	}
+	return ParentPath(fact_path) + "/" + dimension_file;
+}
+
 static idx_t ReadEnvIdx(const char *name, idx_t default_value) {
 	auto value = std::getenv(name);
 	if (!value || !value[0]) {
@@ -791,7 +798,7 @@ static void ReadPipelineRawBatches(DuckDB &db, const vector<string> &fact_paths,
 	try {
 		Connection connection(db);
 		for (auto &fact_path : fact_paths) {
-			auto dimension_path = ParentPath(fact_path) + "/" + dimension_file;
+			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
 			auto mapping =
 			    std::make_shared<GroupMapping>(ReadGroupMapping(connection, dimension_path, join_key, group_column));
 			auto result = RunStreamingQuery(connection, BuildProbeQuery(fact_path, join_key, payload_column));
@@ -826,7 +833,7 @@ static void ReadMultiPipelineRawBatches(DuckDB &db, const vector<string> &fact_p
 	try {
 		Connection connection(db);
 		for (auto &fact_path : fact_paths) {
-			auto dimension_path = ParentPath(fact_path) + "/" + dimension_file;
+			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
 			auto mapping =
 			    std::make_shared<GroupMapping>(ReadGroupMapping(connection, dimension_path, join_key, group_column));
 			auto result = RunStreamingQuery(connection, BuildMultiProbeQuery(fact_path, join_key, payload_columns));
@@ -1533,7 +1540,7 @@ static py::dict DBSGPUFusedLatPipeline(const py::iterable &fact_paths_p, const s
 		auto fused_agg = LoadFusedLatAgg(lib_path, mapped);
 
 		for (auto &fact_path : fact_paths) {
-			auto dimension_path = ParentPath(fact_path) + "/" + dimension_file;
+			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
 			auto mapping = ReadGroupMapping(connection, dimension_path, join_key, group_column);
 			auto probe = ReadProbeColumns(connection, fact_path, join_key, payload_column);
 			if (probe.join_keys.empty()) {
@@ -1653,7 +1660,7 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		}
 	} else {
 		for (auto &fact_path : fact_paths) {
-			auto dimension_path = ParentPath(fact_path) + "/" + dimension_file;
+			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
 			auto mapping = ReadGroupMapping(connection, dimension_path, join_key, group_column);
 			auto probe = ReadMultiProbeColumns(connection, fact_path, join_key, payload_columns);
 			if (probe.join_keys.empty()) {
