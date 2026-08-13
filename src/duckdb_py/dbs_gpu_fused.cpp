@@ -860,6 +860,41 @@ static void ReadMultiPipelineRawBatches(DuckDB &db, const vector<string> &fact_p
 	raw_queue.Close();
 }
 
+static void ReadMultiPipelineRawBatchWorker(DuckDB &db, BlockingQueue<string> &file_queue,
+                                            const vector<string> &payload_columns, const string &join_key,
+                                            const string &group_column, const string &dimension_file,
+                                            BlockingQueue<MultiPipelineRawBatch> &raw_queue,
+                                            std::exception_ptr &error_out, std::mutex &error_lock) {
+	try {
+		Connection connection(db);
+		string fact_path;
+		while (file_queue.Pop(fact_path)) {
+			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
+			auto mapping =
+			    std::make_shared<GroupMapping>(ReadGroupMapping(connection, dimension_path, join_key, group_column));
+			auto result = RunStreamingQuery(connection, BuildMultiProbeQuery(fact_path, join_key, payload_columns));
+
+			while (true) {
+				auto chunk = result->Fetch();
+				if (!chunk || chunk->size() == 0) {
+					break;
+				}
+
+				MultiPipelineRawBatch batch;
+				batch.fact_path = fact_path;
+				batch.mapping = mapping;
+				AppendMultiRawProbeChunk(*chunk, batch, payload_columns.size());
+				raw_queue.Push(std::move(batch));
+			}
+		}
+	} catch (...) {
+		std::lock_guard<std::mutex> guard(error_lock);
+		if (!error_out) {
+			error_out = std::current_exception();
+		}
+	}
+}
+
 static void PreparePipelineInputBatches(BlockingQueue<PipelineRawBatch> &raw_queue,
                                         BlockingQueue<PipelineInputBatch> &input_queue,
                                         std::exception_ptr &error_out, std::mutex &error_lock) {
@@ -1612,16 +1647,31 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 
 	if (pipeline_mode) {
 		auto fused_agg_strided = LoadFusedLatAggMultiStrided(lib_path, mapped);
+		auto reader_thread_count = std::min<idx_t>(ReadEnvIdx("DUCKDB_GPU_PIPELINE_READER_THREADS", 1),
+		                                           std::max<idx_t>(fact_paths.size(), 1));
+		if (reader_thread_count == 0) {
+			reader_thread_count = 1;
+		}
+		BlockingQueue<string> file_queue(0);
 		BlockingQueue<MultiPipelineRawBatch> raw_queue(8);
 		BlockingQueue<MultiPipelineInputBatch> input_queue(8);
 		BlockingQueue<MultiPipelineOutputBatch> output_queue(8);
 		std::exception_ptr worker_error;
 		std::mutex worker_error_lock;
 
-		std::thread reader_thread(ReadMultiPipelineRawBatches, std::ref(db), std::cref(fact_paths),
-		                          std::cref(payload_columns), std::cref(join_key), std::cref(group_column),
-		                          std::cref(dimension_file), std::ref(raw_queue), std::ref(worker_error),
-		                          std::ref(worker_error_lock));
+		for (auto &fact_path : fact_paths) {
+			file_queue.Push(fact_path);
+		}
+		file_queue.Close();
+
+		vector<std::thread> reader_threads;
+		reader_threads.reserve(reader_thread_count);
+		for (idx_t reader = 0; reader < reader_thread_count; reader++) {
+			reader_threads.emplace_back(ReadMultiPipelineRawBatchWorker, std::ref(db), std::ref(file_queue),
+			                            std::cref(payload_columns), std::cref(join_key), std::cref(group_column),
+			                            std::cref(dimension_file), std::ref(raw_queue), std::ref(worker_error),
+			                            std::ref(worker_error_lock));
+		}
 		std::thread prepare_thread(PrepareMultiPipelineInputBatches, std::ref(raw_queue), std::ref(input_queue),
 		                           column_count, std::ref(worker_error), std::ref(worker_error_lock));
 		std::thread gpu_thread(RunMultiPipelineGPUWorker, fused_agg_strided, std::ref(input_queue),
@@ -1632,7 +1682,10 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		                         std::ref(worker_error), std::ref(worker_error_lock));
 
 		try {
-			reader_thread.join();
+			for (auto &reader_thread : reader_threads) {
+				reader_thread.join();
+			}
+			raw_queue.Close();
 			prepare_thread.join();
 			gpu_thread.join();
 			merge_thread.join();
@@ -1644,8 +1697,11 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 			raw_queue.Close();
 			input_queue.Close();
 			output_queue.Close();
-			if (reader_thread.joinable()) {
-				reader_thread.join();
+			file_queue.Close();
+			for (auto &reader_thread : reader_threads) {
+				if (reader_thread.joinable()) {
+					reader_thread.join();
+				}
 			}
 			if (prepare_thread.joinable()) {
 				prepare_thread.join();

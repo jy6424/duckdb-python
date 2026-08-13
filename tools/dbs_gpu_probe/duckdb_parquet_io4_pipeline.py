@@ -132,6 +132,7 @@ def main():
     print(result["row_count"])
     print("[number of input file]: {}".format(len(parquet_paths)))
     print("[read mode]: {}".format(args.read_mode))
+    print("[reader threads]: {}".format(os.environ.get("DUCKDB_GPU_PIPELINE_READER_THREADS", "1")))
     print("[payload columns]: {}".format(",".join(payload_columns)))
     print("[query time]: {:.6f}s".format(float(result["query_time"])))
     print("[wrapper time]: {:.6f}s".format(elapsed))
