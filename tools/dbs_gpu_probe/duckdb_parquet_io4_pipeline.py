@@ -11,6 +11,7 @@ import duckdb
 
 
 io_log = "io_duckdb_pipeline.txt"
+EXCLUDED_AUTO_COLUMNS = set(["grid", "time", "levs"])
 
 
 def parse_args():
@@ -55,13 +56,32 @@ def write_io_diff(title, before, after, elapsed):
             )
 
 
+def read_auto_payload_columns(parquet_path):
+    con = duckdb.connect()
+    try:
+        rows = con.execute("""
+            DESCRIBE SELECT *
+            FROM read_parquet(?)
+        """, [parquet_path]).fetchall()
+    finally:
+        con.close()
+
+    columns = []
+    for name, typ, *_ in rows:
+        if typ.upper() == "DOUBLE" and name not in EXCLUDED_AUTO_COLUMNS:
+            columns.append(name)
+    return columns
+
+
 def main():
     args = parse_args()
     parquet_paths = sorted(glob.glob(os.path.join(args.base_dir, "UP-*", "time-levs-grid.parquet")))
     if not parquet_paths:
         raise SystemExit("no time-levs-grid.parquet files found")
 
-    if args.vars:
+    if args.vars and args.vars.strip().lower() == "all":
+        payload_columns = read_auto_payload_columns(parquet_paths[0])
+    elif args.vars:
         payload_columns = [column.strip() for column in args.vars.split(",") if column.strip()]
     else:
         payload_columns = [args.var or "qicps"]

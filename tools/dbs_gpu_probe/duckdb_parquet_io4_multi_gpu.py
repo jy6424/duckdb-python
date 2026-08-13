@@ -10,6 +10,9 @@ import time
 import duckdb
 
 
+EXCLUDED_AUTO_COLUMNS = set(["grid", "time", "levs"])
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("base_dir")
@@ -33,10 +36,35 @@ def parse_args():
     return parser.parse_args()
 
 
+def read_auto_payload_columns(parquet_path):
+    con = duckdb.connect()
+    try:
+        rows = con.execute("""
+            DESCRIBE SELECT *
+            FROM read_parquet(?)
+        """, [parquet_path]).fetchall()
+    finally:
+        con.close()
+
+    columns = []
+    for name, typ, *_ in rows:
+        if typ.upper() == "DOUBLE" and name not in EXCLUDED_AUTO_COLUMNS:
+            columns.append(name)
+    return columns
+
+
 def main():
     args = parse_args()
-    payload_columns = [column.strip() for column in args.vars.split(",") if column.strip()]
     parquet_paths = sorted(glob.glob(os.path.join(args.base_dir, "UP-*", "time-levs-grid.parquet")))
+    if not parquet_paths:
+        raise SystemExit("no time-levs-grid.parquet files found")
+
+    if args.vars.strip().lower() == "all":
+        payload_columns = read_auto_payload_columns(parquet_paths[0])
+    else:
+        payload_columns = [column.strip() for column in args.vars.split(",") if column.strip()]
+    if not payload_columns:
+        raise SystemExit("no payload columns specified")
 
     start = time.time()
     result = duckdb.dbs_gpu_fused_lat_multi(
