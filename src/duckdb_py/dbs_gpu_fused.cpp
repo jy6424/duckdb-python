@@ -532,6 +532,16 @@ struct MultiPipelineOutputBatch {
 	idx_t column_count = 0;
 };
 
+struct MultiPipelineAccumulatedResult {
+	idx_t column_count = 0;
+	uint64_t total_rows = 0;
+	vector<double> group_values;
+	vector<uint64_t> row_counts;
+	vector<double> sums;
+	vector<uint64_t> counts;
+	std::map<double, idx_t> group_index;
+};
+
 struct MultiPipelineStageTimers {
 	std::mutex lock;
 	double read_time = 0;
@@ -869,6 +879,72 @@ static void MergeMultiFusedResult(vector<std::map<double, double>> &total_sums,
 			auto offset = column * group_count + group;
 			total_sums[column][group_value] += sums[offset];
 			total_counts[column][group_value] += counts[offset];
+		}
+	}
+}
+
+static idx_t GetOrCreateAccumulatedGroup(MultiPipelineAccumulatedResult &total, double group_value) {
+	auto entry = total.group_index.find(group_value);
+	if (entry != total.group_index.end()) {
+		return entry->second;
+	}
+
+	auto group = total.group_values.size();
+	total.group_index[group_value] = group;
+	total.group_values.push_back(group_value);
+	total.row_counts.push_back(0);
+	return group;
+}
+
+static void InitializeAccumulatedResult(MultiPipelineAccumulatedResult &total, idx_t column_count) {
+	if (total.column_count == 0) {
+		total.column_count = column_count;
+		return;
+	}
+	if (total.column_count != column_count) {
+		throw InvalidInputException("GPU fused multi merge column count changed unexpectedly");
+	}
+}
+
+static void MergeMultiFusedResultFast(MultiPipelineAccumulatedResult &total, const GroupMapping &mapping,
+                                      const vector<double> &sums, const vector<uint64_t> &counts,
+                                      const vector<uint64_t> &row_counts, idx_t column_count) {
+	InitializeAccumulatedResult(total, column_count);
+	auto source_group_count = mapping.group_values.size();
+	auto old_group_count = total.group_values.size();
+	vector<idx_t> target_groups(source_group_count);
+
+	for (idx_t group = 0; group < source_group_count; group++) {
+		target_groups[group] = GetOrCreateAccumulatedGroup(total, mapping.group_values[group]);
+	}
+
+	auto target_group_count = total.group_values.size();
+	if (target_group_count != old_group_count) {
+		vector<double> resized_sums(column_count * target_group_count, 0);
+		vector<uint64_t> resized_counts(column_count * target_group_count, 0);
+		for (idx_t column = 0; column < column_count; column++) {
+			for (idx_t group = 0; group < old_group_count; group++) {
+				resized_sums[column * target_group_count + group] = total.sums[column * old_group_count + group];
+				resized_counts[column * target_group_count + group] = total.counts[column * old_group_count + group];
+			}
+		}
+		total.sums.swap(resized_sums);
+		total.counts.swap(resized_counts);
+	}
+
+	for (idx_t group = 0; group < source_group_count; group++) {
+		auto row_count = row_counts[group];
+		if (row_count == 0) {
+			continue;
+		}
+		auto target_group = target_groups[group];
+		total.total_rows += row_count;
+		total.row_counts[target_group] += row_count;
+		for (idx_t column = 0; column < column_count; column++) {
+			auto source_offset = column * source_group_count + group;
+			auto target_offset = column * target_group_count + target_group;
+			total.sums[target_offset] += sums[source_offset];
+			total.counts[target_offset] += counts[source_offset];
 		}
 	}
 }
@@ -1623,9 +1699,7 @@ static void RunMultiPipelineGPUWorker(FusedLatAggMultiStridedFunc fused_agg,
 }
 
 static void RunMultiPipelineMergeWorker(BlockingQueue<MultiPipelineOutputBatch> &output_queue,
-                                        vector<std::map<double, double>> &total_sums,
-                                        vector<std::map<double, uint64_t>> &total_counts,
-                                        std::map<double, uint64_t> &total_row_counts, uint64_t &total_rows,
+                                        MultiPipelineAccumulatedResult &total,
                                         std::exception_ptr &error_out, std::mutex &error_lock,
                                         MultiPipelineStageTimers *timers = nullptr) {
 	auto stage_start = std::chrono::steady_clock::now();
@@ -1642,8 +1716,8 @@ static void RunMultiPipelineMergeWorker(BlockingQueue<MultiPipelineOutputBatch> 
 				break;
 			}
 			auto work_start = std::chrono::steady_clock::now();
-			MergeMultiFusedResult(total_sums, total_counts, total_row_counts, total_rows, *output.mapping,
-			                      output.sums, output.counts, output.row_counts, output.column_count);
+			MergeMultiFusedResultFast(total, *output.mapping, output.sums, output.counts, output.row_counts,
+			                          output.column_count);
 			work_elapsed += ElapsedSeconds(work_start);
 			batch_count++;
 		}
@@ -1942,6 +2016,7 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 	vector<std::map<double, uint64_t>> total_counts(column_count);
 	std::map<double, uint64_t> total_row_counts;
 	uint64_t total_rows = 0;
+	MultiPipelineAccumulatedResult accumulated_result;
 	MultiPipelineStageTimers stage_timers;
 
 	if (pipeline_mode) {
@@ -1968,9 +2043,9 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 			std::thread gpu_thread(RunMultiPipelineGPUWorker, fused_agg_strided, std::ref(input_queue),
 			                       std::ref(output_queue), column_count, std::ref(worker_error),
 			                       std::ref(worker_error_lock), &stage_timers);
-			std::thread merge_thread(RunMultiPipelineMergeWorker, std::ref(output_queue), std::ref(total_sums),
-			                         std::ref(total_counts), std::ref(total_row_counts), std::ref(total_rows),
-			                         std::ref(worker_error), std::ref(worker_error_lock), &stage_timers);
+			std::thread merge_thread(RunMultiPipelineMergeWorker, std::ref(output_queue),
+			                         std::ref(accumulated_result), std::ref(worker_error),
+			                         std::ref(worker_error_lock), &stage_timers);
 
 			try {
 				reader_thread.join();
@@ -2021,9 +2096,9 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 			std::thread gpu_thread(RunMultiPipelineGPUWorker, fused_agg_strided, std::ref(input_queue),
 			                       std::ref(output_queue), column_count, std::ref(worker_error),
 			                       std::ref(worker_error_lock), &stage_timers);
-			std::thread merge_thread(RunMultiPipelineMergeWorker, std::ref(output_queue), std::ref(total_sums),
-			                         std::ref(total_counts), std::ref(total_row_counts), std::ref(total_rows),
-			                         std::ref(worker_error), std::ref(worker_error_lock), &stage_timers);
+			std::thread merge_thread(RunMultiPipelineMergeWorker, std::ref(output_queue),
+			                         std::ref(accumulated_result), std::ref(worker_error),
+			                         std::ref(worker_error_lock), &stage_timers);
 
 			try {
 				for (auto &reader_thread : reader_threads) {
@@ -2091,6 +2166,10 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		}
 	}
 
+	if (pipeline_mode) {
+		total_rows = accumulated_result.total_rows;
+	}
+
 	auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 	py::dict result;
 	result["row_count"] = py::int_(total_rows);
@@ -2131,24 +2210,48 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 	result["payload_columns"] = payloads;
 
 	py::list groups;
-	for (auto &entry : total_row_counts) {
-		auto group_value = entry.first;
-		py::dict group;
-		group["group"] = py::float_(group_value);
-		group["row_count"] = py::int_(entry.second);
-		for (idx_t column = 0; column < column_count; column++) {
-			auto &payload_column = payload_columns[column];
-			auto sum = total_sums[column][group_value];
-			auto count = total_counts[column][group_value];
-			group[py::str("sum_" + payload_column)] = py::float_(sum);
-			group[py::str("count_" + payload_column)] = py::int_(count);
-			if (count > 0) {
-				group[py::str("avg_" + payload_column)] = py::float_(sum / static_cast<double>(count));
-			} else {
-				group[py::str("avg_" + payload_column)] = py::none();
+	if (pipeline_mode) {
+		auto group_count = accumulated_result.group_values.size();
+		for (idx_t group_idx = 0; group_idx < group_count; group_idx++) {
+			auto group_value = accumulated_result.group_values[group_idx];
+			py::dict group;
+			group["group"] = py::float_(group_value);
+			group["row_count"] = py::int_(accumulated_result.row_counts[group_idx]);
+			for (idx_t column = 0; column < column_count; column++) {
+				auto &payload_column = payload_columns[column];
+				auto offset = column * group_count + group_idx;
+				auto sum = accumulated_result.sums[offset];
+				auto count = accumulated_result.counts[offset];
+				group[py::str("sum_" + payload_column)] = py::float_(sum);
+				group[py::str("count_" + payload_column)] = py::int_(count);
+				if (count > 0) {
+					group[py::str("avg_" + payload_column)] = py::float_(sum / static_cast<double>(count));
+				} else {
+					group[py::str("avg_" + payload_column)] = py::none();
+				}
 			}
+			groups.append(group);
 		}
-		groups.append(group);
+	} else {
+		for (auto &entry : total_row_counts) {
+			auto group_value = entry.first;
+			py::dict group;
+			group["group"] = py::float_(group_value);
+			group["row_count"] = py::int_(entry.second);
+			for (idx_t column = 0; column < column_count; column++) {
+				auto &payload_column = payload_columns[column];
+				auto sum = total_sums[column][group_value];
+				auto count = total_counts[column][group_value];
+				group[py::str("sum_" + payload_column)] = py::float_(sum);
+				group[py::str("count_" + payload_column)] = py::int_(count);
+				if (count > 0) {
+					group[py::str("avg_" + payload_column)] = py::float_(sum / static_cast<double>(count));
+				} else {
+					group[py::str("avg_" + payload_column)] = py::none();
+				}
+			}
+			groups.append(group);
+		}
 	}
 	result["groups"] = groups;
 	return result;
