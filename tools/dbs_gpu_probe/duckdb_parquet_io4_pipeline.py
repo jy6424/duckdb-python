@@ -138,11 +138,31 @@ def main():
     if args.print_stage_times and "stage_times" in result:
         stage = result["stage_times"]
         print(
-            "[stage times] read={:.6f}s prepare={:.6f}s gpu={:.6f}s merge={:.6f}s".format(
+            "[stage total] read={:.6f}s prepare={:.6f}s gpu={:.6f}s merge={:.6f}s".format(
                 float(stage.get("read_time", 0.0)),
                 float(stage.get("prepare_time", 0.0)),
                 float(stage.get("gpu_time", 0.0)),
                 float(stage.get("merge_time", 0.0)),
+            )
+        )
+        print(
+            "[stage work] read_setup={:.6f}s read_fetch={:.6f}s prepare={:.6f}s gpu={:.6f}s merge={:.6f}s".format(
+                float(stage.get("read_setup_time", 0.0)),
+                float(stage.get("read_fetch_time", 0.0)),
+                float(stage.get("prepare_work_time", 0.0)),
+                float(stage.get("gpu_work_time", 0.0)),
+                float(stage.get("merge_work_time", 0.0)),
+            )
+        )
+        print(
+            "[stage queue] read_push={:.6f}s prepare_pop={:.6f}s prepare_push={:.6f}s "
+            "gpu_pop={:.6f}s gpu_push={:.6f}s merge_pop={:.6f}s".format(
+                float(stage.get("read_push_time", 0.0)),
+                float(stage.get("prepare_pop_time", 0.0)),
+                float(stage.get("prepare_push_time", 0.0)),
+                float(stage.get("gpu_pop_time", 0.0)),
+                float(stage.get("gpu_push_time", 0.0)),
+                float(stage.get("merge_pop_time", 0.0)),
             )
         )
         print(
