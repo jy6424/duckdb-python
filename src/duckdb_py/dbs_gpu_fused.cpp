@@ -129,6 +129,16 @@ static idx_t ReadEnvIdx(const char *name, idx_t default_value) {
 	return static_cast<idx_t>(parsed);
 }
 
+static bool ReadEnvFlag(const char *name, bool default_value = false) {
+	auto value = std::getenv(name);
+	if (!value || !value[0]) {
+		return default_value;
+	}
+	return std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 || std::strcmp(value, "TRUE") == 0 ||
+	       std::strcmp(value, "yes") == 0 || std::strcmp(value, "YES") == 0 || std::strcmp(value, "on") == 0 ||
+	       std::strcmp(value, "ON") == 0;
+}
+
 static FusedLatAggFunc LoadFusedLatAgg(const string &path_p, bool mapped) {
 	static void *device_handle = nullptr;
 	static void *mapped_handle = nullptr;
@@ -368,6 +378,15 @@ static GroupMapping ReadGroupMapping(Connection &connection, const string &dimen
 	return mapping;
 }
 
+static string DimensionMappingCacheKey(const string &dimension_path, const string &dimension_file,
+                                       const string &join_key, const string &group_column,
+                                       bool reuse_dimension_mapping) {
+	if (reuse_dimension_mapping) {
+		return "reuse:" + dimension_file + ":" + join_key + ":" + group_column;
+	}
+	return "path:" + dimension_path + ":" + join_key + ":" + group_column;
+}
+
 struct ProbeColumns {
 	vector<int64_t> join_keys;
 	vector<double> values;
@@ -534,6 +553,8 @@ struct MultiPipelineStageTimers {
 	uint64_t prepared_batches = 0;
 	uint64_t gpu_batches = 0;
 	uint64_t merged_batches = 0;
+	uint64_t dimension_mapping_reads = 0;
+	uint64_t dimension_mapping_reuses = 0;
 };
 
 static double ElapsedSeconds(std::chrono::steady_clock::time_point start) {
@@ -983,13 +1004,28 @@ static void ReadMultiPipelineChunkBatches(DuckDB &db, const vector<string> &fact
 	double setup_elapsed = 0;
 	double fetch_elapsed = 0;
 	double push_elapsed = 0;
+	uint64_t mapping_reads = 0;
+	uint64_t mapping_reuses = 0;
 	try {
 		Connection connection(db);
+		std::map<string, std::shared_ptr<GroupMapping>> dimension_mapping_cache;
+		auto reuse_dimension_mapping = ReadEnvFlag("DUCKDB_GPU_REUSE_DIMENSION_MAPPING", false);
 		for (auto &fact_path : fact_paths) {
 			auto setup_start = std::chrono::steady_clock::now();
 			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
-			auto mapping =
-			    std::make_shared<GroupMapping>(ReadGroupMapping(connection, dimension_path, join_key, group_column));
+			auto cache_key =
+			    DimensionMappingCacheKey(dimension_path, dimension_file, join_key, group_column, reuse_dimension_mapping);
+			std::shared_ptr<GroupMapping> mapping;
+			auto cached_mapping = dimension_mapping_cache.find(cache_key);
+			if (cached_mapping == dimension_mapping_cache.end()) {
+				mapping =
+				    std::make_shared<GroupMapping>(ReadGroupMapping(connection, dimension_path, join_key, group_column));
+				dimension_mapping_cache[cache_key] = mapping;
+				mapping_reads++;
+			} else {
+				mapping = cached_mapping->second;
+				mapping_reuses++;
+			}
 			auto result = RunStreamingQuery(connection, BuildMultiProbeQuery(fact_path, join_key, payload_columns));
 			setup_elapsed += ElapsedSeconds(setup_start);
 
@@ -1024,6 +1060,8 @@ static void ReadMultiPipelineChunkBatches(DuckDB &db, const vector<string> &fact
 		timers->read_fetch_time += fetch_elapsed;
 		timers->read_push_time += push_elapsed;
 		timers->read_chunks += chunk_count;
+		timers->dimension_mapping_reads += mapping_reads;
+		timers->dimension_mapping_reuses += mapping_reuses;
 	}
 	chunk_queue.Close();
 }
@@ -2081,6 +2119,8 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		stage_times["prepared_batches"] = py::int_(stage_timers.prepared_batches);
 		stage_times["gpu_batches"] = py::int_(stage_timers.gpu_batches);
 		stage_times["merged_batches"] = py::int_(stage_timers.merged_batches);
+		stage_times["dimension_mapping_reads"] = py::int_(stage_timers.dimension_mapping_reads);
+		stage_times["dimension_mapping_reuses"] = py::int_(stage_timers.dimension_mapping_reuses);
 	}
 	result["stage_times"] = stage_times;
 

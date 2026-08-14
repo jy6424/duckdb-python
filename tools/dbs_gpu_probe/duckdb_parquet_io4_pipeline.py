@@ -24,6 +24,7 @@ def parse_args():
     parser.add_argument("--dimension-file", default="grid.parquet")
     parser.add_argument("--read-mode", default="per-file", choices=["per-file", "glob"])
     parser.add_argument("--print-stage-times", action="store_true")
+    parser.add_argument("--reuse-dimension-mapping", action="store_true")
     parser.add_argument(
         "--mode",
         default=os.environ.get("DUCKDB_GPU_PIPELINE_MODE", "pipeline-device"),
@@ -103,6 +104,9 @@ def main():
     before_io = read_proc_io()
     start = time.time()
 
+    if args.reuse_dimension_mapping:
+        os.environ["DUCKDB_GPU_REUSE_DIMENSION_MAPPING"] = "1"
+
     if len(payload_columns) == 1:
         result = duckdb.dbs_gpu_fused_lat_pipeline(
             fact_inputs,
@@ -171,6 +175,12 @@ def main():
                 int(stage.get("prepared_batches", 0)),
                 int(stage.get("gpu_batches", 0)),
                 int(stage.get("merged_batches", 0)),
+            )
+        )
+        print(
+            "[dimension mapping] reads={} reuses={}".format(
+                int(stage.get("dimension_mapping_reads", 0)),
+                int(stage.get("dimension_mapping_reuses", 0)),
             )
         )
     print("[query time]: {:.6f}s".format(float(result["query_time"])))
