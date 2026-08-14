@@ -513,6 +513,22 @@ struct MultiPipelineOutputBatch {
 	idx_t column_count = 0;
 };
 
+struct MultiPipelineStageTimers {
+	std::mutex lock;
+	double read_time = 0;
+	double prepare_time = 0;
+	double gpu_time = 0;
+	double merge_time = 0;
+	uint64_t read_chunks = 0;
+	uint64_t prepared_batches = 0;
+	uint64_t gpu_batches = 0;
+	uint64_t merged_batches = 0;
+};
+
+static double ElapsedSeconds(std::chrono::steady_clock::time_point start) {
+	return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+
 static string BuildProbeQuery(const string &fact_path, const string &join_key, const string &payload_column) {
 	return StringUtil::Format(
 	    "SELECT %s::BIGINT AS join_key, COALESCE(%s, 0)::DOUBLE AS value, "
@@ -949,7 +965,10 @@ static void ReadMultiPipelineChunkBatches(DuckDB &db, const vector<string> &fact
                                           const vector<string> &payload_columns, const string &join_key,
                                           const string &group_column, const string &dimension_file,
                                           BlockingQueue<MultiPipelineChunkBatch> &chunk_queue,
-                                          std::exception_ptr &error_out, std::mutex &error_lock) {
+                                          std::exception_ptr &error_out, std::mutex &error_lock,
+                                          MultiPipelineStageTimers *timers) {
+	auto stage_start = std::chrono::steady_clock::now();
+	uint64_t chunk_count = 0;
 	try {
 		Connection connection(db);
 		for (auto &fact_path : fact_paths) {
@@ -969,6 +988,7 @@ static void ReadMultiPipelineChunkBatches(DuckDB &db, const vector<string> &fact
 				batch.mapping = mapping;
 				batch.chunk = std::move(chunk);
 				chunk_queue.Push(std::move(batch));
+				chunk_count++;
 			}
 		}
 	} catch (...) {
@@ -977,13 +997,20 @@ static void ReadMultiPipelineChunkBatches(DuckDB &db, const vector<string> &fact
 			error_out = std::current_exception();
 		}
 	}
+	if (timers) {
+		std::lock_guard<std::mutex> guard(timers->lock);
+		timers->read_time += ElapsedSeconds(stage_start);
+		timers->read_chunks += chunk_count;
+	}
 	chunk_queue.Close();
 }
 
 static void PrepareMultiPipelineChunkBatches(BlockingQueue<MultiPipelineChunkBatch> &chunk_queue,
                                              BlockingQueue<MultiPipelineInputBatch> &input_queue,
                                              idx_t column_count, std::exception_ptr &error_out,
-                                             std::mutex &error_lock) {
+                                             std::mutex &error_lock, MultiPipelineStageTimers *timers) {
+	auto stage_start = std::chrono::steady_clock::now();
+	uint64_t batch_count = 0;
 	try {
 		auto target_batch_rows = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_ROWS", 65536);
 		auto target_batch_chunks = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_CHUNKS", 32);
@@ -997,6 +1024,7 @@ static void PrepareMultiPipelineChunkBatches(BlockingQueue<MultiPipelineChunkBat
 		auto flush_current = [&]() {
 			if (PreparedRowCount(current) > 0) {
 				input_queue.Push(std::move(current));
+				batch_count++;
 			}
 			current = MultiPipelineInputBatch();
 			current_chunks = 0;
@@ -1034,6 +1062,11 @@ static void PrepareMultiPipelineChunkBatches(BlockingQueue<MultiPipelineChunkBat
 		if (!error_out) {
 			error_out = std::current_exception();
 		}
+	}
+	if (timers) {
+		std::lock_guard<std::mutex> guard(timers->lock);
+		timers->prepare_time += ElapsedSeconds(stage_start);
+		timers->prepared_batches += batch_count;
 	}
 	input_queue.Close();
 }
@@ -1448,7 +1481,9 @@ static void RunMultiPipelineGPUWorker(FusedLatAggMultiStridedFunc fused_agg,
                                       BlockingQueue<MultiPipelineInputBatch> &input_queue,
                                       BlockingQueue<MultiPipelineOutputBatch> &output_queue,
                                       idx_t column_count, std::exception_ptr &error_out,
-                                      std::mutex &error_lock) {
+                                      std::mutex &error_lock, MultiPipelineStageTimers *timers = nullptr) {
+	uint64_t batch_count = 0;
+	double gpu_elapsed = 0;
 	try {
 		MultiPipelineInputBatch batch;
 		while (input_queue.Pop(batch)) {
@@ -1466,6 +1501,7 @@ static void RunMultiPipelineGPUWorker(FusedLatAggMultiStridedFunc fused_agg,
 			output.counts.assign(column_count * group_count, 0);
 			output.row_counts.assign(group_count, 0);
 
+			auto gpu_start = std::chrono::steady_clock::now();
 			auto rc = fused_agg(batch.join_keys.data(), batch.values.data(), batch.validity.data(),
 			                    static_cast<uint64_t>(column_count), static_cast<uint64_t>(batch.value_stride),
 			                    static_cast<uint64_t>(row_count), batch.mapping->join_min, batch.mapping->join_max,
@@ -1473,6 +1509,8 @@ static void RunMultiPipelineGPUWorker(FusedLatAggMultiStridedFunc fused_agg,
 			                    static_cast<uint64_t>(batch.mapping->join_to_group.size()),
 			                    static_cast<uint64_t>(group_count), output.sums.data(), output.counts.data(),
 			                    output.row_counts.data());
+			gpu_elapsed += ElapsedSeconds(gpu_start);
+			batch_count++;
 			if (rc != 0) {
 				throw InvalidInputException("GPU fused multi pipeline aggregate failed for '%s'", batch.fact_path);
 			}
@@ -1485,6 +1523,11 @@ static void RunMultiPipelineGPUWorker(FusedLatAggMultiStridedFunc fused_agg,
 			error_out = std::current_exception();
 		}
 	}
+	if (timers) {
+		std::lock_guard<std::mutex> guard(timers->lock);
+		timers->gpu_time += gpu_elapsed;
+		timers->gpu_batches += batch_count;
+	}
 	output_queue.Close();
 }
 
@@ -1492,18 +1535,27 @@ static void RunMultiPipelineMergeWorker(BlockingQueue<MultiPipelineOutputBatch> 
                                         vector<std::map<double, double>> &total_sums,
                                         vector<std::map<double, uint64_t>> &total_counts,
                                         std::map<double, uint64_t> &total_row_counts, uint64_t &total_rows,
-                                        std::exception_ptr &error_out, std::mutex &error_lock) {
+                                        std::exception_ptr &error_out, std::mutex &error_lock,
+                                        MultiPipelineStageTimers *timers = nullptr) {
+	auto stage_start = std::chrono::steady_clock::now();
+	uint64_t batch_count = 0;
 	try {
 		MultiPipelineOutputBatch output;
 		while (output_queue.Pop(output)) {
 			MergeMultiFusedResult(total_sums, total_counts, total_row_counts, total_rows, *output.mapping,
 			                      output.sums, output.counts, output.row_counts, output.column_count);
+			batch_count++;
 		}
 	} catch (...) {
 		std::lock_guard<std::mutex> guard(error_lock);
 		if (!error_out) {
 			error_out = std::current_exception();
 		}
+	}
+	if (timers) {
+		std::lock_guard<std::mutex> guard(timers->lock);
+		timers->merge_time += ElapsedSeconds(stage_start);
+		timers->merged_batches += batch_count;
 	}
 }
 
@@ -1787,6 +1839,7 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 	vector<std::map<double, uint64_t>> total_counts(column_count);
 	std::map<double, uint64_t> total_row_counts;
 	uint64_t total_rows = 0;
+	MultiPipelineStageTimers stage_timers;
 
 	if (pipeline_mode) {
 		auto fused_agg_strided = LoadFusedLatAggMultiStrided(lib_path, mapped);
@@ -1805,16 +1858,16 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 			std::thread reader_thread(ReadMultiPipelineChunkBatches, std::ref(db), std::cref(fact_paths),
 			                          std::cref(payload_columns), std::cref(join_key), std::cref(group_column),
 			                          std::cref(dimension_file), std::ref(chunk_queue), std::ref(worker_error),
-			                          std::ref(worker_error_lock));
+			                          std::ref(worker_error_lock), &stage_timers);
 			std::thread prepare_thread(PrepareMultiPipelineChunkBatches, std::ref(chunk_queue),
 			                           std::ref(input_queue), column_count, std::ref(worker_error),
-			                           std::ref(worker_error_lock));
+			                           std::ref(worker_error_lock), &stage_timers);
 			std::thread gpu_thread(RunMultiPipelineGPUWorker, fused_agg_strided, std::ref(input_queue),
 			                       std::ref(output_queue), column_count, std::ref(worker_error),
-			                       std::ref(worker_error_lock));
+			                       std::ref(worker_error_lock), &stage_timers);
 			std::thread merge_thread(RunMultiPipelineMergeWorker, std::ref(output_queue), std::ref(total_sums),
 			                         std::ref(total_counts), std::ref(total_row_counts), std::ref(total_rows),
-			                         std::ref(worker_error), std::ref(worker_error_lock));
+			                         std::ref(worker_error), std::ref(worker_error_lock), &stage_timers);
 
 			try {
 				reader_thread.join();
@@ -1864,10 +1917,10 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 			                           column_count, std::ref(worker_error), std::ref(worker_error_lock));
 			std::thread gpu_thread(RunMultiPipelineGPUWorker, fused_agg_strided, std::ref(input_queue),
 			                       std::ref(output_queue), column_count, std::ref(worker_error),
-			                       std::ref(worker_error_lock));
+			                       std::ref(worker_error_lock), &stage_timers);
 			std::thread merge_thread(RunMultiPipelineMergeWorker, std::ref(output_queue), std::ref(total_sums),
 			                         std::ref(total_counts), std::ref(total_row_counts), std::ref(total_rows),
-			                         std::ref(worker_error), std::ref(worker_error_lock));
+			                         std::ref(worker_error), std::ref(worker_error_lock), &stage_timers);
 
 			try {
 				for (auto &reader_thread : reader_threads) {
@@ -1940,6 +1993,20 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 	result["row_count"] = py::int_(total_rows);
 	result["input_file_count"] = py::int_(fact_paths.size());
 	result["query_time"] = py::float_(elapsed);
+
+	py::dict stage_times;
+	{
+		std::lock_guard<std::mutex> guard(stage_timers.lock);
+		stage_times["read_time"] = py::float_(stage_timers.read_time);
+		stage_times["prepare_time"] = py::float_(stage_timers.prepare_time);
+		stage_times["gpu_time"] = py::float_(stage_timers.gpu_time);
+		stage_times["merge_time"] = py::float_(stage_timers.merge_time);
+		stage_times["read_chunks"] = py::int_(stage_timers.read_chunks);
+		stage_times["prepared_batches"] = py::int_(stage_timers.prepared_batches);
+		stage_times["gpu_batches"] = py::int_(stage_timers.gpu_batches);
+		stage_times["merged_batches"] = py::int_(stage_timers.merged_batches);
+	}
+	result["stage_times"] = stage_times;
 
 	py::list payloads;
 	for (auto &payload_column : payload_columns) {

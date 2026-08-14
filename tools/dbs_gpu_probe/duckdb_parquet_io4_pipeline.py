@@ -23,6 +23,7 @@ def parse_args():
     parser.add_argument("--group-column", default="lats")
     parser.add_argument("--dimension-file", default="grid.parquet")
     parser.add_argument("--read-mode", default="per-file", choices=["per-file", "glob"])
+    parser.add_argument("--print-stage-times", action="store_true")
     parser.add_argument(
         "--mode",
         default=os.environ.get("DUCKDB_GPU_PIPELINE_MODE", "pipeline-device"),
@@ -134,6 +135,24 @@ def main():
     print("[read mode]: {}".format(args.read_mode))
     print("[reader threads]: {}".format(os.environ.get("DUCKDB_GPU_PIPELINE_READER_THREADS", "1")))
     print("[payload columns]: {}".format(",".join(payload_columns)))
+    if args.print_stage_times and "stage_times" in result:
+        stage = result["stage_times"]
+        print(
+            "[stage times] read={:.6f}s prepare={:.6f}s gpu={:.6f}s merge={:.6f}s".format(
+                float(stage.get("read_time", 0.0)),
+                float(stage.get("prepare_time", 0.0)),
+                float(stage.get("gpu_time", 0.0)),
+                float(stage.get("merge_time", 0.0)),
+            )
+        )
+        print(
+            "[stage counts] read_chunks={} prepared_batches={} gpu_batches={} merged_batches={}".format(
+                int(stage.get("read_chunks", 0)),
+                int(stage.get("prepared_batches", 0)),
+                int(stage.get("gpu_batches", 0)),
+                int(stage.get("merged_batches", 0)),
+            )
+        )
     print("[query time]: {:.6f}s".format(float(result["query_time"])))
     print("[wrapper time]: {:.6f}s".format(elapsed))
 
