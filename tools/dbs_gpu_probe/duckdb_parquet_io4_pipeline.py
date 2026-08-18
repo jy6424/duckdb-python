@@ -28,7 +28,15 @@ def parse_args():
     parser.add_argument(
         "--mode",
         default=os.environ.get("DUCKDB_GPU_PIPELINE_MODE", "pipeline-device"),
-        choices=["device", "mapped", "pipeline-device", "pipeline-mapped", "pipeline-managed", "pipeline-cpu"],
+        choices=[
+            "device",
+            "mapped",
+            "pipeline-device",
+            "pipeline-mapped",
+            "pipeline-mapped-direct",
+            "pipeline-managed",
+            "pipeline-cpu",
+        ],
     )
     parser.add_argument(
         "--lib",
@@ -99,7 +107,11 @@ def main():
     if not payload_columns:
         raise SystemExit("no payload columns specified")
     if len(payload_columns) > 1 and args.mode in ("pipeline-managed", "pipeline-cpu"):
-        raise SystemExit("{} does not support --vars yet; use pipeline-device or pipeline-mapped".format(args.mode))
+        raise SystemExit(
+            "{} does not support --vars yet; use pipeline-device, pipeline-mapped, or pipeline-mapped-direct".format(
+                args.mode
+            )
+        )
 
     before_io = read_proc_io()
     start = time.time()
