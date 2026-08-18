@@ -1456,8 +1456,7 @@ static void PrepareMultiPipelineChunkBatches(BlockingQueue<MultiPipelineChunkBat
 			}
 			idx_t row_offset = 0;
 			while (row_offset < chunk_batch.chunk->size()) {
-				auto boundary = !current.fact_path.empty() &&
-				                (current.fact_path != chunk_batch.fact_path || current.mapping != chunk_batch.mapping);
+				auto boundary = !current.fact_path.empty() && current.mapping != chunk_batch.mapping;
 				if (boundary || (PreparedRowCount(current) > 0 && current_chunks >= target_batch_chunks)) {
 					flush_current();
 				}
@@ -1554,8 +1553,7 @@ static void PrepareDirectMultiPipelineChunkBatches(FusedLatAggMultiDirectPipelin
 			idx_t row_offset = 0;
 			bool counted_chunk = false;
 			while (row_offset < chunk_batch.chunk->size()) {
-				auto boundary = current.active &&
-				                (current.fact_path != chunk_batch.fact_path || current.mapping != chunk_batch.mapping);
+				auto boundary = current.active && current.mapping != chunk_batch.mapping;
 				if (boundary || current.row_count >= target_batch_rows || current.chunks >= target_batch_chunks) {
 					flush_current();
 					counted_chunk = false;
