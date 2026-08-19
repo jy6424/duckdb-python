@@ -28,6 +28,7 @@ def parse_args():
     parser.add_argument("--prefetch-files", action="store_true")
     parser.add_argument("--prefetch-method", default="both", choices=["fadvise", "readahead", "both", "io_uring"])
     parser.add_argument("--duckdb-parquet-async-prefetch", action="store_true")
+    parser.add_argument("--fetch-raw", action="store_true", help="use DuckDB FetchRaw and decode vectors directly")
     parser.add_argument(
         "--reader-duckdb-threads",
         type=int,
@@ -157,6 +158,8 @@ def main():
         os.environ["DUCKDB_GPU_PREFETCH_METHOD"] = args.prefetch_method
     if args.duckdb_parquet_async_prefetch:
         os.environ["DUCKDB_PARQUET_ASYNC_PREFETCH"] = "1"
+    if args.fetch_raw:
+        os.environ["DUCKDB_GPU_FETCH_RAW"] = "1"
     if args.reader_duckdb_threads is not None:
         if args.reader_duckdb_threads <= 0:
             raise SystemExit("--reader-duckdb-threads must be positive")
@@ -197,6 +200,8 @@ def main():
         print("[prefetch]: {}".format(args.prefetch_method))
     if args.duckdb_parquet_async_prefetch:
         print("[duckdb parquet async prefetch]: on")
+    if args.fetch_raw:
+        print("[duckdb fetch raw]: on")
     print("[payload columns]: {}".format(",".join(payload_columns)))
     if args.print_stage_times and "stage_times" in result:
         stage = result["stage_times"]

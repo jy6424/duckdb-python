@@ -234,6 +234,55 @@ static string ReadEnvString(const char *name, const string &default_value) {
 	return value;
 }
 
+static bool UseRawGpuFetch() {
+	return ReadEnvFlag("DUCKDB_GPU_FETCH_RAW", false);
+}
+
+static unique_ptr<DataChunk> FetchGpuPipelineChunk(QueryResult &result) {
+	if (UseRawGpuFetch()) {
+		return result.FetchRaw();
+	}
+	return result.Fetch();
+}
+
+template <class T>
+struct UnifiedColumnReader {
+	UnifiedColumnReader(Vector &vector, idx_t count) {
+		vector.ToUnifiedFormat(count, format);
+		data = UnifiedVectorFormat::GetData<T>(format);
+	}
+
+	idx_t Index(idx_t row) const {
+		return format.sel->get_index(row);
+	}
+
+	bool RowIsValid(idx_t row) const {
+		return format.validity.RowIsValid(Index(row));
+	}
+
+	T Value(idx_t row) const {
+		return data[Index(row)];
+	}
+
+	UnifiedVectorFormat format;
+	const T *data = nullptr;
+};
+
+template <class T>
+static void CopyUnifiedValues(T *target, const UnifiedColumnReader<T> &source, idx_t source_offset, idx_t count) {
+	for (idx_t row = 0; row < count; row++) {
+		target[row] = source.Value(source_offset + row);
+	}
+}
+
+template <class T>
+static void CopyUnifiedValidityToBytes(uint8_t *target, const UnifiedColumnReader<T> &source, idx_t source_offset,
+                                       idx_t count) {
+	for (idx_t row = 0; row < count; row++) {
+		target[row] = source.RowIsValid(source_offset + row) ? 1 : 0;
+	}
+}
+
 static FusedLatAggFunc LoadFusedLatAgg(const string &path_p, bool mapped) {
 	static void *device_handle = nullptr;
 	static void *mapped_handle = nullptr;
@@ -779,21 +828,19 @@ static GroupMapping ReadGroupMapping(Connection &connection, const string &dimen
 	int64_t join_max = 0;
 
 	while (true) {
-		auto chunk = result->Fetch();
+		auto chunk = FetchGpuPipelineChunk(*result);
 		if (!chunk || chunk->size() == 0) {
 			break;
 		}
 		auto count = chunk->size();
-		auto join_data = FlatVector::GetData<int64_t>(chunk->data[0]);
-		auto group_data = FlatVector::GetData<double>(chunk->data[1]);
-		auto &join_validity = FlatVector::Validity(chunk->data[0]);
-		auto &group_validity = FlatVector::Validity(chunk->data[1]);
+		UnifiedColumnReader<int64_t> join_data(chunk->data[0], count);
+		UnifiedColumnReader<double> group_data(chunk->data[1], count);
 		for (idx_t row = 0; row < count; row++) {
-			if (!join_validity.RowIsValid(row) || !group_validity.RowIsValid(row)) {
+			if (!join_data.RowIsValid(row) || !group_data.RowIsValid(row)) {
 				continue;
 			}
-			auto join_value = join_data[row];
-			auto group_value = group_data[row];
+			auto join_value = join_data.Value(row);
+			auto group_value = group_data.Value(row);
 			join_keys.push_back(join_value);
 			group_values_per_row.push_back(group_value);
 			if (first) {
@@ -1067,10 +1114,9 @@ static string BuildProbeQuery(const string &fact_path, const string &join_key, c
 
 static void AppendProbeChunk(DataChunk &chunk, ProbeColumns &columns) {
 	auto count = chunk.size();
-	auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
-	auto value_data = FlatVector::GetData<double>(chunk.data[1]);
-	auto valid_data = FlatVector::GetData<uint8_t>(chunk.data[2]);
-	auto &join_validity = FlatVector::Validity(chunk.data[0]);
+	UnifiedColumnReader<int64_t> join_data(chunk.data[0], count);
+	UnifiedColumnReader<double> value_data(chunk.data[1], count);
+	UnifiedColumnReader<uint8_t> valid_data(chunk.data[2], count);
 
 	columns.join_keys.clear();
 	columns.values.clear();
@@ -1080,12 +1126,12 @@ static void AppendProbeChunk(DataChunk &chunk, ProbeColumns &columns) {
 	columns.validity.reserve(count);
 
 	for (idx_t row = 0; row < count; row++) {
-		if (!join_validity.RowIsValid(row)) {
+		if (!join_data.RowIsValid(row)) {
 			continue;
 		}
-		columns.join_keys.push_back(join_data[row]);
-		columns.values.push_back(value_data[row]);
-		columns.validity.push_back(valid_data[row]);
+		columns.join_keys.push_back(join_data.Value(row));
+		columns.values.push_back(value_data.Value(row));
+		columns.validity.push_back(valid_data.Value(row));
 	}
 }
 
@@ -1101,8 +1147,7 @@ static void CopyValidityToBytes(uint8_t *target, const ValidityMask &validity, i
 
 static void AppendMultiRawProbeChunk(DataChunk &chunk, MultiPipelineRawBatch &batch, idx_t column_count) {
 	auto count = chunk.size();
-	auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
-	auto &join_validity = FlatVector::Validity(chunk.data[0]);
+	UnifiedColumnReader<int64_t> join_data(chunk.data[0], count);
 
 	batch.join_keys.resize(count);
 	batch.join_validity.resize(count);
@@ -1111,26 +1156,24 @@ static void AppendMultiRawProbeChunk(DataChunk &chunk, MultiPipelineRawBatch &ba
 	for (idx_t column = 0; column < column_count; column++) {
 		batch.values[column].resize(count);
 		batch.validity[column].resize(count);
-		auto value_data = FlatVector::GetData<double>(chunk.data[1 + column]);
-		auto &value_validity = FlatVector::Validity(chunk.data[1 + column]);
+		UnifiedColumnReader<double> value_data(chunk.data[1 + column], count);
 		for (idx_t row = 0; row < count; row++) {
-			batch.values[column][row] = value_data[row];
+			batch.values[column][row] = value_data.Value(row);
 		}
-		CopyValidityToBytes(batch.validity[column].data(), value_validity, 0, count);
+		CopyUnifiedValidityToBytes(batch.validity[column].data(), value_data, 0, count);
 	}
 
 	for (idx_t row = 0; row < count; row++) {
-		batch.join_keys[row] = join_data[row];
-		batch.join_validity[row] = join_validity.RowIsValid(row) ? 1 : 0;
+		batch.join_keys[row] = join_data.Value(row);
+		batch.join_validity[row] = join_data.RowIsValid(row) ? 1 : 0;
 	}
 }
 
 static void AppendRawProbeChunk(DataChunk &chunk, PipelineRawBatch &batch) {
 	auto count = chunk.size();
-	auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
-	auto value_data = FlatVector::GetData<double>(chunk.data[1]);
-	auto valid_data = FlatVector::GetData<uint8_t>(chunk.data[2]);
-	auto &join_validity = FlatVector::Validity(chunk.data[0]);
+	UnifiedColumnReader<int64_t> join_data(chunk.data[0], count);
+	UnifiedColumnReader<double> value_data(chunk.data[1], count);
+	UnifiedColumnReader<uint8_t> valid_data(chunk.data[2], count);
 
 	batch.join_keys.resize(count);
 	batch.values.resize(count);
@@ -1138,10 +1181,10 @@ static void AppendRawProbeChunk(DataChunk &chunk, PipelineRawBatch &batch) {
 	batch.join_validity.resize(count);
 
 	for (idx_t row = 0; row < count; row++) {
-		batch.join_keys[row] = join_data[row];
-		batch.values[row] = value_data[row];
-		batch.value_validity[row] = valid_data[row];
-		batch.join_validity[row] = join_validity.RowIsValid(row) ? 1 : 0;
+		batch.join_keys[row] = join_data.Value(row);
+		batch.values[row] = value_data.Value(row);
+		batch.value_validity[row] = valid_data.Value(row);
+		batch.join_validity[row] = join_data.RowIsValid(row) ? 1 : 0;
 	}
 }
 
@@ -1218,19 +1261,69 @@ static void StartMultiPipelineInputBatch(MultiPipelineInputBatch &batch, const s
 static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChunk &chunk, idx_t &row_offset,
                                          idx_t column_count, idx_t target_batch_rows) {
 	auto count = chunk.size();
-	auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
-	auto &join_validity = FlatVector::Validity(chunk.data[0]);
+	if (!UseRawGpuFetch()) {
+		auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
+		auto &join_validity = FlatVector::Validity(chunk.data[0]);
 
-	vector<const double *> value_data;
-	vector<ValidityMask *> value_validity;
-	value_data.reserve(column_count);
-	value_validity.reserve(column_count);
-	for (idx_t column = 0; column < column_count; column++) {
-		value_data.push_back(FlatVector::GetData<double>(chunk.data[1 + column]));
-		value_validity.push_back(&FlatVector::Validity(chunk.data[1 + column]));
+		vector<const double *> value_data;
+		vector<ValidityMask *> value_validity;
+		value_data.reserve(column_count);
+		value_validity.reserve(column_count);
+		for (idx_t column = 0; column < column_count; column++) {
+			value_data.push_back(FlatVector::GetData<double>(chunk.data[1 + column]));
+			value_validity.push_back(&FlatVector::Validity(chunk.data[1 + column]));
+		}
+
+		if (join_validity.AllValid()) {
+			auto remaining_rows = count - row_offset;
+			auto remaining_capacity = target_batch_rows - batch.row_count;
+			auto append_count = std::min(remaining_rows, remaining_capacity);
+			if (append_count == 0) {
+				return;
+			}
+
+			auto output_row = batch.row_count;
+			batch.join_keys.insert(batch.join_keys.end(), join_data + row_offset,
+			                       join_data + row_offset + append_count);
+			for (idx_t column = 0; column < column_count; column++) {
+				auto output_offset = column * batch.value_stride + output_row;
+				std::memcpy(batch.values.data() + output_offset, value_data[column] + row_offset,
+				            append_count * sizeof(double));
+				CopyValidityToBytes(batch.validity.data() + output_offset, *value_validity[column], row_offset,
+				                    append_count);
+			}
+			batch.row_count += append_count;
+			row_offset += append_count;
+			return;
+		}
+
+		while (row_offset < count && batch.row_count < target_batch_rows) {
+			auto row = row_offset++;
+			if (!join_validity.RowIsValid(row)) {
+				continue;
+			}
+
+			auto output_row = batch.row_count;
+			batch.join_keys.push_back(join_data[row]);
+			for (idx_t column = 0; column < column_count; column++) {
+				auto offset = column * batch.value_stride + output_row;
+				batch.values[offset] = value_data[column][row];
+				batch.validity[offset] = value_validity[column]->RowIsValid(row) ? 1 : 0;
+			}
+			batch.row_count++;
+		}
+		return;
 	}
 
-	if (join_validity.AllValid()) {
+	UnifiedColumnReader<int64_t> join_data(chunk.data[0], count);
+
+	vector<UnifiedColumnReader<double>> value_data;
+	value_data.reserve(column_count);
+	for (idx_t column = 0; column < column_count; column++) {
+		value_data.emplace_back(chunk.data[1 + column], count);
+	}
+
+	if (join_data.format.validity.AllValid()) {
 		auto remaining_rows = count - row_offset;
 		auto remaining_capacity = target_batch_rows - batch.row_count;
 		auto append_count = std::min(remaining_rows, remaining_capacity);
@@ -1239,13 +1332,14 @@ static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChu
 		}
 
 		auto output_row = batch.row_count;
-		batch.join_keys.insert(batch.join_keys.end(), join_data + row_offset, join_data + row_offset + append_count);
+		for (idx_t row = 0; row < append_count; row++) {
+			batch.join_keys.push_back(join_data.Value(row_offset + row));
+		}
 		for (idx_t column = 0; column < column_count; column++) {
 			auto output_offset = column * batch.value_stride + output_row;
-			std::memcpy(batch.values.data() + output_offset, value_data[column] + row_offset,
-			            append_count * sizeof(double));
-			CopyValidityToBytes(batch.validity.data() + output_offset, *value_validity[column], row_offset,
-			                    append_count);
+			CopyUnifiedValues(batch.values.data() + output_offset, value_data[column], row_offset, append_count);
+			CopyUnifiedValidityToBytes(batch.validity.data() + output_offset, value_data[column], row_offset,
+			                           append_count);
 		}
 		batch.row_count += append_count;
 		row_offset += append_count;
@@ -1254,16 +1348,16 @@ static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChu
 
 	while (row_offset < count && batch.row_count < target_batch_rows) {
 		auto row = row_offset++;
-		if (!join_validity.RowIsValid(row)) {
+		if (!join_data.RowIsValid(row)) {
 			continue;
 		}
 
 		auto output_row = batch.row_count;
-		batch.join_keys.push_back(join_data[row]);
+		batch.join_keys.push_back(join_data.Value(row));
 		for (idx_t column = 0; column < column_count; column++) {
 			auto offset = column * batch.value_stride + output_row;
-			batch.values[offset] = value_data[column][row];
-			batch.validity[offset] = value_validity[column]->RowIsValid(row) ? 1 : 0;
+			batch.values[offset] = value_data[column].Value(row);
+			batch.validity[offset] = value_data[column].RowIsValid(row) ? 1 : 0;
 		}
 		batch.row_count++;
 	}
@@ -1316,9 +1410,51 @@ static void AppendDeviceDirectMultiPreparedChunkRows(FusedLatAggMultiDirectPipel
                                                      idx_t &row_offset, idx_t column_count,
                                                      idx_t target_batch_rows, vector<uint8_t> &validity_scratch) {
 	auto count = chunk.size();
-	auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
-	auto &join_validity = FlatVector::Validity(chunk.data[0]);
-	if (!join_validity.AllValid()) {
+	if (!UseRawGpuFetch()) {
+		auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
+		auto &join_validity = FlatVector::Validity(chunk.data[0]);
+		if (!join_validity.AllValid()) {
+			throw InvalidInputException("pipeline-device-direct requires non-null join keys");
+		}
+
+		auto remaining_rows = count - row_offset;
+		auto remaining_capacity = target_batch_rows - batch.row_count;
+		auto append_count = std::min(remaining_rows, remaining_capacity);
+		if (append_count == 0) {
+			return;
+		}
+
+		auto output_row = batch.row_count;
+		auto rc = pipeline.copy_grids(handle, static_cast<uint32_t>(batch.slot), static_cast<uint64_t>(output_row),
+		                              join_data + row_offset, static_cast<uint64_t>(append_count));
+		if (rc != 0) {
+			throw InvalidInputException("GPU fused device-direct grid copy failed for '%s'", batch.fact_path);
+		}
+
+		for (idx_t column = 0; column < column_count; column++) {
+			auto value_data = FlatVector::GetData<double>(chunk.data[1 + column]);
+			auto &value_validity = FlatVector::Validity(chunk.data[1 + column]);
+			const uint8_t *validity_data = nullptr;
+			auto all_valid = value_validity.AllValid();
+			if (!all_valid) {
+				validity_scratch.resize(append_count);
+				CopyValidityToBytes(validity_scratch.data(), value_validity, row_offset, append_count);
+				validity_data = validity_scratch.data();
+			}
+			rc = pipeline.copy_values(handle, static_cast<uint32_t>(batch.slot), static_cast<uint64_t>(column),
+			                          static_cast<uint64_t>(output_row), value_data + row_offset, validity_data,
+			                          static_cast<uint64_t>(append_count), all_valid ? 1 : 0);
+			if (rc != 0) {
+				throw InvalidInputException("GPU fused device-direct value copy failed for '%s'", batch.fact_path);
+			}
+		}
+		batch.row_count += append_count;
+		row_offset += append_count;
+		return;
+	}
+
+	UnifiedColumnReader<int64_t> join_data(chunk.data[0], count);
+	if (!join_data.format.validity.AllValid()) {
 		throw InvalidInputException("pipeline-device-direct requires non-null join keys");
 	}
 
@@ -1330,24 +1466,29 @@ static void AppendDeviceDirectMultiPreparedChunkRows(FusedLatAggMultiDirectPipel
 	}
 
 	auto output_row = batch.row_count;
+	vector<int64_t> join_scratch;
+	join_scratch.resize(append_count);
+	CopyUnifiedValues(join_scratch.data(), join_data, row_offset, append_count);
 	auto rc = pipeline.copy_grids(handle, static_cast<uint32_t>(batch.slot), static_cast<uint64_t>(output_row),
-	                              join_data + row_offset, static_cast<uint64_t>(append_count));
+	                              join_scratch.data(), static_cast<uint64_t>(append_count));
 	if (rc != 0) {
 		throw InvalidInputException("GPU fused device-direct grid copy failed for '%s'", batch.fact_path);
 	}
 
 	for (idx_t column = 0; column < column_count; column++) {
-		auto value_data = FlatVector::GetData<double>(chunk.data[1 + column]);
-		auto &value_validity = FlatVector::Validity(chunk.data[1 + column]);
+		UnifiedColumnReader<double> value_data(chunk.data[1 + column], count);
 		const uint8_t *validity_data = nullptr;
-		auto all_valid = value_validity.AllValid();
+		auto all_valid = value_data.format.validity.AllValid();
+		vector<double> value_scratch;
+		value_scratch.resize(append_count);
+		CopyUnifiedValues(value_scratch.data(), value_data, row_offset, append_count);
 		if (!all_valid) {
 			validity_scratch.resize(append_count);
-			CopyValidityToBytes(validity_scratch.data(), value_validity, row_offset, append_count);
+			CopyUnifiedValidityToBytes(validity_scratch.data(), value_data, row_offset, append_count);
 			validity_data = validity_scratch.data();
 		}
 		rc = pipeline.copy_values(handle, static_cast<uint32_t>(batch.slot), static_cast<uint64_t>(column),
-		                          static_cast<uint64_t>(output_row), value_data + row_offset, validity_data,
+		                          static_cast<uint64_t>(output_row), value_scratch.data(), validity_data,
 		                          static_cast<uint64_t>(append_count), all_valid ? 1 : 0);
 		if (rc != 0) {
 			throw InvalidInputException("GPU fused device-direct value copy failed for '%s'", batch.fact_path);
@@ -1360,19 +1501,68 @@ static void AppendDeviceDirectMultiPreparedChunkRows(FusedLatAggMultiDirectPipel
 static void AppendDirectMultiPreparedChunkRows(DirectMultiPipelineBuffer &batch, DataChunk &chunk, idx_t &row_offset,
                                               idx_t column_count, idx_t target_batch_rows) {
 	auto count = chunk.size();
-	auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
-	auto &join_validity = FlatVector::Validity(chunk.data[0]);
+	if (!UseRawGpuFetch()) {
+		auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
+		auto &join_validity = FlatVector::Validity(chunk.data[0]);
 
-	vector<const double *> value_data;
-	vector<ValidityMask *> value_validity;
-	value_data.reserve(column_count);
-	value_validity.reserve(column_count);
-	for (idx_t column = 0; column < column_count; column++) {
-		value_data.push_back(FlatVector::GetData<double>(chunk.data[1 + column]));
-		value_validity.push_back(&FlatVector::Validity(chunk.data[1 + column]));
+		vector<const double *> value_data;
+		vector<ValidityMask *> value_validity;
+		value_data.reserve(column_count);
+		value_validity.reserve(column_count);
+		for (idx_t column = 0; column < column_count; column++) {
+			value_data.push_back(FlatVector::GetData<double>(chunk.data[1 + column]));
+			value_validity.push_back(&FlatVector::Validity(chunk.data[1 + column]));
+		}
+
+		if (join_validity.AllValid()) {
+			auto remaining_rows = count - row_offset;
+			auto remaining_capacity = target_batch_rows - batch.row_count;
+			auto append_count = std::min(remaining_rows, remaining_capacity);
+			if (append_count == 0) {
+				return;
+			}
+
+			auto output_row = batch.row_count;
+			std::memcpy(batch.join_keys + output_row, join_data + row_offset, append_count * sizeof(int64_t));
+			for (idx_t column = 0; column < column_count; column++) {
+				auto output_offset = column * batch.value_stride + output_row;
+				std::memcpy(batch.values + output_offset, value_data[column] + row_offset,
+				            append_count * sizeof(double));
+				CopyValidityToBytes(batch.validity + output_offset, *value_validity[column], row_offset,
+				                    append_count);
+			}
+			batch.row_count += append_count;
+			row_offset += append_count;
+			return;
+		}
+
+		while (row_offset < count && batch.row_count < target_batch_rows) {
+			auto row = row_offset++;
+			if (!join_validity.RowIsValid(row)) {
+				continue;
+			}
+
+			auto output_row = batch.row_count;
+			batch.join_keys[output_row] = join_data[row];
+			for (idx_t column = 0; column < column_count; column++) {
+				auto offset = column * batch.value_stride + output_row;
+				batch.values[offset] = value_data[column][row];
+				batch.validity[offset] = value_validity[column]->RowIsValid(row) ? 1 : 0;
+			}
+			batch.row_count++;
+		}
+		return;
 	}
 
-	if (join_validity.AllValid()) {
+	UnifiedColumnReader<int64_t> join_data(chunk.data[0], count);
+
+	vector<UnifiedColumnReader<double>> value_data;
+	value_data.reserve(column_count);
+	for (idx_t column = 0; column < column_count; column++) {
+		value_data.emplace_back(chunk.data[1 + column], count);
+	}
+
+	if (join_data.format.validity.AllValid()) {
 		auto remaining_rows = count - row_offset;
 		auto remaining_capacity = target_batch_rows - batch.row_count;
 		auto append_count = std::min(remaining_rows, remaining_capacity);
@@ -1381,11 +1571,11 @@ static void AppendDirectMultiPreparedChunkRows(DirectMultiPipelineBuffer &batch,
 		}
 
 		auto output_row = batch.row_count;
-		std::memcpy(batch.join_keys + output_row, join_data + row_offset, append_count * sizeof(int64_t));
+		CopyUnifiedValues(batch.join_keys + output_row, join_data, row_offset, append_count);
 		for (idx_t column = 0; column < column_count; column++) {
 			auto output_offset = column * batch.value_stride + output_row;
-			std::memcpy(batch.values + output_offset, value_data[column] + row_offset, append_count * sizeof(double));
-			CopyValidityToBytes(batch.validity + output_offset, *value_validity[column], row_offset, append_count);
+			CopyUnifiedValues(batch.values + output_offset, value_data[column], row_offset, append_count);
+			CopyUnifiedValidityToBytes(batch.validity + output_offset, value_data[column], row_offset, append_count);
 		}
 		batch.row_count += append_count;
 		row_offset += append_count;
@@ -1394,16 +1584,16 @@ static void AppendDirectMultiPreparedChunkRows(DirectMultiPipelineBuffer &batch,
 
 	while (row_offset < count && batch.row_count < target_batch_rows) {
 		auto row = row_offset++;
-		if (!join_validity.RowIsValid(row)) {
+		if (!join_data.RowIsValid(row)) {
 			continue;
 		}
 
 		auto output_row = batch.row_count;
-		batch.join_keys[output_row] = join_data[row];
+		batch.join_keys[output_row] = join_data.Value(row);
 		for (idx_t column = 0; column < column_count; column++) {
 			auto offset = column * batch.value_stride + output_row;
-			batch.values[offset] = value_data[column][row];
-			batch.validity[offset] = value_validity[column]->RowIsValid(row) ? 1 : 0;
+			batch.values[offset] = value_data[column].Value(row);
+			batch.validity[offset] = value_data[column].RowIsValid(row) ? 1 : 0;
 		}
 		batch.row_count++;
 	}
@@ -1416,7 +1606,7 @@ static ProbeColumns ReadProbeColumns(Connection &connection, const string &fact_
 	ProbeColumns chunk_columns;
 
 	while (true) {
-		auto chunk = result->Fetch();
+		auto chunk = FetchGpuPipelineChunk(*result);
 		if (!chunk || chunk->size() == 0) {
 			break;
 		}
@@ -1443,8 +1633,12 @@ static string BuildMultiProbeQuery(const string &fact_path, const string &join_k
 
 static void AppendMultiProbeChunk(DataChunk &chunk, MultiProbeColumns &columns, idx_t column_count) {
 	auto count = chunk.size();
-	auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
-	auto &join_validity = FlatVector::Validity(chunk.data[0]);
+	UnifiedColumnReader<int64_t> join_data(chunk.data[0], count);
+	vector<UnifiedColumnReader<double>> value_data;
+	value_data.reserve(column_count);
+	for (idx_t column = 0; column < column_count; column++) {
+		value_data.emplace_back(chunk.data[1 + column], count);
+	}
 
 	if (columns.values.empty()) {
 		columns.values.resize(column_count);
@@ -1457,15 +1651,13 @@ static void AppendMultiProbeChunk(DataChunk &chunk, MultiProbeColumns &columns, 
 	columns.join_keys.reserve(columns.join_keys.size() + count);
 
 	for (idx_t row = 0; row < count; row++) {
-		if (!join_validity.RowIsValid(row)) {
+		if (!join_data.RowIsValid(row)) {
 			continue;
 		}
-		columns.join_keys.push_back(join_data[row]);
+		columns.join_keys.push_back(join_data.Value(row));
 		for (idx_t column = 0; column < column_count; column++) {
-			auto value_data = FlatVector::GetData<double>(chunk.data[1 + column]);
-			auto &value_validity = FlatVector::Validity(chunk.data[1 + column]);
-			columns.values[column].push_back(value_data[row]);
-			columns.validity[column].push_back(value_validity.RowIsValid(row) ? 1 : 0);
+			columns.values[column].push_back(value_data[column].Value(row));
+			columns.validity[column].push_back(value_data[column].RowIsValid(row) ? 1 : 0);
 		}
 	}
 }
@@ -1478,7 +1670,7 @@ static MultiProbeColumns ReadMultiProbeColumns(Connection &connection, const str
 	columns.validity.resize(payload_columns.size());
 
 	while (true) {
-		auto chunk = result->Fetch();
+		auto chunk = FetchGpuPipelineChunk(*result);
 		if (!chunk || chunk->size() == 0) {
 			break;
 		}
@@ -1635,7 +1827,7 @@ static void ReadPipelineRawBatches(DuckDB &db, const vector<string> &fact_paths,
 			auto result = RunStreamingQuery(connection, BuildProbeQuery(fact_path, join_key, payload_column));
 
 			while (true) {
-				auto chunk = result->Fetch();
+				auto chunk = FetchGpuPipelineChunk(*result);
 				if (!chunk || chunk->size() == 0) {
 					break;
 				}
@@ -1671,7 +1863,7 @@ static void ReadMultiPipelineRawBatches(DuckDB &db, const vector<string> &fact_p
 			auto result = RunStreamingQuery(connection, BuildMultiProbeQuery(fact_path, join_key, payload_columns));
 
 			while (true) {
-				auto chunk = result->Fetch();
+				auto chunk = FetchGpuPipelineChunk(*result);
 				if (!chunk || chunk->size() == 0) {
 					break;
 				}
@@ -1708,7 +1900,7 @@ static void ReadMultiPipelineRawBatchWorker(DuckDB &db, BlockingQueue<string> &f
 			auto result = RunStreamingQuery(connection, BuildMultiProbeQuery(fact_path, join_key, payload_columns));
 
 			while (true) {
-				auto chunk = result->Fetch();
+				auto chunk = FetchGpuPipelineChunk(*result);
 				if (!chunk || chunk->size() == 0) {
 					break;
 				}
@@ -1788,7 +1980,7 @@ static void ReadMultiPipelineChunkBatchWorker(DuckDB &db, BlockingQueue<string> 
 
 			while (true) {
 				auto fetch_start = std::chrono::steady_clock::now();
-				auto chunk = result->Fetch();
+				auto chunk = FetchGpuPipelineChunk(*result);
 				fetch_elapsed += ElapsedSeconds(fetch_start);
 				if (!chunk || chunk->size() == 0) {
 					break;
@@ -1881,7 +2073,7 @@ static void ReadMultiPipelineChunkBatches(DuckDB &db, const vector<string> &fact
 
 			while (true) {
 				auto fetch_start = std::chrono::steady_clock::now();
-				auto chunk = result->Fetch();
+				auto chunk = FetchGpuPipelineChunk(*result);
 				fetch_elapsed += ElapsedSeconds(fetch_start);
 				if (!chunk || chunk->size() == 0) {
 					break;
