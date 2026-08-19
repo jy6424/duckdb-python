@@ -17,8 +17,17 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <utility>
+
+#if defined(__linux__)
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
 
 namespace py = pybind11;
 
@@ -169,6 +178,14 @@ static bool ReadEnvFlag(const char *name, bool default_value = false) {
 	return std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 || std::strcmp(value, "TRUE") == 0 ||
 	       std::strcmp(value, "yes") == 0 || std::strcmp(value, "YES") == 0 || std::strcmp(value, "on") == 0 ||
 	       std::strcmp(value, "ON") == 0;
+}
+
+static string ReadEnvString(const char *name, const string &default_value) {
+	auto value = std::getenv(name);
+	if (!value || !value[0]) {
+		return default_value;
+	}
+	return value;
 }
 
 static FusedLatAggFunc LoadFusedLatAgg(const string &path_p, bool mapped) {
@@ -404,6 +421,82 @@ static void ConfigurePipelineReaderConnection(Connection &connection) {
 		result->ThrowError();
 	}
 }
+
+static void PrefetchFileBestEffort(const string &path, const string &method) {
+#if defined(__linux__)
+	auto fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		return;
+	}
+
+	struct stat file_stat;
+	if (fstat(fd, &file_stat) != 0 || !S_ISREG(file_stat.st_mode)) {
+		close(fd);
+		return;
+	}
+
+	const bool use_fadvise = method == "fadvise" || method == "both";
+	const bool use_readahead = method == "readahead" || method == "both";
+	if (use_fadvise) {
+		(void)posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+	}
+	if (use_readahead && file_stat.st_size > 0) {
+#if defined(SYS_readahead)
+		constexpr uint64_t READAHEAD_CHUNK_SIZE = 64ULL * 1024ULL * 1024ULL;
+		uint64_t offset = 0;
+		uint64_t remaining = static_cast<uint64_t>(file_stat.st_size);
+		while (remaining > 0) {
+			auto request = static_cast<size_t>(std::min<uint64_t>(remaining, READAHEAD_CHUNK_SIZE));
+			(void)syscall(SYS_readahead, fd, static_cast<off_t>(offset), request);
+			offset += request;
+			remaining -= request;
+		}
+#endif
+	}
+	close(fd);
+#else
+	(void)path;
+	(void)method;
+#endif
+}
+
+static void PrefetchPipelineFiles(vector<string> fact_paths, string dimension_file) {
+	auto method = ReadEnvString("DUCKDB_GPU_PREFETCH_METHOD", "both");
+	if (method != "fadvise" && method != "readahead" && method != "both") {
+		method = "both";
+	}
+	std::set<string> prefetch_paths;
+	for (auto &fact_path : fact_paths) {
+		prefetch_paths.insert(fact_path);
+		if (ReadEnvFlag("DUCKDB_GPU_PREFETCH_DIMENSION_FILES", true)) {
+			prefetch_paths.insert(ResolveDimensionPath(fact_path, dimension_file));
+		}
+	}
+	for (auto &path : prefetch_paths) {
+		PrefetchFileBestEffort(path, method);
+	}
+}
+
+class ScopedThread {
+public:
+	~ScopedThread() {
+		Join();
+	}
+
+	template <class... ARGS>
+	void Start(ARGS &&...args) {
+		thread = std::thread(std::forward<ARGS>(args)...);
+	}
+
+	void Join() {
+		if (thread.joinable()) {
+			thread.join();
+		}
+	}
+
+private:
+	std::thread thread;
+};
 
 struct GroupMapping {
 	int64_t join_min = 0;
@@ -2390,6 +2483,10 @@ static py::dict DBSGPUFusedLatPipeline(const py::iterable &fact_paths_p, const s
 	std::map<double, double> total_sum;
 	std::map<double, uint64_t> total_count;
 	uint64_t total_rows = 0;
+	ScopedThread prefetch_thread;
+	if (pipeline_mode && ReadEnvFlag("DUCKDB_GPU_PREFETCH_FILES", false)) {
+		prefetch_thread.Start(PrefetchPipelineFiles, fact_paths, dimension_file);
+	}
 
 	if (pipeline_mode) {
 		if (cpu_pipeline_mode) {
@@ -2577,6 +2674,7 @@ static py::dict DBSGPUFusedLatPipeline(const py::iterable &fact_paths_p, const s
 		}
 	}
 
+	prefetch_thread.Join();
 	auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 	py::dict result;
 	result["row_count"] = py::int_(total_rows);
@@ -2629,6 +2727,10 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 	uint64_t total_rows = 0;
 	MultiPipelineAccumulatedResult accumulated_result;
 	MultiPipelineStageTimers stage_timers;
+	ScopedThread prefetch_thread;
+	if (pipeline_mode && ReadEnvFlag("DUCKDB_GPU_PREFETCH_FILES", false)) {
+		prefetch_thread.Start(PrefetchPipelineFiles, fact_paths, dimension_file);
+	}
 
 	if (pipeline_mode) {
 		auto reader_thread_count = std::min<idx_t>(ReadEnvIdx("DUCKDB_GPU_PIPELINE_READER_THREADS", 1),
@@ -2883,6 +2985,7 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 	if (pipeline_mode) {
 		total_rows = accumulated_result.total_rows;
 	}
+	prefetch_thread.Join();
 
 	auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 	py::dict result;
