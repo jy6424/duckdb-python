@@ -21,29 +21,22 @@ def parse_args():
     parser.add_argument("--read-mode", default="per-file", choices=["per-file", "glob"])
     parser.add_argument("--reuse-dimension-mapping", action="store_true")
     parser.add_argument("--print-stage-times", action="store_true")
+    parser.add_argument("--print-results", action="store_true")
     return parser.parse_args()
 
 
 def read_auto_payload_columns(parquet_path):
-    import duckdb
-
-    con = duckdb.connect()
     try:
-        rows = con.execute(
-            """
-            DESCRIBE SELECT *
-            FROM read_parquet(?)
-            """,
-            [parquet_path],
-        ).fetchall()
-    finally:
-        con.close()
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise SystemExit("pyarrow is required for --vars all metadata inspection: {}".format(exc))
 
-    columns = []
-    for name, typ, *_ in rows:
-        if typ.upper() == "DOUBLE" and name not in EXCLUDED_AUTO_COLUMNS:
-            columns.append(name)
-    return columns
+    schema = pq.ParquetFile(parquet_path).schema_arrow
+    return [
+        field.name
+        for field in schema
+        if field.name not in EXCLUDED_AUTO_COLUMNS and str(field.type).lower() == "double"
+    ]
 
 
 def resolve_payload_columns(args, parquet_paths):
@@ -87,6 +80,10 @@ def cuda_synchronize():
         pass
 
 
+def read_parquet_gpu(cudf, source, columns):
+    return cudf.read_parquet(source, columns=columns)
+
+
 def combine_frames(cudf, frames, group_column, payload_columns, is_row_count=False):
     if not frames:
         columns = [group_column, "row_count"] if is_row_count else [group_column] + payload_columns
@@ -125,8 +122,8 @@ def main():
     if args.read_mode == "glob":
         dimension_path = resolve_dimension_path(parquet_paths[0], args.dimension_file)
         read_start = time.time()
-        dim = cudf.read_parquet(dimension_path, columns=[args.join_key, args.group_column])
-        fact = cudf.read_parquet(parquet_paths, columns=[args.join_key] + payload_columns)
+        dim = read_parquet_gpu(cudf, dimension_path, columns=[args.join_key, args.group_column])
+        fact = read_parquet_gpu(cudf, parquet_paths, columns=[args.join_key] + payload_columns)
         cuda_synchronize()
         read_seconds += time.time() - read_start
 
@@ -148,9 +145,9 @@ def main():
             dimension_path = resolve_dimension_path(fact_path, args.dimension_file)
             read_start = time.time()
             if cached_dim is None or not args.reuse_dimension_mapping:
-                cached_dim = cudf.read_parquet(dimension_path, columns=[args.join_key, args.group_column])
+                cached_dim = read_parquet_gpu(cudf, dimension_path, columns=[args.join_key, args.group_column])
             dim = cached_dim
-            fact = cudf.read_parquet(fact_path, columns=[args.join_key] + payload_columns)
+            fact = read_parquet_gpu(cudf, fact_path, columns=[args.join_key] + payload_columns)
             cuda_synchronize()
             read_seconds += time.time() - read_start
 
@@ -182,6 +179,7 @@ def main():
     print(row_count)
     print("[number of input file]: {}".format(len(parquet_paths)))
     print("[read mode]: {}".format(args.read_mode))
+    print("[scan/decode engine]: cudf")
     print("[payload columns]: {}".format(",".join(payload_columns)))
     if args.print_stage_times:
         print(
@@ -189,6 +187,12 @@ def main():
                 read_seconds, join_seconds, group_seconds, merge_seconds
             )
         )
+    if args.print_results:
+        print("\n[Results]")
+        merged = total_sums.merge(total_counts, on=args.group_column, suffixes=("_sum", "_count"))
+        merged = merged.merge(total_row_counts, on=args.group_column)
+        for row in merged.sort_values(args.group_column).to_pandas().itertuples(index=False):
+            print(row)
     print("[query time]: {:.6f}s".format(elapsed))
 
 
