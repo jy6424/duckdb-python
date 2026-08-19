@@ -984,8 +984,14 @@ struct MultiPipelineStageTimers {
 	double gpu_time = 0;
 	double merge_time = 0;
 	double read_setup_time = 0;
+	double read_connection_time = 0;
+	double read_mapping_lock_time = 0;
+	double read_mapping_time = 0;
+	double read_query_build_time = 0;
+	double read_query_submit_time = 0;
 	double read_fetch_time = 0;
 	double read_push_time = 0;
+	double read_thread_max_time = 0;
 	double prepare_pop_time = 0;
 	double prepare_work_time = 0;
 	double prepare_push_time = 0;
@@ -1688,13 +1694,20 @@ static void ReadMultiPipelineChunkBatchWorker(DuckDB &db, BlockingQueue<string> 
 	auto stage_start = std::chrono::steady_clock::now();
 	uint64_t chunk_count = 0;
 	double setup_elapsed = 0;
+	double connection_elapsed = 0;
+	double mapping_lock_elapsed = 0;
+	double mapping_elapsed = 0;
+	double query_build_elapsed = 0;
+	double query_submit_elapsed = 0;
 	double fetch_elapsed = 0;
 	double push_elapsed = 0;
 	uint64_t mapping_reads = 0;
 	uint64_t mapping_reuses = 0;
 	try {
+		auto connection_start = std::chrono::steady_clock::now();
 		Connection connection(db);
 		ConfigurePipelineReaderConnection(connection);
+		connection_elapsed += ElapsedSeconds(connection_start);
 		auto reuse_dimension_mapping = ReadEnvFlag("DUCKDB_GPU_REUSE_DIMENSION_MAPPING", false);
 		string fact_path;
 		while (file_queue.Pop(fact_path)) {
@@ -1704,11 +1717,15 @@ static void ReadMultiPipelineChunkBatchWorker(DuckDB &db, BlockingQueue<string> 
 			    DimensionMappingCacheKey(dimension_path, dimension_file, join_key, group_column, reuse_dimension_mapping);
 			std::shared_ptr<GroupMapping> mapping;
 			{
+				auto mapping_lock_start = std::chrono::steady_clock::now();
 				std::lock_guard<std::mutex> guard(dimension_mapping_cache_lock);
+				mapping_lock_elapsed += ElapsedSeconds(mapping_lock_start);
 				auto cached_mapping = dimension_mapping_cache.find(cache_key);
 				if (cached_mapping == dimension_mapping_cache.end()) {
+					auto mapping_start = std::chrono::steady_clock::now();
 					mapping = std::make_shared<GroupMapping>(
 					    ReadGroupMapping(connection, dimension_path, join_key, group_column));
+					mapping_elapsed += ElapsedSeconds(mapping_start);
 					dimension_mapping_cache[cache_key] = mapping;
 					mapping_reads++;
 				} else {
@@ -1716,7 +1733,12 @@ static void ReadMultiPipelineChunkBatchWorker(DuckDB &db, BlockingQueue<string> 
 					mapping_reuses++;
 				}
 			}
-			auto result = RunStreamingQuery(connection, BuildMultiProbeQuery(fact_path, join_key, payload_columns));
+			auto query_build_start = std::chrono::steady_clock::now();
+			auto query = BuildMultiProbeQuery(fact_path, join_key, payload_columns);
+			query_build_elapsed += ElapsedSeconds(query_build_start);
+			auto query_submit_start = std::chrono::steady_clock::now();
+			auto result = RunStreamingQuery(connection, query);
+			query_submit_elapsed += ElapsedSeconds(query_submit_start);
 			setup_elapsed += ElapsedSeconds(setup_start);
 
 			while (true) {
@@ -1744,11 +1766,18 @@ static void ReadMultiPipelineChunkBatchWorker(DuckDB &db, BlockingQueue<string> 
 		}
 	}
 	if (timers) {
+		auto read_elapsed = ElapsedSeconds(stage_start);
 		std::lock_guard<std::mutex> guard(timers->lock);
-		timers->read_time += ElapsedSeconds(stage_start);
+		timers->read_time += read_elapsed;
 		timers->read_setup_time += setup_elapsed;
+		timers->read_connection_time += connection_elapsed;
+		timers->read_mapping_lock_time += mapping_lock_elapsed;
+		timers->read_mapping_time += mapping_elapsed;
+		timers->read_query_build_time += query_build_elapsed;
+		timers->read_query_submit_time += query_submit_elapsed;
 		timers->read_fetch_time += fetch_elapsed;
 		timers->read_push_time += push_elapsed;
+		timers->read_thread_max_time = std::max(timers->read_thread_max_time, read_elapsed);
 		timers->read_chunks += chunk_count;
 		timers->dimension_mapping_reads += mapping_reads;
 		timers->dimension_mapping_reuses += mapping_reuses;
@@ -1764,13 +1793,19 @@ static void ReadMultiPipelineChunkBatches(DuckDB &db, const vector<string> &fact
 	auto stage_start = std::chrono::steady_clock::now();
 	uint64_t chunk_count = 0;
 	double setup_elapsed = 0;
+	double connection_elapsed = 0;
+	double mapping_elapsed = 0;
+	double query_build_elapsed = 0;
+	double query_submit_elapsed = 0;
 	double fetch_elapsed = 0;
 	double push_elapsed = 0;
 	uint64_t mapping_reads = 0;
 	uint64_t mapping_reuses = 0;
 	try {
+		auto connection_start = std::chrono::steady_clock::now();
 		Connection connection(db);
 		ConfigurePipelineReaderConnection(connection);
+		connection_elapsed += ElapsedSeconds(connection_start);
 		std::map<string, std::shared_ptr<GroupMapping>> dimension_mapping_cache;
 		auto reuse_dimension_mapping = ReadEnvFlag("DUCKDB_GPU_REUSE_DIMENSION_MAPPING", false);
 		for (auto &fact_path : fact_paths) {
@@ -1781,15 +1816,22 @@ static void ReadMultiPipelineChunkBatches(DuckDB &db, const vector<string> &fact
 			std::shared_ptr<GroupMapping> mapping;
 			auto cached_mapping = dimension_mapping_cache.find(cache_key);
 			if (cached_mapping == dimension_mapping_cache.end()) {
+				auto mapping_start = std::chrono::steady_clock::now();
 				mapping =
 				    std::make_shared<GroupMapping>(ReadGroupMapping(connection, dimension_path, join_key, group_column));
+				mapping_elapsed += ElapsedSeconds(mapping_start);
 				dimension_mapping_cache[cache_key] = mapping;
 				mapping_reads++;
 			} else {
 				mapping = cached_mapping->second;
 				mapping_reuses++;
 			}
-			auto result = RunStreamingQuery(connection, BuildMultiProbeQuery(fact_path, join_key, payload_columns));
+			auto query_build_start = std::chrono::steady_clock::now();
+			auto query = BuildMultiProbeQuery(fact_path, join_key, payload_columns);
+			query_build_elapsed += ElapsedSeconds(query_build_start);
+			auto query_submit_start = std::chrono::steady_clock::now();
+			auto result = RunStreamingQuery(connection, query);
+			query_submit_elapsed += ElapsedSeconds(query_submit_start);
 			setup_elapsed += ElapsedSeconds(setup_start);
 
 			while (true) {
@@ -1817,11 +1859,17 @@ static void ReadMultiPipelineChunkBatches(DuckDB &db, const vector<string> &fact
 		}
 	}
 	if (timers) {
+		auto read_elapsed = ElapsedSeconds(stage_start);
 		std::lock_guard<std::mutex> guard(timers->lock);
-		timers->read_time += ElapsedSeconds(stage_start);
+		timers->read_time += read_elapsed;
 		timers->read_setup_time += setup_elapsed;
+		timers->read_connection_time += connection_elapsed;
+		timers->read_mapping_time += mapping_elapsed;
+		timers->read_query_build_time += query_build_elapsed;
+		timers->read_query_submit_time += query_submit_elapsed;
 		timers->read_fetch_time += fetch_elapsed;
 		timers->read_push_time += push_elapsed;
+		timers->read_thread_max_time = std::max(timers->read_thread_max_time, read_elapsed);
 		timers->read_chunks += chunk_count;
 		timers->dimension_mapping_reads += mapping_reads;
 		timers->dimension_mapping_reuses += mapping_reuses;
@@ -3216,8 +3264,14 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		stage_times["gpu_time"] = py::float_(stage_timers.gpu_time);
 		stage_times["merge_time"] = py::float_(stage_timers.merge_time);
 		stage_times["read_setup_time"] = py::float_(stage_timers.read_setup_time);
+		stage_times["read_connection_time"] = py::float_(stage_timers.read_connection_time);
+		stage_times["read_mapping_lock_time"] = py::float_(stage_timers.read_mapping_lock_time);
+		stage_times["read_mapping_time"] = py::float_(stage_timers.read_mapping_time);
+		stage_times["read_query_build_time"] = py::float_(stage_timers.read_query_build_time);
+		stage_times["read_query_submit_time"] = py::float_(stage_timers.read_query_submit_time);
 		stage_times["read_fetch_time"] = py::float_(stage_timers.read_fetch_time);
 		stage_times["read_push_time"] = py::float_(stage_timers.read_push_time);
+		stage_times["read_thread_max_time"] = py::float_(stage_timers.read_thread_max_time);
 		stage_times["prepare_pop_time"] = py::float_(stage_timers.prepare_pop_time);
 		stage_times["prepare_work_time"] = py::float_(stage_timers.prepare_work_time);
 		stage_times["prepare_push_time"] = py::float_(stage_timers.prepare_push_time);

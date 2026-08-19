@@ -193,6 +193,18 @@ def main():
             )
         )
         print(
+            "[read detail] thread_max={:.6f}s connection={:.6f}s mapping_lock={:.6f}s mapping={:.6f}s "
+            "query_build={:.6f}s query_submit={:.6f}s fetch={:.6f}s".format(
+                float(stage.get("read_thread_max_time", 0.0)),
+                float(stage.get("read_connection_time", 0.0)),
+                float(stage.get("read_mapping_lock_time", 0.0)),
+                float(stage.get("read_mapping_time", 0.0)),
+                float(stage.get("read_query_build_time", 0.0)),
+                float(stage.get("read_query_submit_time", 0.0)),
+                float(stage.get("read_fetch_time", 0.0)),
+            )
+        )
+        print(
             "[stage queue] read_push={:.6f}s prepare_pop={:.6f}s prepare_push={:.6f}s "
             "gpu_pop={:.6f}s gpu_push={:.6f}s merge_pop={:.6f}s".format(
                 float(stage.get("read_push_time", 0.0)),
