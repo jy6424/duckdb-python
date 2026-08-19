@@ -26,7 +26,7 @@ def parse_args():
     parser.add_argument("--print-stage-times", action="store_true")
     parser.add_argument("--reuse-dimension-mapping", action="store_true")
     parser.add_argument("--prefetch-files", action="store_true")
-    parser.add_argument("--prefetch-method", default="both", choices=["fadvise", "readahead", "both"])
+    parser.add_argument("--prefetch-method", default="both", choices=["fadvise", "readahead", "both", "io_uring"])
     parser.add_argument(
         "--reader-duckdb-threads",
         type=int,

@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -23,6 +24,8 @@
 
 #if defined(__linux__)
 #include <fcntl.h>
+#include <linux/io_uring.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -422,8 +425,194 @@ static void ConfigurePipelineReaderConnection(Connection &connection) {
 	}
 }
 
+#if defined(__linux__) && defined(SYS_io_uring_setup) && defined(SYS_io_uring_enter)
+class IoUringPrefetcher {
+public:
+	~IoUringPrefetcher() {
+		Close();
+	}
+
+	bool Init(uint32_t entries) {
+		params = {};
+		ring_fd = static_cast<int>(syscall(SYS_io_uring_setup, entries, &params));
+		if (ring_fd < 0) {
+			return false;
+		}
+
+		sq_ring_size = params.sq_off.array + params.sq_entries * sizeof(uint32_t);
+		cq_ring_size = params.cq_off.cqes + params.cq_entries * sizeof(struct io_uring_cqe);
+		sqes_size = params.sq_entries * sizeof(struct io_uring_sqe);
+
+		sq_ring = mmap(nullptr, sq_ring_size, PROT_READ | PROT_WRITE, MAP_SHARED, ring_fd, IORING_OFF_SQ_RING);
+		cq_ring = mmap(nullptr, cq_ring_size, PROT_READ | PROT_WRITE, MAP_SHARED, ring_fd, IORING_OFF_CQ_RING);
+		sqes = static_cast<struct io_uring_sqe *>(
+		    mmap(nullptr, sqes_size, PROT_READ | PROT_WRITE, MAP_SHARED, ring_fd, IORING_OFF_SQES));
+		if (sq_ring == MAP_FAILED || cq_ring == MAP_FAILED || reinterpret_cast<void *>(sqes) == MAP_FAILED) {
+			Close();
+			return false;
+		}
+
+		sq_head = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ring) + params.sq_off.head);
+		sq_tail = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ring) + params.sq_off.tail);
+		sq_ring_mask = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ring) + params.sq_off.ring_mask);
+		sq_array = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ring) + params.sq_off.array);
+
+		cq_head = reinterpret_cast<uint32_t *>(static_cast<char *>(cq_ring) + params.cq_off.head);
+		cq_tail = reinterpret_cast<uint32_t *>(static_cast<char *>(cq_ring) + params.cq_off.tail);
+		cq_ring_mask = reinterpret_cast<uint32_t *>(static_cast<char *>(cq_ring) + params.cq_off.ring_mask);
+		cqes = reinterpret_cast<struct io_uring_cqe *>(static_cast<char *>(cq_ring) + params.cq_off.cqes);
+		return true;
+	}
+
+	void Close() {
+		if (sq_ring && sq_ring != MAP_FAILED) {
+			munmap(sq_ring, sq_ring_size);
+		}
+		if (cq_ring && cq_ring != MAP_FAILED) {
+			munmap(cq_ring, cq_ring_size);
+		}
+		if (sqes && reinterpret_cast<void *>(sqes) != MAP_FAILED) {
+			munmap(sqes, sqes_size);
+		}
+		if (ring_fd >= 0) {
+			close(ring_fd);
+		}
+		sq_ring = nullptr;
+		cq_ring = nullptr;
+		sqes = nullptr;
+		ring_fd = -1;
+	}
+
+	bool SubmitRead(int fd, uint64_t offset, void *buffer, uint32_t length, uint64_t user_data) {
+		auto tail = *sq_tail;
+		auto index = tail & *sq_ring_mask;
+		auto &sqe = sqes[index];
+		std::memset(&sqe, 0, sizeof(sqe));
+		sqe.opcode = IORING_OP_READ;
+		sqe.fd = fd;
+		sqe.off = offset;
+		sqe.addr = reinterpret_cast<uint64_t>(buffer);
+		sqe.len = length;
+		sqe.user_data = user_data;
+		sq_array[index] = index;
+		std::atomic_thread_fence(std::memory_order_release);
+		*sq_tail = tail + 1;
+		pending_submissions++;
+		return true;
+	}
+
+	bool SubmitAndWait(uint32_t wait_nr) {
+		auto submit_count = pending_submissions;
+		pending_submissions = 0;
+		auto result = syscall(SYS_io_uring_enter, ring_fd, submit_count, wait_nr, IORING_ENTER_GETEVENTS, nullptr, 0);
+		return result >= 0;
+	}
+
+	uint32_t DrainCompletions() {
+		uint32_t completed = 0;
+		auto head = *cq_head;
+		std::atomic_thread_fence(std::memory_order_acquire);
+		auto tail = *cq_tail;
+		while (head != tail) {
+			auto &cqe = cqes[head & *cq_ring_mask];
+			(void)cqe;
+			head++;
+			completed++;
+		}
+		*cq_head = head;
+		return completed;
+	}
+
+private:
+	int ring_fd = -1;
+	struct io_uring_params params;
+	void *sq_ring = nullptr;
+	void *cq_ring = nullptr;
+	struct io_uring_sqe *sqes = nullptr;
+	struct io_uring_cqe *cqes = nullptr;
+	size_t sq_ring_size = 0;
+	size_t cq_ring_size = 0;
+	size_t sqes_size = 0;
+	uint32_t *sq_head = nullptr;
+	uint32_t *sq_tail = nullptr;
+	uint32_t *sq_ring_mask = nullptr;
+	uint32_t *sq_array = nullptr;
+	uint32_t *cq_head = nullptr;
+	uint32_t *cq_tail = nullptr;
+	uint32_t *cq_ring_mask = nullptr;
+	uint32_t pending_submissions = 0;
+};
+
+static void PrefetchFileWithIoUring(const string &path) {
+	auto queue_depth = static_cast<uint32_t>(ReadEnvIdx("DUCKDB_GPU_IO_URING_QD", 8));
+	queue_depth = std::max<uint32_t>(1, std::min<uint32_t>(queue_depth, 64));
+	auto block_bytes = static_cast<uint32_t>(ReadEnvIdx("DUCKDB_GPU_IO_URING_BLOCK_BYTES", 1024 * 1024));
+	block_bytes = std::max<uint32_t>(4096, block_bytes);
+
+	auto fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		return;
+	}
+
+	struct stat file_stat;
+	if (fstat(fd, &file_stat) != 0 || !S_ISREG(file_stat.st_mode) || file_stat.st_size <= 0) {
+		close(fd);
+		return;
+	}
+
+	IoUringPrefetcher ring;
+	if (!ring.Init(queue_depth)) {
+		close(fd);
+		return;
+	}
+
+	vector<vector<char>> buffers;
+	buffers.reserve(queue_depth);
+	for (uint32_t idx = 0; idx < queue_depth; idx++) {
+		buffers.emplace_back(block_bytes);
+	}
+
+	uint64_t offset = 0;
+	auto file_size = static_cast<uint64_t>(file_stat.st_size);
+	uint64_t request_id = 0;
+
+	while (offset < file_size) {
+		uint32_t submitted = 0;
+		while (offset < file_size && submitted < queue_depth) {
+			auto buffer_idx = submitted;
+			auto remaining = file_size - offset;
+			auto request = static_cast<uint32_t>(std::min<uint64_t>(remaining, block_bytes));
+			if (!ring.SubmitRead(fd, offset, buffers[buffer_idx].data(), request, request_id)) {
+				break;
+			}
+			offset += request;
+			request_id++;
+			submitted++;
+		}
+		if (submitted == 0 || !ring.SubmitAndWait(submitted)) {
+			break;
+		}
+		uint32_t completed = 0;
+		while (completed < submitted) {
+			completed += ring.DrainCompletions();
+			if (completed < submitted && !ring.SubmitAndWait(1)) {
+				break;
+			}
+		}
+	}
+	close(fd);
+}
+#endif
+
 static void PrefetchFileBestEffort(const string &path, const string &method) {
 #if defined(__linux__)
+	if (method == "io_uring") {
+#if defined(SYS_io_uring_setup) && defined(SYS_io_uring_enter)
+		PrefetchFileWithIoUring(path);
+#endif
+		return;
+	}
+
 	auto fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
 	if (fd < 0) {
 		return;
@@ -462,14 +651,23 @@ static void PrefetchFileBestEffort(const string &path, const string &method) {
 
 static void PrefetchPipelineFiles(vector<string> fact_paths, string dimension_file) {
 	auto method = ReadEnvString("DUCKDB_GPU_PREFETCH_METHOD", "both");
-	if (method != "fadvise" && method != "readahead" && method != "both") {
+	if (method != "fadvise" && method != "readahead" && method != "both" && method != "io_uring") {
 		method = "both";
 	}
 	std::set<string> prefetch_paths;
+	const bool prefetch_dimension_files = ReadEnvFlag("DUCKDB_GPU_PREFETCH_DIMENSION_FILES", true);
+	const bool reuse_dimension_mapping = ReadEnvFlag("DUCKDB_GPU_REUSE_DIMENSION_MAPPING", false);
+	string reused_dimension_path;
 	for (auto &fact_path : fact_paths) {
 		prefetch_paths.insert(fact_path);
-		if (ReadEnvFlag("DUCKDB_GPU_PREFETCH_DIMENSION_FILES", true)) {
-			prefetch_paths.insert(ResolveDimensionPath(fact_path, dimension_file));
+		if (prefetch_dimension_files) {
+			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
+			if (!reuse_dimension_mapping) {
+				prefetch_paths.insert(dimension_path);
+			} else if (reused_dimension_path.empty()) {
+				reused_dimension_path = dimension_path;
+				prefetch_paths.insert(reused_dimension_path);
+			}
 		}
 	}
 	for (auto &path : prefetch_paths) {
