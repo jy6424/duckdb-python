@@ -2452,8 +2452,11 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 				    target_batch_rows - current.row_count < STANDARD_VECTOR_SIZE) {
 					FlushDirectMappedDecodedBatch(current, input_queue, free_slots, batch_count, prepare_push_elapsed);
 					auto prepare_start = std::chrono::steady_clock::now();
-					StartDirectMultiPipelineInputBatch(pipeline, handle, free_slots, fact_path, mapping,
-					                                   payload_columns.size(), target_batch_rows, current, false);
+					MultiPipelineChunkBatch start_batch;
+					start_batch.fact_path = fact_path;
+					start_batch.mapping = mapping;
+					StartDirectMultiPipelineBuffer(pipeline, handle, free_slots, target_batch_rows,
+					                               payload_columns.size(), start_batch, current, false);
 					prepare_work_elapsed += ElapsedSeconds(prepare_start);
 				}
 
