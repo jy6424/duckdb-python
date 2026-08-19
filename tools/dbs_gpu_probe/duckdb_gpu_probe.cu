@@ -1969,6 +1969,93 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_prepare_input_i64_double(
 	return 0;
 }
 
+extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_prepare_device_input_i64_double(
+    void *handle, uint32_t slot_idx, uint64_t capacity, uint64_t column_count) {
+	if (!handle || capacity == 0 || column_count == 0) {
+		return 1;
+	}
+
+	auto state = reinterpret_cast<FusedLatAggPipelineState *>(handle);
+	if (slot_idx >= state->slot_count) {
+		return 1;
+	}
+	auto &slot = state->slots[slot_idx];
+	if (slot.EnsureStream() || !slot.IsDevice()) {
+		return 1;
+	}
+
+	const auto grid_bytes = capacity * sizeof(int64_t);
+	const auto value_bytes = column_count * capacity * sizeof(double);
+	const auto validity_bytes = column_count * capacity * sizeof(uint8_t);
+
+	int error = 0;
+	error |= slot.grids.Ensure(grid_bytes, "resize device direct multi pipeline grids");
+	error |= slot.values.Ensure(value_bytes, "resize device direct multi pipeline values");
+	error |= slot.value_validity.Ensure(validity_bytes, "resize device direct multi pipeline validity");
+	if (error) {
+		return 1;
+	}
+
+	slot.column_count = column_count;
+	slot.value_stride = capacity;
+	return 0;
+}
+
+extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_copy_grids_i64(
+    void *handle, uint32_t slot_idx, uint64_t dst_offset, const int64_t *grids, uint64_t count) {
+	if (!handle || !grids || count == 0) {
+		return 1;
+	}
+
+	auto state = reinterpret_cast<FusedLatAggPipelineState *>(handle);
+	if (slot_idx >= state->slot_count) {
+		return 1;
+	}
+	auto &slot = state->slots[slot_idx];
+	if (slot.EnsureStream() || !slot.IsDevice() || slot.value_stride < dst_offset + count) {
+		return 1;
+	}
+
+	auto dst = slot.grids.As<int64_t>() + dst_offset;
+	return CheckCuda(cudaMemcpy(dst, grids, count * sizeof(int64_t), cudaMemcpyHostToDevice),
+	                 "copy device direct multi pipeline grids");
+}
+
+extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_copy_values_double(
+    void *handle, uint32_t slot_idx, uint64_t column_idx, uint64_t dst_offset, const double *values,
+    const uint8_t *value_validity, uint64_t count, int validity_all_valid) {
+	if (!handle || !values || count == 0) {
+		return 1;
+	}
+
+	auto state = reinterpret_cast<FusedLatAggPipelineState *>(handle);
+	if (slot_idx >= state->slot_count) {
+		return 1;
+	}
+	auto &slot = state->slots[slot_idx];
+	if (slot.EnsureStream() || !slot.IsDevice() || column_idx >= slot.column_count ||
+	    slot.value_stride < dst_offset + count) {
+		return 1;
+	}
+
+	const auto offset = column_idx * slot.value_stride + dst_offset;
+	auto dst_values = slot.values.As<double>() + offset;
+	auto dst_validity = slot.value_validity.As<uint8_t>() + offset;
+	int error = 0;
+	error |= CheckCuda(cudaMemcpy(dst_values, values, count * sizeof(double), cudaMemcpyHostToDevice),
+	                   "copy device direct multi pipeline values");
+	if (validity_all_valid) {
+		error |= CheckCuda(cudaMemset(dst_validity, 1, count * sizeof(uint8_t)),
+		                   "set device direct multi pipeline validity");
+	} else if (value_validity) {
+		error |= CheckCuda(cudaMemcpy(dst_validity, value_validity, count * sizeof(uint8_t), cudaMemcpyHostToDevice),
+		                   "copy device direct multi pipeline validity");
+	} else {
+		return 1;
+	}
+	return error ? 1 : 0;
+}
+
 extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_reset_i64_double(
     void *handle, uint32_t slot_idx, int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group,
     uint64_t build_size, uint64_t group_count, uint64_t column_count) {
@@ -2009,7 +2096,7 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_reset_i64_double(
 	} else if (slot.IsManaged()) {
 		error |= slot.managed_grid_to_group.Ensure(build_bytes, "resize managed direct multi grid to group");
 	} else {
-		return 1;
+		error |= slot.grid_to_group.Ensure(build_bytes, "resize device direct multi grid to group");
 	}
 	if (error) {
 		return 1;
@@ -2017,8 +2104,12 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_reset_i64_double(
 
 	if (slot.IsMapped()) {
 		std::memcpy(slot.mapped_grid_to_group.HostAs<int32_t>(), grid_to_group, build_bytes);
-	} else {
+	} else if (slot.IsManaged()) {
 		std::memcpy(slot.managed_grid_to_group.As<int32_t>(), grid_to_group, build_bytes);
+	} else {
+		error |= CheckCuda(cudaMemcpyAsync(slot.grid_to_group.As<int32_t>(), grid_to_group, build_bytes,
+		                                  cudaMemcpyHostToDevice, slot.stream),
+		                   "async copy device direct multi grid to group");
 	}
 	error |= CheckCuda(cudaMemsetAsync(slot.sums.As<double>(), 0, sum_bytes, slot.stream),
 	                   "async clear direct multi pipeline sums");
@@ -2054,7 +2145,7 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_submit_prepared_i64_doubl
 	if (slot.EnsureStream()) {
 		return 1;
 	}
-	if (slot.IsDevice() || slot.group_count == 0 || slot.build_size == 0) {
+	if (slot.group_count == 0 || slot.build_size == 0) {
 		return 1;
 	}
 
@@ -2067,11 +2158,16 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_submit_prepared_i64_doubl
 		d_values = slot.mapped_values.DeviceAs<double>();
 		d_value_validity = slot.mapped_value_validity.DeviceAs<uint8_t>();
 		d_grid_to_group = slot.mapped_grid_to_group.DeviceAs<int32_t>();
-	} else {
+	} else if (slot.IsManaged()) {
 		d_grids = slot.managed_grids.As<int64_t>();
 		d_values = slot.managed_values.As<double>();
 		d_value_validity = slot.managed_value_validity.As<uint8_t>();
 		d_grid_to_group = slot.managed_grid_to_group.As<int32_t>();
+	} else {
+		d_grids = slot.grids.As<int64_t>();
+		d_values = slot.values.As<double>();
+		d_value_validity = slot.value_validity.As<uint8_t>();
+		d_grid_to_group = slot.grid_to_group.As<int32_t>();
 	}
 
 	constexpr int THREADS_PER_BLOCK = 256;

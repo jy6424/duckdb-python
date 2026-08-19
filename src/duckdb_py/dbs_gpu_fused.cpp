@@ -62,6 +62,14 @@ using FusedLatAggPipelineDestroyFunc = void (*)(void *handle);
 using FusedLatAggMultiPipelinePrepareInputFunc = int (*)(void *handle, uint32_t slot_idx, uint64_t capacity,
                                                          uint64_t column_count, int64_t **grids_out,
                                                          double **values_out, uint8_t **value_validity_out);
+using FusedLatAggMultiPipelinePrepareDeviceInputFunc = int (*)(void *handle, uint32_t slot_idx, uint64_t capacity,
+                                                               uint64_t column_count);
+using FusedLatAggMultiPipelineCopyGridsFunc = int (*)(void *handle, uint32_t slot_idx, uint64_t dst_offset,
+                                                      const int64_t *grids, uint64_t count);
+using FusedLatAggMultiPipelineCopyValuesFunc = int (*)(void *handle, uint32_t slot_idx, uint64_t column_idx,
+                                                       uint64_t dst_offset, const double *values,
+                                                       const uint8_t *value_validity, uint64_t count,
+                                                       int validity_all_valid);
 using FusedLatAggMultiPipelineResetFunc = int (*)(void *handle, uint32_t slot_idx, int64_t grid_min,
                                                   int64_t grid_max, const int32_t *grid_to_group,
                                                   uint64_t build_size, uint64_t group_count,
@@ -86,6 +94,9 @@ struct FusedLatAggPipelineFuncs {
 struct FusedLatAggMultiDirectPipelineFuncs {
 	FusedLatAggPipelineCreateFunc create = nullptr;
 	FusedLatAggMultiPipelinePrepareInputFunc prepare_input = nullptr;
+	FusedLatAggMultiPipelinePrepareDeviceInputFunc prepare_device_input = nullptr;
+	FusedLatAggMultiPipelineCopyGridsFunc copy_grids = nullptr;
+	FusedLatAggMultiPipelineCopyValuesFunc copy_values = nullptr;
 	FusedLatAggMultiPipelineResetFunc reset = nullptr;
 	FusedLatAggMultiPipelineSubmitPreparedFunc submit_prepared = nullptr;
 	FusedLatAggPipelineSyncSlotFunc sync_slot = nullptr;
@@ -315,11 +326,13 @@ static FusedLatAggPipelineFuncs LoadFusedLatAggPipeline(const string &path_p) {
 	return funcs;
 }
 
-static FusedLatAggMultiDirectPipelineFuncs LoadFusedLatAggMultiDirectPipeline(const string &path_p) {
+static FusedLatAggMultiDirectPipelineFuncs LoadFusedLatAggMultiDirectPipeline(const string &path_p,
+                                                                             bool require_device_direct = false) {
 	static void *handle = nullptr;
 	static FusedLatAggMultiDirectPipelineFuncs funcs;
-	if (funcs.create && funcs.prepare_input && funcs.reset && funcs.submit_prepared && funcs.sync_slot && funcs.wait &&
-	    funcs.destroy) {
+	if (funcs.create && funcs.prepare_input && funcs.reset && funcs.submit_prepared && funcs.sync_slot &&
+	    funcs.wait && funcs.destroy &&
+	    (!require_device_direct || (funcs.prepare_device_input && funcs.copy_grids && funcs.copy_values))) {
 		return funcs;
 	}
 
@@ -342,6 +355,12 @@ static FusedLatAggMultiDirectPipelineFuncs LoadFusedLatAggMultiDirectPipeline(co
 	    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_create"));
 	funcs.prepare_input = reinterpret_cast<FusedLatAggMultiPipelinePrepareInputFunc>(
 	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_prepare_input_i64_double"));
+	funcs.prepare_device_input = reinterpret_cast<FusedLatAggMultiPipelinePrepareDeviceInputFunc>(
+	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_prepare_device_input_i64_double"));
+	funcs.copy_grids = reinterpret_cast<FusedLatAggMultiPipelineCopyGridsFunc>(
+	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_copy_grids_i64"));
+	funcs.copy_values = reinterpret_cast<FusedLatAggMultiPipelineCopyValuesFunc>(
+	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_copy_values_double"));
 	funcs.reset = reinterpret_cast<FusedLatAggMultiPipelineResetFunc>(
 	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_reset_i64_double"));
 	funcs.submit_prepared = reinterpret_cast<FusedLatAggMultiPipelineSubmitPreparedFunc>(
@@ -355,6 +374,9 @@ static FusedLatAggMultiDirectPipelineFuncs LoadFusedLatAggMultiDirectPipeline(co
 	if (!funcs.create || !funcs.prepare_input || !funcs.reset || !funcs.submit_prepared || !funcs.sync_slot ||
 	    !funcs.wait || !funcs.destroy) {
 		throw InvalidInputException("Failed to load GPU fused multi direct pipeline symbols from '%s'", path);
+	}
+	if (require_device_direct && (!funcs.prepare_device_input || !funcs.copy_grids || !funcs.copy_values)) {
+		throw InvalidInputException("Failed to load GPU fused multi device-direct pipeline symbols from '%s'", path);
 	}
 	return funcs;
 }
@@ -599,6 +621,7 @@ struct DirectMultiPipelineInputBatch {
 
 struct DirectMultiPipelineBuffer {
 	bool active = false;
+	bool device_direct = false;
 	string fact_path;
 	std::shared_ptr<GroupMapping> mapping;
 	idx_t slot = 0;
@@ -874,7 +897,7 @@ static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChu
 static void StartDirectMultiPipelineBuffer(FusedLatAggMultiDirectPipelineFuncs pipeline, void *handle,
                                            BlockingQueue<idx_t> &free_slots, idx_t target_batch_rows,
                                            idx_t column_count, const MultiPipelineChunkBatch &chunk_batch,
-                                           DirectMultiPipelineBuffer &current) {
+                                           DirectMultiPipelineBuffer &current, bool device_direct) {
 	idx_t slot = 0;
 	if (!free_slots.Pop(slot)) {
 		throw InvalidInputException("GPU fused direct multi pipeline slot queue closed");
@@ -883,15 +906,26 @@ static void StartDirectMultiPipelineBuffer(FusedLatAggMultiDirectPipelineFuncs p
 	int64_t *join_keys = nullptr;
 	double *values = nullptr;
 	uint8_t *validity = nullptr;
-	auto rc = pipeline.prepare_input(handle, static_cast<uint32_t>(slot), static_cast<uint64_t>(target_batch_rows),
-	                                 static_cast<uint64_t>(column_count), &join_keys, &values, &validity);
-	if (rc != 0 || !join_keys || !values || !validity) {
-		throw InvalidInputException("GPU fused direct multi pipeline input preparation failed for '%s'",
-		                            chunk_batch.fact_path);
+	if (device_direct) {
+		auto rc = pipeline.prepare_device_input(handle, static_cast<uint32_t>(slot),
+		                                        static_cast<uint64_t>(target_batch_rows),
+		                                        static_cast<uint64_t>(column_count));
+		if (rc != 0) {
+			throw InvalidInputException("GPU fused device-direct multi pipeline input preparation failed for '%s'",
+			                            chunk_batch.fact_path);
+		}
+	} else {
+		auto rc = pipeline.prepare_input(handle, static_cast<uint32_t>(slot), static_cast<uint64_t>(target_batch_rows),
+		                                 static_cast<uint64_t>(column_count), &join_keys, &values, &validity);
+		if (rc != 0 || !join_keys || !values || !validity) {
+			throw InvalidInputException("GPU fused direct multi pipeline input preparation failed for '%s'",
+			                            chunk_batch.fact_path);
+		}
 	}
 
 	current = DirectMultiPipelineBuffer();
 	current.active = true;
+	current.device_direct = device_direct;
 	current.fact_path = chunk_batch.fact_path;
 	current.mapping = chunk_batch.mapping;
 	current.slot = slot;
@@ -900,6 +934,52 @@ static void StartDirectMultiPipelineBuffer(FusedLatAggMultiDirectPipelineFuncs p
 	current.join_keys = join_keys;
 	current.values = values;
 	current.validity = validity;
+}
+
+static void AppendDeviceDirectMultiPreparedChunkRows(FusedLatAggMultiDirectPipelineFuncs pipeline, void *handle,
+                                                     DirectMultiPipelineBuffer &batch, DataChunk &chunk,
+                                                     idx_t &row_offset, idx_t column_count,
+                                                     idx_t target_batch_rows, vector<uint8_t> &validity_scratch) {
+	auto count = chunk.size();
+	auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
+	auto &join_validity = FlatVector::Validity(chunk.data[0]);
+	if (!join_validity.AllValid()) {
+		throw InvalidInputException("pipeline-device-direct requires non-null join keys");
+	}
+
+	auto remaining_rows = count - row_offset;
+	auto remaining_capacity = target_batch_rows - batch.row_count;
+	auto append_count = std::min(remaining_rows, remaining_capacity);
+	if (append_count == 0) {
+		return;
+	}
+
+	auto output_row = batch.row_count;
+	auto rc = pipeline.copy_grids(handle, static_cast<uint32_t>(batch.slot), static_cast<uint64_t>(output_row),
+	                              join_data + row_offset, static_cast<uint64_t>(append_count));
+	if (rc != 0) {
+		throw InvalidInputException("GPU fused device-direct grid copy failed for '%s'", batch.fact_path);
+	}
+
+	for (idx_t column = 0; column < column_count; column++) {
+		auto value_data = FlatVector::GetData<double>(chunk.data[1 + column]);
+		auto &value_validity = FlatVector::Validity(chunk.data[1 + column]);
+		const uint8_t *validity_data = nullptr;
+		auto all_valid = value_validity.AllValid();
+		if (!all_valid) {
+			validity_scratch.resize(append_count);
+			CopyValidityToBytes(validity_scratch.data(), value_validity, row_offset, append_count);
+			validity_data = validity_scratch.data();
+		}
+		rc = pipeline.copy_values(handle, static_cast<uint32_t>(batch.slot), static_cast<uint64_t>(column),
+		                          static_cast<uint64_t>(output_row), value_data + row_offset, validity_data,
+		                          static_cast<uint64_t>(append_count), all_valid ? 1 : 0);
+		if (rc != 0) {
+			throw InvalidInputException("GPU fused device-direct value copy failed for '%s'", batch.fact_path);
+		}
+	}
+	batch.row_count += append_count;
+	row_offset += append_count;
 }
 
 static void AppendDirectMultiPreparedChunkRows(DirectMultiPipelineBuffer &batch, DataChunk &chunk, idx_t &row_offset,
@@ -1506,7 +1586,7 @@ static void PrepareDirectMultiPipelineChunkBatches(FusedLatAggMultiDirectPipelin
                                                    BlockingQueue<DirectMultiPipelineInputBatch> &input_queue,
                                                    BlockingQueue<idx_t> &free_slots, idx_t column_count,
                                                    std::exception_ptr &error_out, std::mutex &error_lock,
-                                                   MultiPipelineStageTimers *timers) {
+                                                   MultiPipelineStageTimers *timers, bool device_direct = false) {
 	auto stage_start = std::chrono::steady_clock::now();
 	uint64_t batch_count = 0;
 	double pop_elapsed = 0;
@@ -1520,6 +1600,7 @@ static void PrepareDirectMultiPipelineChunkBatches(FusedLatAggMultiDirectPipelin
 			    "DUCKDB_GPU_PIPELINE_BATCH_ROWS and DUCKDB_GPU_PIPELINE_BATCH_CHUNKS must be > 0");
 		}
 		DirectMultiPipelineBuffer current;
+		vector<uint8_t> validity_scratch;
 
 		auto flush_current = [&]() {
 			if (!current.active) {
@@ -1567,7 +1648,7 @@ static void PrepareDirectMultiPipelineChunkBatches(FusedLatAggMultiDirectPipelin
 				}
 				if (!current.active) {
 					StartDirectMultiPipelineBuffer(pipeline, handle, free_slots, target_batch_rows, column_count,
-					                               chunk_batch, current);
+					                               chunk_batch, current, device_direct);
 				}
 				if (!counted_chunk) {
 					current.chunks++;
@@ -1575,8 +1656,14 @@ static void PrepareDirectMultiPipelineChunkBatches(FusedLatAggMultiDirectPipelin
 				}
 
 				auto work_start = std::chrono::steady_clock::now();
-				AppendDirectMultiPreparedChunkRows(current, *chunk_batch.chunk, row_offset, column_count,
-				                                   target_batch_rows);
+				if (current.device_direct) {
+					AppendDeviceDirectMultiPreparedChunkRows(pipeline, handle, current, *chunk_batch.chunk,
+					                                         row_offset, column_count, target_batch_rows,
+					                                         validity_scratch);
+				} else {
+					AppendDirectMultiPreparedChunkRows(current, *chunk_batch.chunk, row_offset, column_count,
+					                                   target_batch_rows);
+				}
 				work_elapsed += ElapsedSeconds(work_start);
 				if (current.row_count >= target_batch_rows || current.chunks >= target_batch_chunks) {
 					flush_current();
@@ -1930,8 +2017,7 @@ static void RunDirectPipelineGPUWorker(FusedLatAggPipelineFuncs pipeline, void *
 		};
 
 		while (input_queue.Pop(batch)) {
-			if (!active_file.active || active_file.fact_path != batch.fact_path ||
-			    active_file.mapping != batch.mapping) {
+			if (!active_file.active || active_file.mapping != batch.mapping) {
 				flush_active_file();
 				reset_for_file(batch);
 			}
@@ -2490,13 +2576,16 @@ static py::dict DBSGPUFusedLatPipeline(const py::iterable &fact_paths_p, const s
 static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::object &payload_columns_p,
                                     const string &join_key, const string &group_column,
                                     const string &dimension_file, const string &lib_path, const string &mode) {
+	const bool pipeline_device_direct_mode = mode == "pipeline-device-direct";
 	const bool pipeline_mapped_direct_mode = mode == "pipeline-mapped-direct";
-	const bool pipeline_mode = mode == "pipeline-device" || mode == "pipeline-mapped" || pipeline_mapped_direct_mode;
+	const bool pipeline_direct_mode = pipeline_device_direct_mode || pipeline_mapped_direct_mode;
+	const bool pipeline_mode = mode == "pipeline-device" || mode == "pipeline-mapped" || pipeline_direct_mode;
 	const bool mapped = mode == "mapped" || mode == "pipeline-mapped";
 	if (mode != "device" && mode != "mapped" && mode != "pipeline-device" && mode != "pipeline-mapped" &&
-	    mode != "pipeline-mapped-direct") {
+	    mode != "pipeline-device-direct" && mode != "pipeline-mapped-direct") {
 		throw InvalidInputException(
-		    "mode must be 'device', 'mapped', 'pipeline-device', 'pipeline-mapped', or 'pipeline-mapped-direct'");
+		    "mode must be 'device', 'mapped', 'pipeline-device', 'pipeline-mapped', 'pipeline-device-direct', "
+		    "or 'pipeline-mapped-direct'");
 	}
 
 	vector<string> fact_paths;
@@ -2530,14 +2619,11 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		std::exception_ptr worker_error;
 		std::mutex worker_error_lock;
 
-		if (pipeline_mapped_direct_mode) {
-			if (reader_thread_count != 1) {
-				throw InvalidInputException(
-				    "pipeline-mapped-direct currently requires DUCKDB_GPU_PIPELINE_READER_THREADS=1");
-			}
+		if (pipeline_direct_mode) {
 			constexpr idx_t PIPELINE_SLOTS = 2;
-			auto direct_pipeline = LoadFusedLatAggMultiDirectPipeline(lib_path);
-			void *handle = direct_pipeline.create(static_cast<uint32_t>(PIPELINE_SLOTS), 1);
+			auto direct_pipeline = LoadFusedLatAggMultiDirectPipeline(lib_path, pipeline_device_direct_mode);
+			void *handle =
+			    direct_pipeline.create(static_cast<uint32_t>(PIPELINE_SLOTS), pipeline_device_direct_mode ? 0 : 1);
 			if (!handle) {
 				throw InvalidInputException("GPU fused direct multi pipeline create failed");
 			}
@@ -2548,14 +2634,35 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 			for (idx_t slot = 0; slot < PIPELINE_SLOTS; slot++) {
 				free_slots.Push(slot);
 			}
-			std::thread reader_thread(ReadMultiPipelineChunkBatches, std::ref(db), std::cref(fact_paths),
-			                          std::cref(payload_columns), std::cref(join_key), std::cref(group_column),
-			                          std::cref(dimension_file), std::ref(chunk_queue), std::ref(worker_error),
-			                          std::ref(worker_error_lock), &stage_timers);
+			BlockingQueue<string> file_queue(0);
+			std::map<string, std::shared_ptr<GroupMapping>> dimension_mapping_cache;
+			std::mutex dimension_mapping_cache_lock;
+			vector<std::thread> reader_threads;
+			std::thread reader_thread;
+			if (reader_thread_count == 1) {
+				reader_thread = std::thread(ReadMultiPipelineChunkBatches, std::ref(db), std::cref(fact_paths),
+				                            std::cref(payload_columns), std::cref(join_key), std::cref(group_column),
+				                            std::cref(dimension_file), std::ref(chunk_queue), std::ref(worker_error),
+				                            std::ref(worker_error_lock), &stage_timers);
+			} else {
+				for (auto &fact_path : fact_paths) {
+					file_queue.Push(fact_path);
+				}
+				file_queue.Close();
+				reader_threads.reserve(reader_thread_count);
+				for (idx_t reader = 0; reader < reader_thread_count; reader++) {
+					reader_threads.emplace_back(ReadMultiPipelineChunkBatchWorker, std::ref(db), std::ref(file_queue),
+					                            std::cref(payload_columns), std::cref(join_key),
+					                            std::cref(group_column), std::cref(dimension_file),
+					                            std::ref(chunk_queue), std::ref(dimension_mapping_cache),
+					                            std::ref(dimension_mapping_cache_lock), std::ref(worker_error),
+					                            std::ref(worker_error_lock), &stage_timers);
+				}
+			}
 			std::thread prepare_thread(PrepareDirectMultiPipelineChunkBatches, direct_pipeline, handle,
 			                           std::ref(chunk_queue), std::ref(input_queue), std::ref(free_slots),
 			                           column_count, std::ref(worker_error), std::ref(worker_error_lock),
-			                           &stage_timers);
+			                           &stage_timers, pipeline_device_direct_mode);
 			std::thread gpu_thread(RunDirectMultiPipelineGPUWorker, direct_pipeline, handle, PIPELINE_SLOTS,
 			                       std::ref(input_queue), std::ref(output_queue), std::ref(free_slots),
 			                       column_count, std::ref(worker_error), std::ref(worker_error_lock),
@@ -2565,7 +2672,14 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 			                         std::ref(worker_error_lock), &stage_timers);
 
 			try {
-				reader_thread.join();
+				if (reader_thread_count == 1) {
+					reader_thread.join();
+				} else {
+					for (auto &reader_thread_item : reader_threads) {
+						reader_thread_item.join();
+					}
+					chunk_queue.Close();
+				}
 				prepare_thread.join();
 				gpu_thread.join();
 				merge_thread.join();
@@ -2578,8 +2692,14 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 				input_queue.Close();
 				output_queue.Close();
 				free_slots.Close();
+				file_queue.Close();
 				if (reader_thread.joinable()) {
 					reader_thread.join();
+				}
+				for (auto &reader_thread_item : reader_threads) {
+					if (reader_thread_item.joinable()) {
+						reader_thread_item.join();
+					}
 				}
 				if (prepare_thread.joinable()) {
 					prepare_thread.join();

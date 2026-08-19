@@ -32,6 +32,7 @@ def parse_args():
             "device",
             "mapped",
             "pipeline-device",
+            "pipeline-device-direct",
             "pipeline-mapped",
             "pipeline-mapped-direct",
             "pipeline-managed",
@@ -108,9 +109,8 @@ def main():
         raise SystemExit("no payload columns specified")
     if len(payload_columns) > 1 and args.mode in ("pipeline-managed", "pipeline-cpu"):
         raise SystemExit(
-            "{} does not support --vars yet; use pipeline-device, pipeline-mapped, or pipeline-mapped-direct".format(
-                args.mode
-            )
+            "{} does not support --vars yet; use pipeline-device, pipeline-device-direct, pipeline-mapped, "
+            "or pipeline-mapped-direct".format(args.mode)
         )
 
     before_io = read_proc_io()
