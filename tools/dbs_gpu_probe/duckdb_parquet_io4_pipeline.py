@@ -27,6 +27,7 @@ def parse_args():
     parser.add_argument("--reuse-dimension-mapping", action="store_true")
     parser.add_argument("--prefetch-files", action="store_true")
     parser.add_argument("--prefetch-method", default="both", choices=["fadvise", "readahead", "both", "io_uring"])
+    parser.add_argument("--duckdb-parquet-async-prefetch", action="store_true")
     parser.add_argument(
         "--reader-duckdb-threads",
         type=int,
@@ -129,6 +130,8 @@ def main():
     if args.prefetch_files:
         os.environ["DUCKDB_GPU_PREFETCH_FILES"] = "1"
         os.environ["DUCKDB_GPU_PREFETCH_METHOD"] = args.prefetch_method
+    if args.duckdb_parquet_async_prefetch:
+        os.environ["DUCKDB_PARQUET_ASYNC_PREFETCH"] = "1"
     if args.reader_duckdb_threads is not None:
         if args.reader_duckdb_threads <= 0:
             raise SystemExit("--reader-duckdb-threads must be positive")
@@ -167,6 +170,8 @@ def main():
     print("[reader threads]: {}".format(os.environ.get("DUCKDB_GPU_PIPELINE_READER_THREADS", "1")))
     if args.prefetch_files:
         print("[prefetch]: {}".format(args.prefetch_method))
+    if args.duckdb_parquet_async_prefetch:
+        print("[duckdb parquet async prefetch]: on")
     print("[payload columns]: {}".format(",".join(payload_columns)))
     if args.print_stage_times and "stage_times" in result:
         stage = result["stage_times"]

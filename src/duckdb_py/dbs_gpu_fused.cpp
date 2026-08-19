@@ -412,17 +412,23 @@ static unique_ptr<QueryResult> RunStreamingQuery(Connection &connection, const s
 
 static void ConfigurePipelineReaderConnection(Connection &connection) {
 	auto value = std::getenv("DUCKDB_GPU_READER_DUCKDB_THREADS");
-	if (!value || !value[0]) {
-		return;
+	if (value && value[0]) {
+		char *end = nullptr;
+		auto parsed = std::strtoull(value, &end, 10);
+		if (!end || *end != '\0' || parsed == 0) {
+			throw InvalidInputException("DUCKDB_GPU_READER_DUCKDB_THREADS must be a positive integer");
+		}
+		auto result = connection.Query("SET threads=" + std::to_string(parsed));
+		if (result->HasError()) {
+			result->ThrowError();
+		}
 	}
-	char *end = nullptr;
-	auto parsed = std::strtoull(value, &end, 10);
-	if (!end || *end != '\0' || parsed == 0) {
-		throw InvalidInputException("DUCKDB_GPU_READER_DUCKDB_THREADS must be a positive integer");
-	}
-	auto result = connection.Query("SET threads=" + std::to_string(parsed));
-	if (result->HasError()) {
-		result->ThrowError();
+	if (ReadEnvFlag("DUCKDB_PARQUET_ASYNC_PREFETCH", false) ||
+	    ReadEnvFlag("DUCKDB_PARQUET_PREFETCH_ALL_FILES", false)) {
+		auto result = connection.Query("SET prefetch_all_parquet_files=true");
+		if (result->HasError()) {
+			result->ThrowError();
+		}
 	}
 }
 
