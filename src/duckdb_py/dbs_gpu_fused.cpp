@@ -3,6 +3,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "../../external/duckdb/extension/parquet/include/parquet_reader.hpp"
 
 #include <chrono>
 #include <algorithm>
@@ -181,8 +182,10 @@ static string FirstFactPath(const string &fact_path) {
 
 static string BuildReadParquetExpression(const string &fact_path) {
 	auto paths = SplitFactPathGroup(fact_path);
+	const string options =
+	    ", union_by_name=false, hive_partitioning=false, filename=false, file_row_number=false, binary_as_string=false";
 	if (paths.size() == 1) {
-		return "read_parquet('" + EscapeSQLString(paths[0]) + "')";
+		return "read_parquet('" + EscapeSQLString(paths[0]) + "'" + options + ")";
 	}
 
 	string result = "read_parquet([";
@@ -192,8 +195,12 @@ static string BuildReadParquetExpression(const string &fact_path) {
 		}
 		result += "'" + EscapeSQLString(paths[path]) + "'";
 	}
-	result += "])";
+	result += "]" + options + ")";
 	return result;
+}
+
+static string BuildReadParquetExpressionForPath(const string &path) {
+	return BuildReadParquetExpression(path);
 }
 
 static string ResolveDimensionPath(const string &fact_path, const string &dimension_file) {
@@ -236,6 +243,10 @@ static string ReadEnvString(const char *name, const string &default_value) {
 
 static bool UseRawGpuFetch() {
 	return ReadEnvFlag("DUCKDB_GPU_FETCH_RAW", false);
+}
+
+static bool InferGridFromRowOrder() {
+	return ReadEnvFlag("DUCKDB_GPU_INFER_GRID_FROM_ROW_ORDER", false);
 }
 
 static unique_ptr<DataChunk> FetchGpuPipelineChunk(QueryResult &result) {
@@ -502,6 +513,10 @@ static unique_ptr<QueryResult> RunStreamingQuery(Connection &connection, const s
 }
 
 static void ConfigurePipelineReaderConnection(Connection &connection) {
+	auto preserve_result = connection.Query("SET preserve_insertion_order=false");
+	if (preserve_result->HasError()) {
+		preserve_result->ThrowError();
+	}
 	auto value = std::getenv("DUCKDB_GPU_READER_DUCKDB_THREADS");
 	if (value && value[0]) {
 		char *end = nullptr;
@@ -817,8 +832,8 @@ struct GroupMapping {
 static GroupMapping ReadGroupMapping(Connection &connection, const string &dimension_path, const string &join_key,
                                      const string &group_column) {
 	auto query = StringUtil::Format(
-	    "SELECT %s AS join_key, %s AS group_value FROM read_parquet('%s')",
-	    QuoteIdentifier(join_key), QuoteIdentifier(group_column), EscapeSQLString(dimension_path));
+	    "SELECT %s AS join_key, %s AS group_value FROM %s",
+	    QuoteIdentifier(join_key), QuoteIdentifier(group_column), BuildReadParquetExpressionForPath(dimension_path));
 	auto result = RunStreamingQuery(connection, query);
 
 	vector<int64_t> join_keys;
@@ -881,13 +896,63 @@ static GroupMapping ReadGroupMapping(Connection &connection, const string &dimen
 	return mapping;
 }
 
+static GroupMapping ReadGroupMappingByRowNumber(Connection &connection, const string &dimension_path,
+                                                const string &group_column) {
+	auto query = StringUtil::Format("SELECT %s AS group_value FROM %s", QuoteIdentifier(group_column),
+	                                BuildReadParquetExpressionForPath(dimension_path));
+	auto result = RunStreamingQuery(connection, query);
+
+	GroupMapping mapping;
+	std::map<double, int32_t> group_ids;
+	while (true) {
+		auto chunk = FetchGpuPipelineChunk(*result);
+		if (!chunk || chunk->size() == 0) {
+			break;
+		}
+		auto count = chunk->size();
+		UnifiedColumnReader<double> group_data(chunk->data[0], count);
+		mapping.join_to_group.reserve(mapping.join_to_group.size() + count);
+		for (idx_t row = 0; row < count; row++) {
+			if (!group_data.RowIsValid(row)) {
+				throw InvalidInputException("row-order grid inference requires non-null dimension groups");
+			}
+			auto group_value = group_data.Value(row);
+			auto entry = group_ids.find(group_value);
+			if (entry == group_ids.end()) {
+				auto group_id = static_cast<int32_t>(group_ids.size());
+				entry = group_ids.emplace(group_value, group_id).first;
+			}
+			mapping.join_to_group.push_back(entry->second);
+		}
+	}
+	if (mapping.join_to_group.empty()) {
+		throw InvalidInputException("Invalid or empty dimension parquet file '%s'", dimension_path);
+	}
+	mapping.join_min = 0;
+	mapping.join_max = static_cast<int64_t>(mapping.join_to_group.size() - 1);
+	mapping.group_values.reserve(group_ids.size());
+	for (auto &entry : group_ids) {
+		mapping.group_values.push_back(entry.first);
+	}
+	return mapping;
+}
+
+static GroupMapping ReadGroupMappingForCurrentMode(Connection &connection, const string &dimension_path,
+                                                   const string &join_key, const string &group_column) {
+	if (InferGridFromRowOrder()) {
+		return ReadGroupMappingByRowNumber(connection, dimension_path, group_column);
+	}
+	return ReadGroupMapping(connection, dimension_path, join_key, group_column);
+}
+
 static string DimensionMappingCacheKey(const string &dimension_path, const string &dimension_file,
                                        const string &join_key, const string &group_column,
                                        bool reuse_dimension_mapping) {
+	auto prefix = InferGridFromRowOrder() ? "row_order:" : "grid_key:";
 	if (reuse_dimension_mapping) {
-		return "reuse:" + dimension_file + ":" + join_key + ":" + group_column;
+		return prefix + "reuse:" + dimension_file + ":" + join_key + ":" + group_column;
 	}
-	return "path:" + dimension_path + ":" + join_key + ":" + group_column;
+	return prefix + "path:" + dimension_path + ":" + join_key + ":" + group_column;
 }
 
 struct ProbeColumns {
@@ -1014,6 +1079,7 @@ struct MultiPipelineChunkBatch {
 	string fact_path;
 	std::shared_ptr<GroupMapping> mapping;
 	std::unique_ptr<DataChunk> chunk;
+	idx_t row_base = 0;
 };
 
 struct MultiPipelineInputBatch {
@@ -1145,6 +1211,18 @@ static void CopyValidityToBytes(uint8_t *target, const ValidityMask &validity, i
 	}
 }
 
+static idx_t MultiPayloadColumnOffset() {
+	return InferGridFromRowOrder() ? 0 : 1;
+}
+
+static int64_t RowOrderJoinKey(const GroupMapping &mapping, idx_t row_number) {
+	auto mapping_size = mapping.join_to_group.size();
+	if (mapping_size == 0) {
+		throw InvalidInputException("row-order grid inference requires a non-empty dimension mapping");
+	}
+	return static_cast<int64_t>(row_number % mapping_size);
+}
+
 static void AppendMultiRawProbeChunk(DataChunk &chunk, MultiPipelineRawBatch &batch, idx_t column_count) {
 	auto count = chunk.size();
 	UnifiedColumnReader<int64_t> join_data(chunk.data[0], count);
@@ -1258,23 +1336,28 @@ static void StartMultiPipelineInputBatch(MultiPipelineInputBatch &batch, const s
 	batch.validity.resize(column_count * target_batch_rows);
 }
 
-static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChunk &chunk, idx_t &row_offset,
-                                         idx_t column_count, idx_t target_batch_rows) {
+static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChunk &chunk, idx_t chunk_row_base,
+                                         idx_t &row_offset, idx_t column_count, idx_t target_batch_rows) {
 	auto count = chunk.size();
+	auto payload_offset = MultiPayloadColumnOffset();
 	if (!UseRawGpuFetch()) {
-		auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
-		auto &join_validity = FlatVector::Validity(chunk.data[0]);
+		const int64_t *join_data = nullptr;
+		ValidityMask *join_validity = nullptr;
+		if (!InferGridFromRowOrder()) {
+			join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
+			join_validity = &FlatVector::Validity(chunk.data[0]);
+		}
 
 		vector<const double *> value_data;
 		vector<ValidityMask *> value_validity;
 		value_data.reserve(column_count);
 		value_validity.reserve(column_count);
 		for (idx_t column = 0; column < column_count; column++) {
-			value_data.push_back(FlatVector::GetData<double>(chunk.data[1 + column]));
-			value_validity.push_back(&FlatVector::Validity(chunk.data[1 + column]));
+			value_data.push_back(FlatVector::GetData<double>(chunk.data[payload_offset + column]));
+			value_validity.push_back(&FlatVector::Validity(chunk.data[payload_offset + column]));
 		}
 
-		if (join_validity.AllValid()) {
+		if (InferGridFromRowOrder() || join_validity->AllValid()) {
 			auto remaining_rows = count - row_offset;
 			auto remaining_capacity = target_batch_rows - batch.row_count;
 			auto append_count = std::min(remaining_rows, remaining_capacity);
@@ -1283,8 +1366,14 @@ static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChu
 			}
 
 			auto output_row = batch.row_count;
-			batch.join_keys.insert(batch.join_keys.end(), join_data + row_offset,
-			                       join_data + row_offset + append_count);
+			if (InferGridFromRowOrder()) {
+				for (idx_t row = 0; row < append_count; row++) {
+					batch.join_keys.push_back(RowOrderJoinKey(*batch.mapping, chunk_row_base + row_offset + row));
+				}
+			} else {
+				batch.join_keys.insert(batch.join_keys.end(), join_data + row_offset,
+				                       join_data + row_offset + append_count);
+			}
 			for (idx_t column = 0; column < column_count; column++) {
 				auto output_offset = column * batch.value_stride + output_row;
 				std::memcpy(batch.values.data() + output_offset, value_data[column] + row_offset,
@@ -1299,7 +1388,7 @@ static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChu
 
 		while (row_offset < count && batch.row_count < target_batch_rows) {
 			auto row = row_offset++;
-			if (!join_validity.RowIsValid(row)) {
+			if (!join_validity->RowIsValid(row)) {
 				continue;
 			}
 
@@ -1315,15 +1404,18 @@ static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChu
 		return;
 	}
 
-	UnifiedColumnReader<int64_t> join_data(chunk.data[0], count);
+	std::unique_ptr<UnifiedColumnReader<int64_t>> join_data;
+	if (!InferGridFromRowOrder()) {
+		join_data = make_uniq<UnifiedColumnReader<int64_t>>(chunk.data[0], count);
+	}
 
 	vector<UnifiedColumnReader<double>> value_data;
 	value_data.reserve(column_count);
 	for (idx_t column = 0; column < column_count; column++) {
-		value_data.emplace_back(chunk.data[1 + column], count);
+		value_data.emplace_back(chunk.data[payload_offset + column], count);
 	}
 
-	if (join_data.format.validity.AllValid()) {
+	if (InferGridFromRowOrder() || join_data->format.validity.AllValid()) {
 		auto remaining_rows = count - row_offset;
 		auto remaining_capacity = target_batch_rows - batch.row_count;
 		auto append_count = std::min(remaining_rows, remaining_capacity);
@@ -1333,7 +1425,11 @@ static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChu
 
 		auto output_row = batch.row_count;
 		for (idx_t row = 0; row < append_count; row++) {
-			batch.join_keys.push_back(join_data.Value(row_offset + row));
+			if (InferGridFromRowOrder()) {
+				batch.join_keys.push_back(RowOrderJoinKey(*batch.mapping, chunk_row_base + row_offset + row));
+			} else {
+				batch.join_keys.push_back(join_data->Value(row_offset + row));
+			}
 		}
 		for (idx_t column = 0; column < column_count; column++) {
 			auto output_offset = column * batch.value_stride + output_row;
@@ -1348,12 +1444,12 @@ static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChu
 
 	while (row_offset < count && batch.row_count < target_batch_rows) {
 		auto row = row_offset++;
-		if (!join_data.RowIsValid(row)) {
+		if (!join_data->RowIsValid(row)) {
 			continue;
 		}
 
 		auto output_row = batch.row_count;
-		batch.join_keys.push_back(join_data.Value(row));
+		batch.join_keys.push_back(join_data->Value(row));
 		for (idx_t column = 0; column < column_count; column++) {
 			auto offset = column * batch.value_stride + output_row;
 			batch.values[offset] = value_data[column].Value(row);
@@ -1407,13 +1503,20 @@ static void StartDirectMultiPipelineBuffer(FusedLatAggMultiDirectPipelineFuncs p
 
 static void AppendDeviceDirectMultiPreparedChunkRows(FusedLatAggMultiDirectPipelineFuncs pipeline, void *handle,
                                                      DirectMultiPipelineBuffer &batch, DataChunk &chunk,
-                                                     idx_t &row_offset, idx_t column_count,
+                                                     idx_t chunk_row_base, idx_t &row_offset, idx_t column_count,
                                                      idx_t target_batch_rows, vector<uint8_t> &validity_scratch) {
 	auto count = chunk.size();
+	auto payload_offset = MultiPayloadColumnOffset();
 	if (!UseRawGpuFetch()) {
-		auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
-		auto &join_validity = FlatVector::Validity(chunk.data[0]);
-		if (!join_validity.AllValid()) {
+		const int64_t *join_data = nullptr;
+		if (!InferGridFromRowOrder()) {
+			join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
+			auto &join_validity = FlatVector::Validity(chunk.data[0]);
+			if (!join_validity.AllValid()) {
+				throw InvalidInputException("pipeline-device-direct requires non-null join keys");
+			}
+		}
+		if (!InferGridFromRowOrder() && !join_data) {
 			throw InvalidInputException("pipeline-device-direct requires non-null join keys");
 		}
 
@@ -1425,15 +1528,26 @@ static void AppendDeviceDirectMultiPreparedChunkRows(FusedLatAggMultiDirectPipel
 		}
 
 		auto output_row = batch.row_count;
+		vector<int64_t> join_scratch;
+		const int64_t *join_source = nullptr;
+		if (InferGridFromRowOrder()) {
+			join_scratch.resize(append_count);
+			for (idx_t row = 0; row < append_count; row++) {
+				join_scratch[row] = RowOrderJoinKey(*batch.mapping, chunk_row_base + row_offset + row);
+			}
+			join_source = join_scratch.data();
+		} else {
+			join_source = join_data + row_offset;
+		}
 		auto rc = pipeline.copy_grids(handle, static_cast<uint32_t>(batch.slot), static_cast<uint64_t>(output_row),
-		                              join_data + row_offset, static_cast<uint64_t>(append_count));
+		                              join_source, static_cast<uint64_t>(append_count));
 		if (rc != 0) {
 			throw InvalidInputException("GPU fused device-direct grid copy failed for '%s'", batch.fact_path);
 		}
 
 		for (idx_t column = 0; column < column_count; column++) {
-			auto value_data = FlatVector::GetData<double>(chunk.data[1 + column]);
-			auto &value_validity = FlatVector::Validity(chunk.data[1 + column]);
+			auto value_data = FlatVector::GetData<double>(chunk.data[payload_offset + column]);
+			auto &value_validity = FlatVector::Validity(chunk.data[payload_offset + column]);
 			const uint8_t *validity_data = nullptr;
 			auto all_valid = value_validity.AllValid();
 			if (!all_valid) {
@@ -1453,9 +1567,12 @@ static void AppendDeviceDirectMultiPreparedChunkRows(FusedLatAggMultiDirectPipel
 		return;
 	}
 
-	UnifiedColumnReader<int64_t> join_data(chunk.data[0], count);
-	if (!join_data.format.validity.AllValid()) {
-		throw InvalidInputException("pipeline-device-direct requires non-null join keys");
+	std::unique_ptr<UnifiedColumnReader<int64_t>> join_data;
+	if (!InferGridFromRowOrder()) {
+		join_data = make_uniq<UnifiedColumnReader<int64_t>>(chunk.data[0], count);
+		if (!join_data->format.validity.AllValid()) {
+			throw InvalidInputException("pipeline-device-direct requires non-null join keys");
+		}
 	}
 
 	auto remaining_rows = count - row_offset;
@@ -1468,7 +1585,13 @@ static void AppendDeviceDirectMultiPreparedChunkRows(FusedLatAggMultiDirectPipel
 	auto output_row = batch.row_count;
 	vector<int64_t> join_scratch;
 	join_scratch.resize(append_count);
-	CopyUnifiedValues(join_scratch.data(), join_data, row_offset, append_count);
+	if (InferGridFromRowOrder()) {
+		for (idx_t row = 0; row < append_count; row++) {
+			join_scratch[row] = RowOrderJoinKey(*batch.mapping, chunk_row_base + row_offset + row);
+		}
+	} else {
+		CopyUnifiedValues(join_scratch.data(), *join_data, row_offset, append_count);
+	}
 	auto rc = pipeline.copy_grids(handle, static_cast<uint32_t>(batch.slot), static_cast<uint64_t>(output_row),
 	                              join_scratch.data(), static_cast<uint64_t>(append_count));
 	if (rc != 0) {
@@ -1476,7 +1599,7 @@ static void AppendDeviceDirectMultiPreparedChunkRows(FusedLatAggMultiDirectPipel
 	}
 
 	for (idx_t column = 0; column < column_count; column++) {
-		UnifiedColumnReader<double> value_data(chunk.data[1 + column], count);
+		UnifiedColumnReader<double> value_data(chunk.data[payload_offset + column], count);
 		const uint8_t *validity_data = nullptr;
 		auto all_valid = value_data.format.validity.AllValid();
 		vector<double> value_scratch;
@@ -1498,23 +1621,28 @@ static void AppendDeviceDirectMultiPreparedChunkRows(FusedLatAggMultiDirectPipel
 	row_offset += append_count;
 }
 
-static void AppendDirectMultiPreparedChunkRows(DirectMultiPipelineBuffer &batch, DataChunk &chunk, idx_t &row_offset,
-                                              idx_t column_count, idx_t target_batch_rows) {
+static void AppendDirectMultiPreparedChunkRows(DirectMultiPipelineBuffer &batch, DataChunk &chunk, idx_t chunk_row_base,
+                                              idx_t &row_offset, idx_t column_count, idx_t target_batch_rows) {
 	auto count = chunk.size();
+	auto payload_offset = MultiPayloadColumnOffset();
 	if (!UseRawGpuFetch()) {
-		auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
-		auto &join_validity = FlatVector::Validity(chunk.data[0]);
+		const int64_t *join_data = nullptr;
+		ValidityMask *join_validity = nullptr;
+		if (!InferGridFromRowOrder()) {
+			join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
+			join_validity = &FlatVector::Validity(chunk.data[0]);
+		}
 
 		vector<const double *> value_data;
 		vector<ValidityMask *> value_validity;
 		value_data.reserve(column_count);
 		value_validity.reserve(column_count);
 		for (idx_t column = 0; column < column_count; column++) {
-			value_data.push_back(FlatVector::GetData<double>(chunk.data[1 + column]));
-			value_validity.push_back(&FlatVector::Validity(chunk.data[1 + column]));
+			value_data.push_back(FlatVector::GetData<double>(chunk.data[payload_offset + column]));
+			value_validity.push_back(&FlatVector::Validity(chunk.data[payload_offset + column]));
 		}
 
-		if (join_validity.AllValid()) {
+		if (InferGridFromRowOrder() || join_validity->AllValid()) {
 			auto remaining_rows = count - row_offset;
 			auto remaining_capacity = target_batch_rows - batch.row_count;
 			auto append_count = std::min(remaining_rows, remaining_capacity);
@@ -1523,7 +1651,14 @@ static void AppendDirectMultiPreparedChunkRows(DirectMultiPipelineBuffer &batch,
 			}
 
 			auto output_row = batch.row_count;
-			std::memcpy(batch.join_keys + output_row, join_data + row_offset, append_count * sizeof(int64_t));
+			if (InferGridFromRowOrder()) {
+				for (idx_t row = 0; row < append_count; row++) {
+					batch.join_keys[output_row + row] =
+					    RowOrderJoinKey(*batch.mapping, chunk_row_base + row_offset + row);
+				}
+			} else {
+				std::memcpy(batch.join_keys + output_row, join_data + row_offset, append_count * sizeof(int64_t));
+			}
 			for (idx_t column = 0; column < column_count; column++) {
 				auto output_offset = column * batch.value_stride + output_row;
 				std::memcpy(batch.values + output_offset, value_data[column] + row_offset,
@@ -1538,7 +1673,7 @@ static void AppendDirectMultiPreparedChunkRows(DirectMultiPipelineBuffer &batch,
 
 		while (row_offset < count && batch.row_count < target_batch_rows) {
 			auto row = row_offset++;
-			if (!join_validity.RowIsValid(row)) {
+			if (!join_validity->RowIsValid(row)) {
 				continue;
 			}
 
@@ -1554,15 +1689,18 @@ static void AppendDirectMultiPreparedChunkRows(DirectMultiPipelineBuffer &batch,
 		return;
 	}
 
-	UnifiedColumnReader<int64_t> join_data(chunk.data[0], count);
+	std::unique_ptr<UnifiedColumnReader<int64_t>> join_data;
+	if (!InferGridFromRowOrder()) {
+		join_data = make_uniq<UnifiedColumnReader<int64_t>>(chunk.data[0], count);
+	}
 
 	vector<UnifiedColumnReader<double>> value_data;
 	value_data.reserve(column_count);
 	for (idx_t column = 0; column < column_count; column++) {
-		value_data.emplace_back(chunk.data[1 + column], count);
+		value_data.emplace_back(chunk.data[payload_offset + column], count);
 	}
 
-	if (join_data.format.validity.AllValid()) {
+	if (InferGridFromRowOrder() || join_data->format.validity.AllValid()) {
 		auto remaining_rows = count - row_offset;
 		auto remaining_capacity = target_batch_rows - batch.row_count;
 		auto append_count = std::min(remaining_rows, remaining_capacity);
@@ -1571,7 +1709,14 @@ static void AppendDirectMultiPreparedChunkRows(DirectMultiPipelineBuffer &batch,
 		}
 
 		auto output_row = batch.row_count;
-		CopyUnifiedValues(batch.join_keys + output_row, join_data, row_offset, append_count);
+		if (InferGridFromRowOrder()) {
+			for (idx_t row = 0; row < append_count; row++) {
+				batch.join_keys[output_row + row] =
+				    RowOrderJoinKey(*batch.mapping, chunk_row_base + row_offset + row);
+			}
+		} else {
+			CopyUnifiedValues(batch.join_keys + output_row, *join_data, row_offset, append_count);
+		}
 		for (idx_t column = 0; column < column_count; column++) {
 			auto output_offset = column * batch.value_stride + output_row;
 			CopyUnifiedValues(batch.values + output_offset, value_data[column], row_offset, append_count);
@@ -1584,12 +1729,12 @@ static void AppendDirectMultiPreparedChunkRows(DirectMultiPipelineBuffer &batch,
 
 	while (row_offset < count && batch.row_count < target_batch_rows) {
 		auto row = row_offset++;
-		if (!join_data.RowIsValid(row)) {
+		if (!join_data->RowIsValid(row)) {
 			continue;
 		}
 
 		auto output_row = batch.row_count;
-		batch.join_keys[output_row] = join_data.Value(row);
+		batch.join_keys[output_row] = join_data->Value(row);
 		for (idx_t column = 0; column < column_count; column++) {
 			auto offset = column * batch.value_stride + output_row;
 			batch.values[offset] = value_data[column].Value(row);
@@ -1621,11 +1766,16 @@ static ProbeColumns ReadProbeColumns(Connection &connection, const string &fact_
 static string BuildMultiProbeQuery(const string &fact_path, const string &join_key,
                                    const vector<string> &payload_columns) {
 	string query = "SELECT ";
-	query += QuoteIdentifier(join_key);
-	query += " AS join_key";
+	if (!InferGridFromRowOrder()) {
+		query += QuoteIdentifier(join_key);
+		query += " AS join_key";
+	}
 	for (idx_t column = 0; column < payload_columns.size(); column++) {
 		auto quoted = QuoteIdentifier(payload_columns[column]);
-		query += ", " + quoted + " AS value_" + std::to_string(column);
+		if (column > 0 || !InferGridFromRowOrder()) {
+			query += ", ";
+		}
+		query += quoted + " AS value_" + std::to_string(column);
 	}
 	query += " FROM " + BuildReadParquetExpression(fact_path);
 	return query;
@@ -1823,7 +1973,7 @@ static void ReadPipelineRawBatches(DuckDB &db, const vector<string> &fact_paths,
 		for (auto &fact_path : fact_paths) {
 			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
 			auto mapping =
-			    std::make_shared<GroupMapping>(ReadGroupMapping(connection, dimension_path, join_key, group_column));
+			    std::make_shared<GroupMapping>(ReadGroupMappingForCurrentMode(connection, dimension_path, join_key, group_column));
 			auto result = RunStreamingQuery(connection, BuildProbeQuery(fact_path, join_key, payload_column));
 
 			while (true) {
@@ -1859,7 +2009,7 @@ static void ReadMultiPipelineRawBatches(DuckDB &db, const vector<string> &fact_p
 		for (auto &fact_path : fact_paths) {
 			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
 			auto mapping =
-			    std::make_shared<GroupMapping>(ReadGroupMapping(connection, dimension_path, join_key, group_column));
+			    std::make_shared<GroupMapping>(ReadGroupMappingForCurrentMode(connection, dimension_path, join_key, group_column));
 			auto result = RunStreamingQuery(connection, BuildMultiProbeQuery(fact_path, join_key, payload_columns));
 
 			while (true) {
@@ -1896,7 +2046,7 @@ static void ReadMultiPipelineRawBatchWorker(DuckDB &db, BlockingQueue<string> &f
 		while (file_queue.Pop(fact_path)) {
 			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
 			auto mapping =
-			    std::make_shared<GroupMapping>(ReadGroupMapping(connection, dimension_path, join_key, group_column));
+			    std::make_shared<GroupMapping>(ReadGroupMappingForCurrentMode(connection, dimension_path, join_key, group_column));
 			auto result = RunStreamingQuery(connection, BuildMultiProbeQuery(fact_path, join_key, payload_columns));
 
 			while (true) {
@@ -1961,7 +2111,7 @@ static void ReadMultiPipelineChunkBatchWorker(DuckDB &db, BlockingQueue<string> 
 				if (cached_mapping == dimension_mapping_cache.end()) {
 					auto mapping_start = std::chrono::steady_clock::now();
 					mapping = std::make_shared<GroupMapping>(
-					    ReadGroupMapping(connection, dimension_path, join_key, group_column));
+					    ReadGroupMappingForCurrentMode(connection, dimension_path, join_key, group_column));
 					mapping_elapsed += ElapsedSeconds(mapping_start);
 					dimension_mapping_cache[cache_key] = mapping;
 					mapping_reads++;
@@ -1978,6 +2128,7 @@ static void ReadMultiPipelineChunkBatchWorker(DuckDB &db, BlockingQueue<string> 
 			query_submit_elapsed += ElapsedSeconds(query_submit_start);
 			setup_elapsed += ElapsedSeconds(setup_start);
 
+			idx_t fact_row_base = 0;
 			while (true) {
 				auto fetch_start = std::chrono::steady_clock::now();
 				auto chunk = FetchGpuPipelineChunk(*result);
@@ -1989,6 +2140,8 @@ static void ReadMultiPipelineChunkBatchWorker(DuckDB &db, BlockingQueue<string> 
 				MultiPipelineChunkBatch batch;
 				batch.fact_path = fact_path;
 				batch.mapping = mapping;
+				batch.row_base = fact_row_base;
+				fact_row_base += chunk->size();
 				batch.chunk = std::move(chunk);
 				auto push_start = std::chrono::steady_clock::now();
 				chunk_queue.Push(std::move(batch));
@@ -2055,7 +2208,7 @@ static void ReadMultiPipelineChunkBatches(DuckDB &db, const vector<string> &fact
 			if (cached_mapping == dimension_mapping_cache.end()) {
 				auto mapping_start = std::chrono::steady_clock::now();
 				mapping =
-				    std::make_shared<GroupMapping>(ReadGroupMapping(connection, dimension_path, join_key, group_column));
+				    std::make_shared<GroupMapping>(ReadGroupMappingForCurrentMode(connection, dimension_path, join_key, group_column));
 				mapping_elapsed += ElapsedSeconds(mapping_start);
 				dimension_mapping_cache[cache_key] = mapping;
 				mapping_reads++;
@@ -2071,6 +2224,7 @@ static void ReadMultiPipelineChunkBatches(DuckDB &db, const vector<string> &fact
 			query_submit_elapsed += ElapsedSeconds(query_submit_start);
 			setup_elapsed += ElapsedSeconds(setup_start);
 
+			idx_t fact_row_base = 0;
 			while (true) {
 				auto fetch_start = std::chrono::steady_clock::now();
 				auto chunk = FetchGpuPipelineChunk(*result);
@@ -2082,6 +2236,8 @@ static void ReadMultiPipelineChunkBatches(DuckDB &db, const vector<string> &fact
 				MultiPipelineChunkBatch batch;
 				batch.fact_path = fact_path;
 				batch.mapping = mapping;
+				batch.row_base = fact_row_base;
+				fact_row_base += chunk->size();
 				batch.chunk = std::move(chunk);
 				auto push_start = std::chrono::steady_clock::now();
 				chunk_queue.Push(std::move(batch));
@@ -2112,6 +2268,247 @@ static void ReadMultiPipelineChunkBatches(DuckDB &db, const vector<string> &fact
 		timers->dimension_mapping_reuses += mapping_reuses;
 	}
 	chunk_queue.Close();
+}
+
+static vector<idx_t> ResolveParquetPayloadColumnIds(const ParquetReader &reader, const vector<string> &payload_columns,
+                                                    const string &fact_path) {
+	vector<idx_t> column_ids;
+	column_ids.reserve(payload_columns.size());
+	auto &columns = reader.GetColumns();
+	for (auto &payload_column : payload_columns) {
+		idx_t column_id = DConstants::INVALID_INDEX;
+		for (idx_t idx = 0; idx < columns.size(); idx++) {
+			if (columns[idx].name == payload_column) {
+				column_id = idx;
+				break;
+			}
+		}
+		if (column_id == DConstants::INVALID_INDEX) {
+			throw InvalidInputException("Parquet file '%s' does not contain payload column '%s'", fact_path,
+			                            payload_column);
+		}
+		if (columns[column_id].type.id() != LogicalTypeId::DOUBLE) {
+			throw InvalidInputException("Payload column '%s' must be DOUBLE for direct parquet GPU decode, got %s",
+			                            payload_column, columns[column_id].type.ToString());
+		}
+		column_ids.push_back(column_id);
+	}
+	return column_ids;
+}
+
+static void ConfigureDirectParquetReaderProjection(ParquetReader &reader, const vector<idx_t> &column_ids) {
+	reader.column_ids = MultiFileLocalColumnIds<MultiFileLocalColumnId>();
+	reader.column_indexes.clear();
+	for (auto column_id : column_ids) {
+		reader.column_ids.emplace_back(MultiFileLocalColumnId(column_id));
+		reader.column_indexes.emplace_back(ColumnIndex(column_id));
+	}
+}
+
+static DataChunk MakeDirectMappedParquetOutputChunk(DirectMultiPipelineBuffer &buffer, idx_t output_row,
+                                                    idx_t column_count) {
+	DataChunk result;
+	for (idx_t column = 0; column < column_count; column++) {
+		auto value_ptr = buffer.values + column * buffer.value_stride + output_row;
+		result.data.emplace_back(LogicalType::DOUBLE, reinterpret_cast<data_ptr_t>(value_ptr));
+	}
+	result.SetCapacity(STANDARD_VECTOR_SIZE);
+	return result;
+}
+
+static void FinishDirectMappedDecodedChunk(DirectMultiPipelineBuffer &buffer, DataChunk &chunk, idx_t chunk_row_base,
+                                           idx_t output_row, idx_t column_count) {
+	auto count = chunk.size();
+	for (idx_t row = 0; row < count; row++) {
+		buffer.join_keys[output_row + row] = RowOrderJoinKey(*buffer.mapping, chunk_row_base + row);
+	}
+	for (idx_t column = 0; column < column_count; column++) {
+		auto validity_out = buffer.validity + column * buffer.value_stride + output_row;
+		auto &validity = FlatVector::Validity(chunk.data[column]);
+		if (validity.AllValid()) {
+			std::memset(validity_out, 1, count);
+		} else {
+			CopyValidityToBytes(validity_out, validity, 0, count);
+		}
+	}
+	buffer.row_count += count;
+	buffer.chunks++;
+}
+
+static void FlushDirectMappedDecodedBatch(DirectMultiPipelineBuffer &current,
+                                          BlockingQueue<DirectMultiPipelineInputBatch> &input_queue,
+                                          BlockingQueue<idx_t> &free_slots, uint64_t &batch_count,
+                                          double &push_elapsed) {
+	if (!current.active) {
+		current = DirectMultiPipelineBuffer();
+		return;
+	}
+	if (current.row_count == 0) {
+		free_slots.Push(current.slot);
+		current = DirectMultiPipelineBuffer();
+		return;
+	}
+	DirectMultiPipelineInputBatch batch;
+	batch.fact_path = current.fact_path;
+	batch.mapping = current.mapping;
+	batch.slot = current.slot;
+	batch.row_count = current.row_count;
+	batch.value_stride = current.value_stride;
+	batch.column_count = current.column_count;
+	auto push_start = std::chrono::steady_clock::now();
+	input_queue.Push(std::move(batch));
+	push_elapsed += ElapsedSeconds(push_start);
+	batch_count++;
+	current = DirectMultiPipelineBuffer();
+}
+
+static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipelineFuncs pipeline, void *handle,
+                                                  BlockingQueue<string> &file_queue,
+                                                  BlockingQueue<DirectMultiPipelineInputBatch> &input_queue,
+                                                  BlockingQueue<idx_t> &free_slots, DuckDB &db,
+                                                  const vector<string> &payload_columns, const string &join_key,
+                                                  const string &group_column, const string &dimension_file,
+                                                  std::map<string, std::shared_ptr<GroupMapping>> &dimension_mapping_cache,
+                                                  std::mutex &dimension_mapping_cache_lock,
+                                                  std::exception_ptr &error_out, std::mutex &error_lock,
+                                                  MultiPipelineStageTimers *timers) {
+	auto stage_start = std::chrono::steady_clock::now();
+	uint64_t chunk_count = 0;
+	uint64_t batch_count = 0;
+	uint64_t mapping_reads = 0;
+	uint64_t mapping_reuses = 0;
+	double setup_elapsed = 0;
+	double connection_elapsed = 0;
+	double mapping_lock_elapsed = 0;
+	double mapping_elapsed = 0;
+	double query_build_elapsed = 0;
+	double query_submit_elapsed = 0;
+	double fetch_elapsed = 0;
+	double push_elapsed = 0;
+	double prepare_work_elapsed = 0;
+	double prepare_pop_elapsed = 0;
+	double prepare_push_elapsed = 0;
+	try {
+		if (!InferGridFromRowOrder()) {
+			throw InvalidInputException("direct parquet decode requires row-order grid inference");
+		}
+		auto target_batch_rows = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_ROWS", 65536);
+		auto target_batch_chunks = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_CHUNKS", 32);
+		if (target_batch_rows < STANDARD_VECTOR_SIZE || target_batch_chunks == 0) {
+			throw InvalidInputException(
+			    "direct parquet decode requires DUCKDB_GPU_PIPELINE_BATCH_ROWS >= STANDARD_VECTOR_SIZE and chunks > 0");
+		}
+
+		auto connection_start = std::chrono::steady_clock::now();
+		Connection connection(db);
+		ConfigurePipelineReaderConnection(connection);
+		auto &context = *connection.context;
+		connection_elapsed += ElapsedSeconds(connection_start);
+
+		string fact_path;
+		while (file_queue.Pop(fact_path)) {
+			auto setup_start = std::chrono::steady_clock::now();
+			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
+			auto cache_key =
+			    DimensionMappingCacheKey(dimension_path, dimension_file, join_key, group_column, true);
+			std::shared_ptr<GroupMapping> mapping;
+			{
+				auto mapping_lock_start = std::chrono::steady_clock::now();
+				std::lock_guard<std::mutex> guard(dimension_mapping_cache_lock);
+				mapping_lock_elapsed += ElapsedSeconds(mapping_lock_start);
+				auto cached_mapping = dimension_mapping_cache.find(cache_key);
+				if (cached_mapping == dimension_mapping_cache.end()) {
+					auto mapping_start = std::chrono::steady_clock::now();
+					mapping = std::make_shared<GroupMapping>(
+					    ReadGroupMappingForCurrentMode(connection, dimension_path, join_key, group_column));
+					mapping_elapsed += ElapsedSeconds(mapping_start);
+					dimension_mapping_cache[cache_key] = mapping;
+					mapping_reads++;
+				} else {
+					mapping = cached_mapping->second;
+					mapping_reuses++;
+				}
+			}
+
+			auto query_build_start = std::chrono::steady_clock::now();
+			ParquetOptions parquet_options(context);
+			query_build_elapsed += ElapsedSeconds(query_build_start);
+			auto query_submit_start = std::chrono::steady_clock::now();
+			ParquetReader reader(context, OpenFileInfo(fact_path), parquet_options);
+			auto projected_column_ids = ResolveParquetPayloadColumnIds(reader, payload_columns, fact_path);
+			ConfigureDirectParquetReaderProjection(reader, projected_column_ids);
+			ParquetReaderScanState scan_state;
+			vector<idx_t> groups_to_read;
+			groups_to_read.reserve(reader.NumRowGroups());
+			for (idx_t group = 0; group < reader.NumRowGroups(); group++) {
+				groups_to_read.push_back(group);
+			}
+			reader.InitializeScan(context, scan_state, std::move(groups_to_read));
+			query_submit_elapsed += ElapsedSeconds(query_submit_start);
+			setup_elapsed += ElapsedSeconds(setup_start);
+
+			DirectMultiPipelineBuffer current;
+			idx_t fact_row_base = 0;
+			while (true) {
+				if (!current.active || current.chunks >= target_batch_chunks ||
+				    target_batch_rows - current.row_count < STANDARD_VECTOR_SIZE) {
+					FlushDirectMappedDecodedBatch(current, input_queue, free_slots, batch_count, prepare_push_elapsed);
+					auto prepare_start = std::chrono::steady_clock::now();
+					StartDirectMultiPipelineInputBatch(pipeline, handle, free_slots, fact_path, mapping,
+					                                   payload_columns.size(), target_batch_rows, current, false);
+					prepare_work_elapsed += ElapsedSeconds(prepare_start);
+				}
+
+				auto output_row = current.row_count;
+				auto result = MakeDirectMappedParquetOutputChunk(current, output_row, payload_columns.size());
+				auto fetch_start = std::chrono::steady_clock::now();
+				auto scan_result = reader.Scan(context, scan_state, result);
+				if (scan_result.GetResultType() == AsyncResultType::BLOCKED) {
+					scan_result.ExecuteTasksSynchronously();
+				}
+				fetch_elapsed += ElapsedSeconds(fetch_start);
+				if (scan_result.GetResultType() == AsyncResultType::FINISHED) {
+					break;
+				}
+				if (result.size() == 0) {
+					continue;
+				}
+				auto work_start = std::chrono::steady_clock::now();
+				FinishDirectMappedDecodedChunk(current, result, fact_row_base, output_row, payload_columns.size());
+				prepare_work_elapsed += ElapsedSeconds(work_start);
+				fact_row_base += result.size();
+				chunk_count++;
+			}
+			FlushDirectMappedDecodedBatch(current, input_queue, free_slots, batch_count, prepare_push_elapsed);
+		}
+	} catch (...) {
+		std::lock_guard<std::mutex> guard(error_lock);
+		if (!error_out) {
+			error_out = std::current_exception();
+		}
+	}
+	if (timers) {
+		auto read_elapsed = ElapsedSeconds(stage_start);
+		std::lock_guard<std::mutex> guard(timers->lock);
+		timers->read_time += read_elapsed;
+		timers->read_setup_time += setup_elapsed;
+		timers->read_connection_time += connection_elapsed;
+		timers->read_mapping_lock_time += mapping_lock_elapsed;
+		timers->read_mapping_time += mapping_elapsed;
+		timers->read_query_build_time += query_build_elapsed;
+		timers->read_query_submit_time += query_submit_elapsed;
+		timers->read_fetch_time += fetch_elapsed;
+		timers->read_push_time += push_elapsed;
+		timers->read_thread_max_time = std::max(timers->read_thread_max_time, read_elapsed);
+		timers->read_chunks += chunk_count;
+		timers->prepare_time += read_elapsed;
+		timers->prepare_pop_time += prepare_pop_elapsed;
+		timers->prepare_work_time += prepare_work_elapsed;
+		timers->prepare_push_time += prepare_push_elapsed;
+		timers->prepared_batches += batch_count;
+		timers->dimension_mapping_reads += mapping_reads;
+		timers->dimension_mapping_reuses += mapping_reuses;
+	}
 }
 
 static void PrepareMultiPipelineChunkBatches(BlockingQueue<MultiPipelineChunkBatch> &chunk_queue,
@@ -2170,7 +2567,8 @@ static void PrepareMultiPipelineChunkBatches(BlockingQueue<MultiPipelineChunkBat
 				}
 
 				auto work_start = std::chrono::steady_clock::now();
-				AppendMultiPreparedChunkRows(current, *chunk_batch.chunk, row_offset, column_count, target_batch_rows);
+				AppendMultiPreparedChunkRows(current, *chunk_batch.chunk, chunk_batch.row_base, row_offset,
+				                             column_count, target_batch_rows);
 				work_elapsed += ElapsedSeconds(work_start);
 				if (PreparedRowCount(current) >= target_batch_rows) {
 					flush_current();
@@ -2272,11 +2670,11 @@ static void PrepareDirectMultiPipelineChunkBatches(FusedLatAggMultiDirectPipelin
 				auto work_start = std::chrono::steady_clock::now();
 				if (current.device_direct) {
 					AppendDeviceDirectMultiPreparedChunkRows(pipeline, handle, current, *chunk_batch.chunk,
-					                                         row_offset, column_count, target_batch_rows,
-					                                         validity_scratch);
+					                                         chunk_batch.row_base, row_offset, column_count,
+					                                         target_batch_rows, validity_scratch);
 				} else {
-					AppendDirectMultiPreparedChunkRows(current, *chunk_batch.chunk, row_offset, column_count,
-					                                   target_batch_rows);
+					AppendDirectMultiPreparedChunkRows(current, *chunk_batch.chunk, chunk_batch.row_base, row_offset,
+					                                   column_count, target_batch_rows);
 				}
 				work_elapsed += ElapsedSeconds(work_start);
 				if (current.row_count >= target_batch_rows || current.chunks >= target_batch_chunks) {
@@ -2967,6 +3365,9 @@ static py::dict DBSGPUFusedLatPipeline(const py::iterable &fact_paths_p, const s
 		    "mode must be 'device', 'mapped', 'pipeline-device', 'pipeline-mapped', 'pipeline-managed', or "
 		    "'pipeline-cpu'");
 	}
+	if (InferGridFromRowOrder()) {
+		throw InvalidInputException("row-order grid inference is only implemented for multi-column pipeline mode");
+	}
 
 	vector<string> fact_paths;
 	for (auto item : fact_paths_p) {
@@ -3151,7 +3552,7 @@ static py::dict DBSGPUFusedLatPipeline(const py::iterable &fact_paths_p, const s
 
 		for (auto &fact_path : fact_paths) {
 			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
-			auto mapping = ReadGroupMapping(connection, dimension_path, join_key, group_column);
+			auto mapping = ReadGroupMappingForCurrentMode(connection, dimension_path, join_key, group_column);
 			auto probe = ReadProbeColumns(connection, fact_path, join_key, payload_column);
 			if (probe.join_keys.empty()) {
 				continue;
@@ -3205,6 +3606,9 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		throw InvalidInputException(
 		    "mode must be 'device', 'mapped', 'pipeline-device', 'pipeline-mapped', 'pipeline-device-direct', "
 		    "or 'pipeline-mapped-direct'");
+	}
+	if (InferGridFromRowOrder() && !pipeline_mode) {
+		throw InvalidInputException("row-order grid inference requires a pipeline mode");
 	}
 
 	vector<string> fact_paths;
@@ -3262,7 +3666,25 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 			std::mutex dimension_mapping_cache_lock;
 			vector<std::thread> reader_threads;
 			std::thread reader_thread;
-			if (reader_thread_count == 1) {
+			auto direct_parquet_decode =
+			    pipeline_mapped_direct_mode && InferGridFromRowOrder() &&
+			    ReadEnvFlag("DUCKDB_GPU_PARQUET_DIRECT_DECODE", false);
+			if (direct_parquet_decode) {
+				for (auto &fact_path : fact_paths) {
+					file_queue.Push(fact_path);
+				}
+				file_queue.Close();
+				reader_threads.reserve(reader_thread_count);
+				for (idx_t reader = 0; reader < reader_thread_count; reader++) {
+					reader_threads.emplace_back(ReadDirectMappedParquetPipelineWorker, direct_pipeline, handle,
+					                            std::ref(file_queue), std::ref(input_queue), std::ref(free_slots),
+					                            std::ref(db), std::cref(payload_columns), std::cref(join_key),
+					                            std::cref(group_column), std::cref(dimension_file),
+					                            std::ref(dimension_mapping_cache),
+					                            std::ref(dimension_mapping_cache_lock), std::ref(worker_error),
+					                            std::ref(worker_error_lock), &stage_timers);
+				}
+			} else if (reader_thread_count == 1) {
 				reader_thread = std::thread(ReadMultiPipelineChunkBatches, std::ref(db), std::cref(fact_paths),
 				                            std::cref(payload_columns), std::cref(join_key), std::cref(group_column),
 				                            std::cref(dimension_file), std::ref(chunk_queue), std::ref(worker_error),
@@ -3279,13 +3701,16 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 					                            std::cref(group_column), std::cref(dimension_file),
 					                            std::ref(chunk_queue), std::ref(dimension_mapping_cache),
 					                            std::ref(dimension_mapping_cache_lock), std::ref(worker_error),
-					                            std::ref(worker_error_lock), &stage_timers);
+				                            std::ref(worker_error_lock), &stage_timers);
 				}
 			}
-			std::thread prepare_thread(PrepareDirectMultiPipelineChunkBatches, direct_pipeline, handle,
-			                           std::ref(chunk_queue), std::ref(input_queue), std::ref(free_slots),
-			                           column_count, std::ref(worker_error), std::ref(worker_error_lock),
-			                           &stage_timers, pipeline_device_direct_mode);
+			std::unique_ptr<std::thread> prepare_thread;
+			if (!direct_parquet_decode) {
+				prepare_thread = make_uniq<std::thread>(
+				    PrepareDirectMultiPipelineChunkBatches, direct_pipeline, handle, std::ref(chunk_queue),
+				    std::ref(input_queue), std::ref(free_slots), column_count, std::ref(worker_error),
+				    std::ref(worker_error_lock), &stage_timers, pipeline_device_direct_mode);
+			}
 			std::thread gpu_thread(RunDirectMultiPipelineGPUWorker, direct_pipeline, handle, PIPELINE_SLOTS,
 			                       std::ref(input_queue), std::ref(output_queue), std::ref(free_slots),
 			                       column_count, std::ref(worker_error), std::ref(worker_error_lock),
@@ -3295,7 +3720,12 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 			                         std::ref(worker_error_lock), &stage_timers);
 
 			try {
-				if (reader_thread_count == 1) {
+				if (direct_parquet_decode) {
+					for (auto &reader_thread_item : reader_threads) {
+						reader_thread_item.join();
+					}
+					input_queue.Close();
+				} else if (reader_thread_count == 1) {
 					reader_thread.join();
 				} else {
 					for (auto &reader_thread_item : reader_threads) {
@@ -3303,7 +3733,9 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 					}
 					chunk_queue.Close();
 				}
-				prepare_thread.join();
+				if (prepare_thread) {
+					prepare_thread->join();
+				}
 				gpu_thread.join();
 				merge_thread.join();
 
@@ -3324,8 +3756,8 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 						reader_thread_item.join();
 					}
 				}
-				if (prepare_thread.joinable()) {
-					prepare_thread.join();
+				if (prepare_thread && prepare_thread->joinable()) {
+					prepare_thread->join();
 				}
 				if (gpu_thread.joinable()) {
 					gpu_thread.join();
@@ -3453,7 +3885,7 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		auto fused_agg = LoadFusedLatAggMulti(lib_path, mapped);
 		for (auto &fact_path : fact_paths) {
 			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
-			auto mapping = ReadGroupMapping(connection, dimension_path, join_key, group_column);
+			auto mapping = ReadGroupMappingForCurrentMode(connection, dimension_path, join_key, group_column);
 			auto probe = ReadMultiProbeColumns(connection, fact_path, join_key, payload_columns);
 			if (probe.join_keys.empty()) {
 				continue;

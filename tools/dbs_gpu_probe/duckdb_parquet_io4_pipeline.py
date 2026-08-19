@@ -25,10 +25,29 @@ def parse_args():
     parser.add_argument("--read-mode", default="per-file", choices=["per-file", "glob", "sharded"])
     parser.add_argument("--print-stage-times", action="store_true")
     parser.add_argument("--reuse-dimension-mapping", action="store_true")
+    parser.add_argument(
+        "--infer-grid-from-row-order",
+        action="store_true",
+        help="do not scan the fact grid column; infer groups from fact row order matching the dimension file",
+    )
     parser.add_argument("--prefetch-files", action="store_true")
     parser.add_argument("--prefetch-method", default="both", choices=["fadvise", "readahead", "both", "io_uring"])
     parser.add_argument("--duckdb-parquet-async-prefetch", action="store_true")
-    parser.add_argument("--fetch-raw", action="store_true", help="use DuckDB FetchRaw and decode vectors directly")
+    parser.add_argument(
+        "--fetch-raw",
+        action="store_true",
+        help="use DuckDB FetchRaw and consume scan vectors without the regular Fetch materialization path",
+    )
+    parser.add_argument(
+        "--regular-fetch",
+        action="store_true",
+        help="force the regular DuckDB Fetch path for comparison",
+    )
+    parser.add_argument(
+        "--parquet-direct-decode",
+        action="store_true",
+        help="decode Parquet DOUBLE payload columns directly into mapped GPU pipeline slot buffers",
+    )
     parser.add_argument(
         "--reader-duckdb-threads",
         type=int,
@@ -83,7 +102,14 @@ def read_auto_payload_columns(parquet_path):
     try:
         rows = con.execute("""
             DESCRIBE SELECT *
-            FROM read_parquet(?)
+            FROM read_parquet(
+                ?,
+                union_by_name=false,
+                hive_partitioning=false,
+                filename=false,
+                file_row_number=false,
+                binary_as_string=false
+            )
         """, [parquet_path]).fetchall()
     finally:
         con.close()
@@ -153,17 +179,23 @@ def main():
 
     if args.reuse_dimension_mapping:
         os.environ["DUCKDB_GPU_REUSE_DIMENSION_MAPPING"] = "1"
+    if args.infer_grid_from_row_order:
+        os.environ["DUCKDB_GPU_INFER_GRID_FROM_ROW_ORDER"] = "1"
     if args.prefetch_files:
         os.environ["DUCKDB_GPU_PREFETCH_FILES"] = "1"
         os.environ["DUCKDB_GPU_PREFETCH_METHOD"] = args.prefetch_method
     if args.duckdb_parquet_async_prefetch:
         os.environ["DUCKDB_PARQUET_ASYNC_PREFETCH"] = "1"
-    if args.fetch_raw:
+    if args.parquet_direct_decode:
+        os.environ["DUCKDB_GPU_PARQUET_DIRECT_DECODE"] = "1"
+    if args.fetch_raw or (not args.regular_fetch and args.mode.startswith("pipeline-")):
         os.environ["DUCKDB_GPU_FETCH_RAW"] = "1"
     if args.reader_duckdb_threads is not None:
         if args.reader_duckdb_threads <= 0:
             raise SystemExit("--reader-duckdb-threads must be positive")
         os.environ["DUCKDB_GPU_READER_DUCKDB_THREADS"] = str(args.reader_duckdb_threads)
+    elif read_env_positive_int("DUCKDB_GPU_PIPELINE_READER_THREADS", 1) > 1:
+        os.environ.setdefault("DUCKDB_GPU_READER_DUCKDB_THREADS", "1")
 
     if len(payload_columns) == 1:
         result = duckdb.dbs_gpu_fused_lat_pipeline(
@@ -196,12 +228,17 @@ def main():
     print("[number of input file]: {}".format(len(parquet_paths)))
     print("[read mode]: {}".format(args.read_mode))
     print("[reader threads]: {}".format(os.environ.get("DUCKDB_GPU_PIPELINE_READER_THREADS", "1")))
+    print("[reader duckdb threads]: {}".format(os.environ.get("DUCKDB_GPU_READER_DUCKDB_THREADS", "default")))
     if args.prefetch_files:
         print("[prefetch]: {}".format(args.prefetch_method))
     if args.duckdb_parquet_async_prefetch:
         print("[duckdb parquet async prefetch]: on")
-    if args.fetch_raw:
+    if os.environ.get("DUCKDB_GPU_PARQUET_DIRECT_DECODE") == "1":
+        print("[parquet direct decode]: on")
+    if os.environ.get("DUCKDB_GPU_FETCH_RAW") == "1":
         print("[duckdb fetch raw]: on")
+    if args.infer_grid_from_row_order:
+        print("[grid inference]: row-order")
     print("[payload columns]: {}".format(",".join(payload_columns)))
     if args.print_stage_times and "stage_times" in result:
         stage = result["stage_times"]
