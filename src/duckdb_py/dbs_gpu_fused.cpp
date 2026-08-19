@@ -948,7 +948,7 @@ static GroupMapping ReadGroupMappingForCurrentMode(Connection &connection, const
 static string DimensionMappingCacheKey(const string &dimension_path, const string &dimension_file,
                                        const string &join_key, const string &group_column,
                                        bool reuse_dimension_mapping) {
-	auto prefix = InferGridFromRowOrder() ? "row_order:" : "grid_key:";
+	string prefix = InferGridFromRowOrder() ? "row_order:" : "grid_key:";
 	if (reuse_dimension_mapping) {
 		return prefix + "reuse:" + dimension_file + ":" + join_key + ":" + group_column;
 	}
@@ -2305,15 +2305,13 @@ static void ConfigureDirectParquetReaderProjection(ParquetReader &reader, const 
 	}
 }
 
-static DataChunk MakeDirectMappedParquetOutputChunk(DirectMultiPipelineBuffer &buffer, idx_t output_row,
-                                                    idx_t column_count) {
-	DataChunk result;
+static void MakeDirectMappedParquetOutputChunk(DataChunk &result, DirectMultiPipelineBuffer &buffer, idx_t output_row,
+                                               idx_t column_count) {
 	for (idx_t column = 0; column < column_count; column++) {
 		auto value_ptr = buffer.values + column * buffer.value_stride + output_row;
 		result.data.emplace_back(LogicalType::DOUBLE, reinterpret_cast<data_ptr_t>(value_ptr));
 	}
 	result.SetCapacity(STANDARD_VECTOR_SIZE);
-	return result;
 }
 
 static void FinishDirectMappedDecodedChunk(DirectMultiPipelineBuffer &buffer, DataChunk &chunk, idx_t chunk_row_base,
@@ -2460,7 +2458,8 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 				}
 
 				auto output_row = current.row_count;
-				auto result = MakeDirectMappedParquetOutputChunk(current, output_row, payload_columns.size());
+				DataChunk result;
+				MakeDirectMappedParquetOutputChunk(result, current, output_row, payload_columns.size());
 				auto fetch_start = std::chrono::steady_clock::now();
 				auto scan_result = reader.Scan(context, scan_state, result);
 				if (scan_result.GetResultType() == AsyncResultType::BLOCKED) {
