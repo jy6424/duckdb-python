@@ -32,3 +32,12 @@ add_library(
   python_udf.cpp)
 
 target_link_libraries(python_src PRIVATE _duckdb_dependencies)
+
+target_include_directories(
+  python_src
+  PRIVATE ${CMAKE_SOURCE_DIR}/external/duckdb/extension/parquet/include
+          ${CMAKE_SOURCE_DIR}/external/duckdb/third_party/lz4
+          ${CMAKE_SOURCE_DIR}/external/duckdb/third_party/parquet
+          ${CMAKE_SOURCE_DIR}/external/duckdb/third_party/thrift
+          ${CMAKE_SOURCE_DIR}/external/duckdb/third_party/snappy
+          ${CMAKE_SOURCE_DIR}/external/duckdb/third_party/brotli/include)
