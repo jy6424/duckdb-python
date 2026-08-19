@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #endif
 
@@ -461,6 +462,7 @@ public:
 		cq_tail = reinterpret_cast<uint32_t *>(static_cast<char *>(cq_ring) + params.cq_off.tail);
 		cq_ring_mask = reinterpret_cast<uint32_t *>(static_cast<char *>(cq_ring) + params.cq_off.ring_mask);
 		cqes = reinterpret_cast<struct io_uring_cqe *>(static_cast<char *>(cq_ring) + params.cq_off.cqes);
+		iovecs.resize(params.sq_entries);
 		return true;
 	}
 
@@ -488,11 +490,19 @@ public:
 		auto index = tail & *sq_ring_mask;
 		auto &sqe = sqes[index];
 		std::memset(&sqe, 0, sizeof(sqe));
+#if defined(IORING_OP_READ)
 		sqe.opcode = IORING_OP_READ;
-		sqe.fd = fd;
-		sqe.off = offset;
 		sqe.addr = reinterpret_cast<uint64_t>(buffer);
 		sqe.len = length;
+#else
+		iovecs[index].iov_base = buffer;
+		iovecs[index].iov_len = length;
+		sqe.opcode = IORING_OP_READV;
+		sqe.addr = reinterpret_cast<uint64_t>(&iovecs[index]);
+		sqe.len = 1;
+#endif
+		sqe.fd = fd;
+		sqe.off = offset;
 		sqe.user_data = user_data;
 		sq_array[index] = index;
 		std::atomic_thread_fence(std::memory_order_release);
@@ -541,6 +551,7 @@ private:
 	uint32_t *cq_tail = nullptr;
 	uint32_t *cq_ring_mask = nullptr;
 	uint32_t pending_submissions = 0;
+	vector<struct iovec> iovecs;
 };
 
 static void PrefetchFileWithIoUring(const string &path) {
