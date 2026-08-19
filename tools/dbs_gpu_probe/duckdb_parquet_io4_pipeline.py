@@ -26,6 +26,12 @@ def parse_args():
     parser.add_argument("--print-stage-times", action="store_true")
     parser.add_argument("--reuse-dimension-mapping", action="store_true")
     parser.add_argument(
+        "--reader-duckdb-threads",
+        type=int,
+        default=None,
+        help="set DuckDB threads inside each C++ reader connection",
+    )
+    parser.add_argument(
         "--mode",
         default=os.environ.get("DUCKDB_GPU_PIPELINE_MODE", "pipeline-device"),
         choices=[
@@ -118,6 +124,10 @@ def main():
 
     if args.reuse_dimension_mapping:
         os.environ["DUCKDB_GPU_REUSE_DIMENSION_MAPPING"] = "1"
+    if args.reader_duckdb_threads is not None:
+        if args.reader_duckdb_threads <= 0:
+            raise SystemExit("--reader-duckdb-threads must be positive")
+        os.environ["DUCKDB_GPU_READER_DUCKDB_THREADS"] = str(args.reader_duckdb_threads)
 
     if len(payload_columns) == 1:
         result = duckdb.dbs_gpu_fused_lat_pipeline(

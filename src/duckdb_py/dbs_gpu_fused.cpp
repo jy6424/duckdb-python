@@ -389,6 +389,22 @@ static unique_ptr<QueryResult> RunStreamingQuery(Connection &connection, const s
 	return result;
 }
 
+static void ConfigurePipelineReaderConnection(Connection &connection) {
+	auto value = std::getenv("DUCKDB_GPU_READER_DUCKDB_THREADS");
+	if (!value || !value[0]) {
+		return;
+	}
+	char *end = nullptr;
+	auto parsed = std::strtoull(value, &end, 10);
+	if (!end || *end != '\0' || parsed == 0) {
+		throw InvalidInputException("DUCKDB_GPU_READER_DUCKDB_THREADS must be a positive integer");
+	}
+	auto result = connection.Query("SET threads=" + std::to_string(parsed));
+	if (result->HasError()) {
+		result->ThrowError();
+	}
+}
+
 struct GroupMapping {
 	int64_t join_min = 0;
 	int64_t join_max = 0;
@@ -399,7 +415,7 @@ struct GroupMapping {
 static GroupMapping ReadGroupMapping(Connection &connection, const string &dimension_path, const string &join_key,
                                      const string &group_column) {
 	auto query = StringUtil::Format(
-	    "SELECT %s::BIGINT AS join_key, %s::DOUBLE AS group_value FROM read_parquet('%s')",
+	    "SELECT %s AS join_key, %s AS group_value FROM read_parquet('%s')",
 	    QuoteIdentifier(join_key), QuoteIdentifier(group_column), EscapeSQLString(dimension_path));
 	auto result = RunStreamingQuery(connection, query);
 
@@ -1057,10 +1073,10 @@ static string BuildMultiProbeQuery(const string &fact_path, const string &join_k
                                    const vector<string> &payload_columns) {
 	string query = "SELECT ";
 	query += QuoteIdentifier(join_key);
-	query += "::BIGINT AS join_key";
+	query += " AS join_key";
 	for (idx_t column = 0; column < payload_columns.size(); column++) {
 		auto quoted = QuoteIdentifier(payload_columns[column]);
-		query += ", " + quoted + "::DOUBLE AS value_" + std::to_string(column);
+		query += ", " + quoted + " AS value_" + std::to_string(column);
 	}
 	query += " FROM read_parquet('" + EscapeSQLString(fact_path) + "')";
 	return query;
@@ -1252,6 +1268,7 @@ static void ReadPipelineRawBatches(DuckDB &db, const vector<string> &fact_paths,
                                    std::mutex &error_lock) {
 	try {
 		Connection connection(db);
+		ConfigurePipelineReaderConnection(connection);
 		for (auto &fact_path : fact_paths) {
 			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
 			auto mapping =
@@ -1287,6 +1304,7 @@ static void ReadMultiPipelineRawBatches(DuckDB &db, const vector<string> &fact_p
                                         std::exception_ptr &error_out, std::mutex &error_lock) {
 	try {
 		Connection connection(db);
+		ConfigurePipelineReaderConnection(connection);
 		for (auto &fact_path : fact_paths) {
 			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
 			auto mapping =
@@ -1322,6 +1340,7 @@ static void ReadMultiPipelineRawBatchWorker(DuckDB &db, BlockingQueue<string> &f
                                             std::exception_ptr &error_out, std::mutex &error_lock) {
 	try {
 		Connection connection(db);
+		ConfigurePipelineReaderConnection(connection);
 		string fact_path;
 		while (file_queue.Pop(fact_path)) {
 			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
@@ -1367,6 +1386,7 @@ static void ReadMultiPipelineChunkBatchWorker(DuckDB &db, BlockingQueue<string> 
 	uint64_t mapping_reuses = 0;
 	try {
 		Connection connection(db);
+		ConfigurePipelineReaderConnection(connection);
 		auto reuse_dimension_mapping = ReadEnvFlag("DUCKDB_GPU_REUSE_DIMENSION_MAPPING", false);
 		string fact_path;
 		while (file_queue.Pop(fact_path)) {
@@ -1442,6 +1462,7 @@ static void ReadMultiPipelineChunkBatches(DuckDB &db, const vector<string> &fact
 	uint64_t mapping_reuses = 0;
 	try {
 		Connection connection(db);
+		ConfigurePipelineReaderConnection(connection);
 		std::map<string, std::shared_ptr<GroupMapping>> dimension_mapping_cache;
 		auto reuse_dimension_mapping = ReadEnvFlag("DUCKDB_GPU_REUSE_DIMENSION_MAPPING", false);
 		for (auto &fact_path : fact_paths) {
