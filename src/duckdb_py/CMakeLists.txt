@@ -40,4 +40,5 @@ target_include_directories(
           ${CMAKE_SOURCE_DIR}/external/duckdb/third_party/parquet
           ${CMAKE_SOURCE_DIR}/external/duckdb/third_party/thrift
           ${CMAKE_SOURCE_DIR}/external/duckdb/third_party/snappy
+          ${CMAKE_SOURCE_DIR}/external/duckdb/third_party/fastpforlib
           ${CMAKE_SOURCE_DIR}/external/duckdb/third_party/brotli/include)
