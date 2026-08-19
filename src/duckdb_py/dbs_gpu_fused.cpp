@@ -691,6 +691,16 @@ static void AppendProbeChunk(DataChunk &chunk, ProbeColumns &columns) {
 	}
 }
 
+static void CopyValidityToBytes(uint8_t *target, const ValidityMask &validity, idx_t source_offset, idx_t count) {
+	if (validity.AllValid()) {
+		std::memset(target, 1, count * sizeof(uint8_t));
+		return;
+	}
+	for (idx_t row = 0; row < count; row++) {
+		target[row] = validity.RowIsValid(source_offset + row) ? 1 : 0;
+	}
+}
+
 static void AppendMultiRawProbeChunk(DataChunk &chunk, MultiPipelineRawBatch &batch, idx_t column_count) {
 	auto count = chunk.size();
 	auto join_data = FlatVector::GetData<int64_t>(chunk.data[0]);
@@ -703,12 +713,12 @@ static void AppendMultiRawProbeChunk(DataChunk &chunk, MultiPipelineRawBatch &ba
 	for (idx_t column = 0; column < column_count; column++) {
 		batch.values[column].resize(count);
 		batch.validity[column].resize(count);
-		auto value_data = FlatVector::GetData<double>(chunk.data[1 + column * 2]);
-		auto valid_data = FlatVector::GetData<uint8_t>(chunk.data[2 + column * 2]);
+		auto value_data = FlatVector::GetData<double>(chunk.data[1 + column]);
+		auto &value_validity = FlatVector::Validity(chunk.data[1 + column]);
 		for (idx_t row = 0; row < count; row++) {
 			batch.values[column][row] = value_data[row];
-			batch.validity[column][row] = valid_data[row];
 		}
+		CopyValidityToBytes(batch.validity[column].data(), value_validity, 0, count);
 	}
 
 	for (idx_t row = 0; row < count; row++) {
@@ -814,12 +824,12 @@ static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChu
 	auto &join_validity = FlatVector::Validity(chunk.data[0]);
 
 	vector<const double *> value_data;
-	vector<const uint8_t *> valid_data;
+	vector<ValidityMask *> value_validity;
 	value_data.reserve(column_count);
-	valid_data.reserve(column_count);
+	value_validity.reserve(column_count);
 	for (idx_t column = 0; column < column_count; column++) {
-		value_data.push_back(FlatVector::GetData<double>(chunk.data[1 + column * 2]));
-		valid_data.push_back(FlatVector::GetData<uint8_t>(chunk.data[2 + column * 2]));
+		value_data.push_back(FlatVector::GetData<double>(chunk.data[1 + column]));
+		value_validity.push_back(&FlatVector::Validity(chunk.data[1 + column]));
 	}
 
 	if (join_validity.AllValid()) {
@@ -836,8 +846,8 @@ static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChu
 			auto output_offset = column * batch.value_stride + output_row;
 			std::memcpy(batch.values.data() + output_offset, value_data[column] + row_offset,
 			            append_count * sizeof(double));
-			std::memcpy(batch.validity.data() + output_offset, valid_data[column] + row_offset,
-			            append_count * sizeof(uint8_t));
+			CopyValidityToBytes(batch.validity.data() + output_offset, *value_validity[column], row_offset,
+			                    append_count);
 		}
 		batch.row_count += append_count;
 		row_offset += append_count;
@@ -855,7 +865,7 @@ static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChu
 		for (idx_t column = 0; column < column_count; column++) {
 			auto offset = column * batch.value_stride + output_row;
 			batch.values[offset] = value_data[column][row];
-			batch.validity[offset] = valid_data[column][row];
+			batch.validity[offset] = value_validity[column]->RowIsValid(row) ? 1 : 0;
 		}
 		batch.row_count++;
 	}
@@ -899,12 +909,12 @@ static void AppendDirectMultiPreparedChunkRows(DirectMultiPipelineBuffer &batch,
 	auto &join_validity = FlatVector::Validity(chunk.data[0]);
 
 	vector<const double *> value_data;
-	vector<const uint8_t *> valid_data;
+	vector<ValidityMask *> value_validity;
 	value_data.reserve(column_count);
-	valid_data.reserve(column_count);
+	value_validity.reserve(column_count);
 	for (idx_t column = 0; column < column_count; column++) {
-		value_data.push_back(FlatVector::GetData<double>(chunk.data[1 + column * 2]));
-		valid_data.push_back(FlatVector::GetData<uint8_t>(chunk.data[2 + column * 2]));
+		value_data.push_back(FlatVector::GetData<double>(chunk.data[1 + column]));
+		value_validity.push_back(&FlatVector::Validity(chunk.data[1 + column]));
 	}
 
 	if (join_validity.AllValid()) {
@@ -920,8 +930,7 @@ static void AppendDirectMultiPreparedChunkRows(DirectMultiPipelineBuffer &batch,
 		for (idx_t column = 0; column < column_count; column++) {
 			auto output_offset = column * batch.value_stride + output_row;
 			std::memcpy(batch.values + output_offset, value_data[column] + row_offset, append_count * sizeof(double));
-			std::memcpy(batch.validity + output_offset, valid_data[column] + row_offset,
-			            append_count * sizeof(uint8_t));
+			CopyValidityToBytes(batch.validity + output_offset, *value_validity[column], row_offset, append_count);
 		}
 		batch.row_count += append_count;
 		row_offset += append_count;
@@ -939,7 +948,7 @@ static void AppendDirectMultiPreparedChunkRows(DirectMultiPipelineBuffer &batch,
 		for (idx_t column = 0; column < column_count; column++) {
 			auto offset = column * batch.value_stride + output_row;
 			batch.values[offset] = value_data[column][row];
-			batch.validity[offset] = valid_data[column][row];
+			batch.validity[offset] = value_validity[column]->RowIsValid(row) ? 1 : 0;
 		}
 		batch.row_count++;
 	}
@@ -971,9 +980,7 @@ static string BuildMultiProbeQuery(const string &fact_path, const string &join_k
 	query += "::BIGINT AS join_key";
 	for (idx_t column = 0; column < payload_columns.size(); column++) {
 		auto quoted = QuoteIdentifier(payload_columns[column]);
-		query += ", COALESCE(" + quoted + ", 0)::DOUBLE AS value_" + std::to_string(column);
-		query += ", CASE WHEN " + quoted + " IS NULL THEN 0 ELSE 1 END::UTINYINT AS valid_" +
-		         std::to_string(column);
+		query += ", " + quoted + "::DOUBLE AS value_" + std::to_string(column);
 	}
 	query += " FROM read_parquet('" + EscapeSQLString(fact_path) + "')";
 	return query;
@@ -1000,10 +1007,10 @@ static void AppendMultiProbeChunk(DataChunk &chunk, MultiProbeColumns &columns, 
 		}
 		columns.join_keys.push_back(join_data[row]);
 		for (idx_t column = 0; column < column_count; column++) {
-			auto value_data = FlatVector::GetData<double>(chunk.data[1 + column * 2]);
-			auto valid_data = FlatVector::GetData<uint8_t>(chunk.data[2 + column * 2]);
+			auto value_data = FlatVector::GetData<double>(chunk.data[1 + column]);
+			auto &value_validity = FlatVector::Validity(chunk.data[1 + column]);
 			columns.values[column].push_back(value_data[row]);
-			columns.validity[column].push_back(valid_data[row]);
+			columns.validity[column].push_back(value_validity.RowIsValid(row) ? 1 : 0);
 		}
 	}
 }
