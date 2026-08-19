@@ -22,7 +22,7 @@ def parse_args():
     parser.add_argument("--join-key", default="grid")
     parser.add_argument("--group-column", default="lats")
     parser.add_argument("--dimension-file", default="grid.parquet")
-    parser.add_argument("--read-mode", default="per-file", choices=["per-file", "glob"])
+    parser.add_argument("--read-mode", default="per-file", choices=["per-file", "glob", "sharded"])
     parser.add_argument("--print-stage-times", action="store_true")
     parser.add_argument("--reuse-dimension-mapping", action="store_true")
     parser.add_argument("--prefetch-files", action="store_true")
@@ -94,6 +94,25 @@ def read_auto_payload_columns(parquet_path):
     return columns
 
 
+def read_env_positive_int(name, default_value):
+    value = os.environ.get(name)
+    if not value:
+        return default_value
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default_value
+    return parsed if parsed > 0 else default_value
+
+
+def shard_paths(paths, shard_count):
+    shard_count = max(1, min(shard_count, len(paths)))
+    shards = [[] for _ in range(shard_count)]
+    for idx, path in enumerate(paths):
+        shards[idx % shard_count].append(path)
+    return ["\n".join(shard) for shard in shards if shard]
+
+
 def main():
     args = parse_args()
     parquet_paths = sorted(glob.glob(os.path.join(args.base_dir, "UP-*", "time-levs-grid.parquet")))
@@ -106,6 +125,12 @@ def main():
     dimension_file = args.dimension_file
     if args.read_mode == "glob":
         fact_inputs = [os.path.join(args.base_dir, "UP-*", "time-levs-grid.parquet")]
+        dimension_file = grid_paths[0]
+    elif args.read_mode == "sharded":
+        if not grid_paths:
+            raise SystemExit("no {} files found".format(args.dimension_file))
+        reader_threads = read_env_positive_int("DUCKDB_GPU_PIPELINE_READER_THREADS", 1)
+        fact_inputs = shard_paths(parquet_paths, reader_threads)
         dimension_file = grid_paths[0]
 
     if args.vars and args.vars.strip().lower() == "all":

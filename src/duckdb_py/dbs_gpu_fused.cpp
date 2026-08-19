@@ -154,11 +154,53 @@ static string ParentPath(const string &path) {
 	return path.substr(0, slash);
 }
 
+static vector<string> SplitFactPathGroup(const string &fact_path) {
+	vector<string> paths;
+	idx_t start = 0;
+	while (start <= fact_path.size()) {
+		auto next = fact_path.find('\n', start);
+		auto end = next == string::npos ? fact_path.size() : next;
+		if (end > start) {
+			paths.push_back(fact_path.substr(start, end - start));
+		}
+		if (next == string::npos) {
+			break;
+		}
+		start = next + 1;
+	}
+	if (paths.empty()) {
+		paths.push_back(fact_path);
+	}
+	return paths;
+}
+
+static string FirstFactPath(const string &fact_path) {
+	auto paths = SplitFactPathGroup(fact_path);
+	return paths[0];
+}
+
+static string BuildReadParquetExpression(const string &fact_path) {
+	auto paths = SplitFactPathGroup(fact_path);
+	if (paths.size() == 1) {
+		return "read_parquet('" + EscapeSQLString(paths[0]) + "')";
+	}
+
+	string result = "read_parquet([";
+	for (idx_t path = 0; path < paths.size(); path++) {
+		if (path > 0) {
+			result += ", ";
+		}
+		result += "'" + EscapeSQLString(paths[path]) + "'";
+	}
+	result += "])";
+	return result;
+}
+
 static string ResolveDimensionPath(const string &fact_path, const string &dimension_file) {
 	if (!dimension_file.empty() && (dimension_file[0] == '/' || dimension_file.find('/') != string::npos)) {
 		return dimension_file;
 	}
-	return ParentPath(fact_path) + "/" + dimension_file;
+	return ParentPath(FirstFactPath(fact_path)) + "/" + dimension_file;
 }
 
 static idx_t ReadEnvIdx(const char *name, idx_t default_value) {
@@ -676,7 +718,10 @@ static void PrefetchPipelineFiles(vector<string> fact_paths, string dimension_fi
 	const bool reuse_dimension_mapping = ReadEnvFlag("DUCKDB_GPU_REUSE_DIMENSION_MAPPING", false);
 	string reused_dimension_path;
 	for (auto &fact_path : fact_paths) {
-		prefetch_paths.insert(fact_path);
+		auto paths = SplitFactPathGroup(fact_path);
+		for (auto &path : paths) {
+			prefetch_paths.insert(path);
+		}
 		if (prefetch_dimension_files) {
 			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
 			if (!reuse_dimension_mapping) {
@@ -1015,9 +1060,9 @@ static double ElapsedSeconds(std::chrono::steady_clock::time_point start) {
 static string BuildProbeQuery(const string &fact_path, const string &join_key, const string &payload_column) {
 	return StringUtil::Format(
 	    "SELECT %s::BIGINT AS join_key, COALESCE(%s, 0)::DOUBLE AS value, "
-	    "CASE WHEN %s IS NULL THEN 0 ELSE 1 END::UTINYINT AS value_valid FROM read_parquet('%s')",
+	    "CASE WHEN %s IS NULL THEN 0 ELSE 1 END::UTINYINT AS value_valid FROM %s",
 	    QuoteIdentifier(join_key), QuoteIdentifier(payload_column), QuoteIdentifier(payload_column),
-	    EscapeSQLString(fact_path));
+	    BuildReadParquetExpression(fact_path));
 }
 
 static void AppendProbeChunk(DataChunk &chunk, ProbeColumns &columns) {
@@ -1392,7 +1437,7 @@ static string BuildMultiProbeQuery(const string &fact_path, const string &join_k
 		auto quoted = QuoteIdentifier(payload_columns[column]);
 		query += ", " + quoted + " AS value_" + std::to_string(column);
 	}
-	query += " FROM read_parquet('" + EscapeSQLString(fact_path) + "')";
+	query += " FROM " + BuildReadParquetExpression(fact_path);
 	return query;
 }
 
