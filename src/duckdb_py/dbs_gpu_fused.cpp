@@ -2307,9 +2307,15 @@ static void ConfigureDirectParquetReaderProjection(ParquetReader &reader, const 
 
 static void MakeDirectMappedParquetOutputChunk(DataChunk &result, DirectMultiPipelineBuffer &buffer, idx_t output_row,
                                                idx_t column_count) {
+	vector<LogicalType> types;
+	types.reserve(column_count);
+	for (idx_t column = 0; column < column_count; column++) {
+		types.emplace_back(LogicalType::DOUBLE);
+	}
+	result.InitializeEmpty(types);
 	for (idx_t column = 0; column < column_count; column++) {
 		auto value_ptr = buffer.values + column * buffer.value_stride + output_row;
-		result.data.emplace_back(LogicalType::DOUBLE, reinterpret_cast<data_ptr_t>(value_ptr));
+		FlatVector::SetData(result.data[column], reinterpret_cast<data_ptr_t>(value_ptr));
 	}
 	result.SetCapacity(STANDARD_VECTOR_SIZE);
 }
