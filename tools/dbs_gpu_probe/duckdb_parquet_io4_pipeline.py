@@ -47,6 +47,17 @@ def parse_args():
     parser.add_argument("--local-io-uring-readahead-depth", type=int, default=None)
     parser.add_argument("--duckdb-parquet-async-prefetch", action="store_true")
     parser.add_argument(
+        "--parquet-page-prefetch",
+        action="store_true",
+        help="prefetch compressed Parquet page/window ranges inside DuckDB's Parquet column reader",
+    )
+    parser.add_argument(
+        "--parquet-page-prefetch-bytes",
+        type=int,
+        default=None,
+        help="byte window used by --parquet-page-prefetch; defaults to 1 MiB in the C++ reader",
+    )
+    parser.add_argument(
         "--fetch-raw",
         action="store_true",
         help="use DuckDB FetchRaw and consume scan vectors without the regular Fetch materialization path",
@@ -213,6 +224,14 @@ def main():
         os.environ["DUCKDB_LOCAL_IO_URING_READAHEAD_DEPTH"] = str(args.local_io_uring_readahead_depth)
     if args.duckdb_parquet_async_prefetch:
         os.environ["DUCKDB_PARQUET_ASYNC_PREFETCH"] = "1"
+    if args.parquet_page_prefetch:
+        os.environ["DUCKDB_PARQUET_PAGE_PREFETCH"] = "1"
+        os.environ.setdefault("DUCKDB_PARQUET_ASYNC_PREFETCH", "1")
+        os.environ.setdefault("DUCKDB_PARQUET_ASYNC_SINGLE_PREFETCH", "1")
+    if args.parquet_page_prefetch_bytes is not None:
+        if args.parquet_page_prefetch_bytes <= 0:
+            raise SystemExit("--parquet-page-prefetch-bytes must be positive")
+        os.environ["DUCKDB_PARQUET_PAGE_PREFETCH_BYTES"] = str(args.parquet_page_prefetch_bytes)
     if args.parquet_direct_decode:
         os.environ["DUCKDB_GPU_PARQUET_DIRECT_DECODE"] = "1"
     if args.fetch_raw or (not args.regular_fetch and args.mode.startswith("pipeline-")):
@@ -268,6 +287,8 @@ def main():
         )
     if args.duckdb_parquet_async_prefetch:
         print("[duckdb parquet async prefetch]: on")
+    if os.environ.get("DUCKDB_PARQUET_PAGE_PREFETCH") == "1":
+        print("[duckdb parquet page prefetch]: bytes={}".format(os.environ.get("DUCKDB_PARQUET_PAGE_PREFETCH_BYTES", "default")))
     if os.environ.get("DUCKDB_GPU_PARQUET_DIRECT_DECODE") == "1":
         print("[parquet direct decode]: on")
     if os.environ.get("DUCKDB_GPU_FETCH_RAW") == "1":
@@ -329,6 +350,28 @@ def main():
             "[dimension mapping] reads={} reuses={}".format(
                 int(stage.get("dimension_mapping_reads", 0)),
                 int(stage.get("dimension_mapping_reuses", 0)),
+            )
+        )
+        print(
+            "[parquet detail] header={:.6f}s payload_read={:.6f}s decompress={:.6f}s "
+            "prepare_page={:.6f}s decode={:.6f}s page_prefetch={:.6f}s".format(
+                float(stage.get("parquet_page_header_time", 0.0)),
+                float(stage.get("parquet_page_payload_read_time", 0.0)),
+                float(stage.get("parquet_page_decompress_time", 0.0)),
+                float(stage.get("parquet_page_prepare_time", 0.0)),
+                float(stage.get("parquet_page_decode_time", 0.0)),
+                float(stage.get("parquet_page_prefetch_time", 0.0)),
+            )
+        )
+        print(
+            "[parquet counts] pages={} payload_bytes={} decoded_rows={} decode_calls={} "
+            "prefetch_ranges={} prefetch_bytes={}".format(
+                int(stage.get("parquet_pages", 0)),
+                int(stage.get("parquet_page_payload_bytes", 0)),
+                int(stage.get("parquet_decoded_rows", 0)),
+                int(stage.get("parquet_decode_calls", 0)),
+                int(stage.get("parquet_prefetch_ranges", 0)),
+                int(stage.get("parquet_prefetch_bytes", 0)),
             )
         )
     print("[query time]: {:.6f}s".format(float(result["query_time"])))

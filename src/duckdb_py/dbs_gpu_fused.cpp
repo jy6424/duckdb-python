@@ -36,6 +36,24 @@
 
 namespace py = pybind11;
 
+struct DuckDBDBSParquetReaderMetricsSnapshot {
+	uint64_t page_header_ns;
+	uint64_t page_payload_read_ns;
+	uint64_t page_decompress_ns;
+	uint64_t page_decode_ns;
+	uint64_t page_prepare_ns;
+	uint64_t page_prefetch_ns;
+	uint64_t pages;
+	uint64_t page_payload_bytes;
+	uint64_t decoded_rows;
+	uint64_t decode_calls;
+	uint64_t prefetch_ranges;
+	uint64_t prefetch_bytes;
+};
+
+extern "C" void duckdb_dbs_parquet_reader_metrics_reset();
+extern "C" void duckdb_dbs_parquet_reader_metrics_snapshot(DuckDBDBSParquetReaderMetricsSnapshot *out);
+
 namespace duckdb {
 
 namespace {
@@ -1199,6 +1217,10 @@ struct MultiPipelineStageTimers {
 
 static double ElapsedSeconds(std::chrono::steady_clock::time_point start) {
 	return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+
+static double NanosecondsToSeconds(uint64_t ns) {
+	return static_cast<double>(ns) / 1000000000.0;
 }
 
 static string BuildProbeQuery(const string &fact_path, const string &join_key, const string &payload_column) {
@@ -3660,6 +3682,7 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 	auto payload_columns = ParsePayloadColumns(payload_columns_p);
 	auto column_count = payload_columns.size();
 
+	duckdb_dbs_parquet_reader_metrics_reset();
 	auto start = std::chrono::steady_clock::now();
 	DuckDB db(nullptr);
 	Connection connection(db);
@@ -3995,6 +4018,21 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		stage_times["dimension_mapping_reads"] = py::int_(stage_timers.dimension_mapping_reads);
 		stage_times["dimension_mapping_reuses"] = py::int_(stage_timers.dimension_mapping_reuses);
 	}
+	DuckDBDBSParquetReaderMetricsSnapshot parquet_metrics;
+	duckdb_dbs_parquet_reader_metrics_snapshot(&parquet_metrics);
+	stage_times["parquet_page_header_time"] = py::float_(NanosecondsToSeconds(parquet_metrics.page_header_ns));
+	stage_times["parquet_page_payload_read_time"] =
+	    py::float_(NanosecondsToSeconds(parquet_metrics.page_payload_read_ns));
+	stage_times["parquet_page_decompress_time"] = py::float_(NanosecondsToSeconds(parquet_metrics.page_decompress_ns));
+	stage_times["parquet_page_decode_time"] = py::float_(NanosecondsToSeconds(parquet_metrics.page_decode_ns));
+	stage_times["parquet_page_prepare_time"] = py::float_(NanosecondsToSeconds(parquet_metrics.page_prepare_ns));
+	stage_times["parquet_page_prefetch_time"] = py::float_(NanosecondsToSeconds(parquet_metrics.page_prefetch_ns));
+	stage_times["parquet_pages"] = py::int_(parquet_metrics.pages);
+	stage_times["parquet_page_payload_bytes"] = py::int_(parquet_metrics.page_payload_bytes);
+	stage_times["parquet_decoded_rows"] = py::int_(parquet_metrics.decoded_rows);
+	stage_times["parquet_decode_calls"] = py::int_(parquet_metrics.decode_calls);
+	stage_times["parquet_prefetch_ranges"] = py::int_(parquet_metrics.prefetch_ranges);
+	stage_times["parquet_prefetch_bytes"] = py::int_(parquet_metrics.prefetch_bytes);
 	result["stage_times"] = stage_times;
 
 	py::list payloads;
