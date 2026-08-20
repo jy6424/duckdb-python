@@ -1268,6 +1268,10 @@ static idx_t MultiPayloadColumnOffset() {
 	return InferGridFromRowOrder() ? 0 : 1;
 }
 
+static bool AssumePayloadAllValid() {
+	return ReadEnvFlag("DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID", false);
+}
+
 static int64_t RowOrderJoinKey(const GroupMapping &mapping, idx_t row_number) {
 	auto mapping_size = mapping.join_to_group.size();
 	if (mapping_size == 0) {
@@ -1355,7 +1359,9 @@ static void AppendMultiPreparedRows(MultiPipelineInputBatch &batch, MultiPipelin
 		batch.value_stride = target_batch_rows;
 		batch.join_keys.reserve(target_batch_rows);
 		batch.values.resize(column_count * target_batch_rows);
-		batch.validity.resize(column_count * target_batch_rows);
+		if (!AssumePayloadAllValid()) {
+			batch.validity.resize(column_count * target_batch_rows);
+		}
 	}
 	auto count = raw.join_keys.size();
 
@@ -1371,7 +1377,9 @@ static void AppendMultiPreparedRows(MultiPipelineInputBatch &batch, MultiPipelin
 		for (idx_t column = 0; column < column_count; column++) {
 			auto offset = column * batch.value_stride + output_row;
 			batch.values[offset] = raw.values[column][row];
-			batch.validity[offset] = raw.validity[column][row];
+			if (!AssumePayloadAllValid()) {
+				batch.validity[offset] = raw.validity[column][row];
+			}
 		}
 		batch.row_count++;
 	}
@@ -1386,7 +1394,9 @@ static void StartMultiPipelineInputBatch(MultiPipelineInputBatch &batch, const s
 	batch.value_stride = target_batch_rows;
 	batch.join_keys.reserve(target_batch_rows);
 	batch.values.resize(column_count * target_batch_rows);
-	batch.validity.resize(column_count * target_batch_rows);
+	if (!AssumePayloadAllValid()) {
+		batch.validity.resize(column_count * target_batch_rows);
+	}
 }
 
 static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChunk &chunk, idx_t chunk_row_base,
@@ -1431,8 +1441,10 @@ static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChu
 				auto output_offset = column * batch.value_stride + output_row;
 				std::memcpy(batch.values.data() + output_offset, value_data[column] + row_offset,
 				            append_count * sizeof(double));
-				CopyValidityToBytes(batch.validity.data() + output_offset, *value_validity[column], row_offset,
-				                    append_count);
+				if (!AssumePayloadAllValid()) {
+					CopyValidityToBytes(batch.validity.data() + output_offset, *value_validity[column], row_offset,
+					                    append_count);
+				}
 			}
 			batch.row_count += append_count;
 			row_offset += append_count;
@@ -1450,7 +1462,9 @@ static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChu
 			for (idx_t column = 0; column < column_count; column++) {
 				auto offset = column * batch.value_stride + output_row;
 				batch.values[offset] = value_data[column][row];
-				batch.validity[offset] = value_validity[column]->RowIsValid(row) ? 1 : 0;
+				if (!AssumePayloadAllValid()) {
+					batch.validity[offset] = value_validity[column]->RowIsValid(row) ? 1 : 0;
+				}
 			}
 			batch.row_count++;
 		}
@@ -1487,8 +1501,10 @@ static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChu
 		for (idx_t column = 0; column < column_count; column++) {
 			auto output_offset = column * batch.value_stride + output_row;
 			CopyUnifiedValues(batch.values.data() + output_offset, value_data[column], row_offset, append_count);
-			CopyUnifiedValidityToBytes(batch.validity.data() + output_offset, value_data[column], row_offset,
-			                           append_count);
+			if (!AssumePayloadAllValid()) {
+				CopyUnifiedValidityToBytes(batch.validity.data() + output_offset, value_data[column], row_offset,
+				                           append_count);
+			}
 		}
 		batch.row_count += append_count;
 		row_offset += append_count;
@@ -1506,7 +1522,9 @@ static void AppendMultiPreparedChunkRows(MultiPipelineInputBatch &batch, DataChu
 		for (idx_t column = 0; column < column_count; column++) {
 			auto offset = column * batch.value_stride + output_row;
 			batch.values[offset] = value_data[column].Value(row);
-			batch.validity[offset] = value_data[column].RowIsValid(row) ? 1 : 0;
+			if (!AssumePayloadAllValid()) {
+				batch.validity[offset] = value_data[column].RowIsValid(row) ? 1 : 0;
+			}
 		}
 		batch.row_count++;
 	}
@@ -1535,7 +1553,7 @@ static void StartDirectMultiPipelineBuffer(FusedLatAggMultiDirectPipelineFuncs p
 	} else {
 		auto rc = pipeline.prepare_input(handle, static_cast<uint32_t>(slot), static_cast<uint64_t>(target_batch_rows),
 		                                 static_cast<uint64_t>(column_count), &join_keys, &values, &validity);
-		if (rc != 0 || !join_keys || !values || !validity) {
+		if (rc != 0 || !join_keys || !values || (!validity && !AssumePayloadAllValid())) {
 			throw InvalidInputException("GPU fused direct multi pipeline input preparation failed for '%s'",
 			                            chunk_batch.fact_path);
 		}
@@ -1600,13 +1618,16 @@ static void AppendDeviceDirectMultiPreparedChunkRows(FusedLatAggMultiDirectPipel
 
 		for (idx_t column = 0; column < column_count; column++) {
 			auto value_data = FlatVector::GetData<double>(chunk.data[payload_offset + column]);
-			auto &value_validity = FlatVector::Validity(chunk.data[payload_offset + column]);
 			const uint8_t *validity_data = nullptr;
-			auto all_valid = value_validity.AllValid();
+			auto all_valid = AssumePayloadAllValid();
 			if (!all_valid) {
-				validity_scratch.resize(append_count);
-				CopyValidityToBytes(validity_scratch.data(), value_validity, row_offset, append_count);
-				validity_data = validity_scratch.data();
+				auto &value_validity = FlatVector::Validity(chunk.data[payload_offset + column]);
+				all_valid = value_validity.AllValid();
+				if (!all_valid) {
+					validity_scratch.resize(append_count);
+					CopyValidityToBytes(validity_scratch.data(), value_validity, row_offset, append_count);
+					validity_data = validity_scratch.data();
+				}
 			}
 			rc = pipeline.copy_values(handle, static_cast<uint32_t>(batch.slot), static_cast<uint64_t>(column),
 			                          static_cast<uint64_t>(output_row), value_data + row_offset, validity_data,
@@ -1654,7 +1675,7 @@ static void AppendDeviceDirectMultiPreparedChunkRows(FusedLatAggMultiDirectPipel
 	for (idx_t column = 0; column < column_count; column++) {
 		UnifiedColumnReader<double> value_data(chunk.data[payload_offset + column], count);
 		const uint8_t *validity_data = nullptr;
-		auto all_valid = value_data.format.validity.AllValid();
+		auto all_valid = AssumePayloadAllValid() || value_data.format.validity.AllValid();
 		vector<double> value_scratch;
 		value_scratch.resize(append_count);
 		CopyUnifiedValues(value_scratch.data(), value_data, row_offset, append_count);
@@ -1716,8 +1737,10 @@ static void AppendDirectMultiPreparedChunkRows(DirectMultiPipelineBuffer &batch,
 				auto output_offset = column * batch.value_stride + output_row;
 				std::memcpy(batch.values + output_offset, value_data[column] + row_offset,
 				            append_count * sizeof(double));
-				CopyValidityToBytes(batch.validity + output_offset, *value_validity[column], row_offset,
-				                    append_count);
+				if (!AssumePayloadAllValid()) {
+					CopyValidityToBytes(batch.validity + output_offset, *value_validity[column], row_offset,
+					                    append_count);
+				}
 			}
 			batch.row_count += append_count;
 			row_offset += append_count;
@@ -1735,7 +1758,9 @@ static void AppendDirectMultiPreparedChunkRows(DirectMultiPipelineBuffer &batch,
 			for (idx_t column = 0; column < column_count; column++) {
 				auto offset = column * batch.value_stride + output_row;
 				batch.values[offset] = value_data[column][row];
-				batch.validity[offset] = value_validity[column]->RowIsValid(row) ? 1 : 0;
+				if (!AssumePayloadAllValid()) {
+					batch.validity[offset] = value_validity[column]->RowIsValid(row) ? 1 : 0;
+				}
 			}
 			batch.row_count++;
 		}
@@ -1773,7 +1798,9 @@ static void AppendDirectMultiPreparedChunkRows(DirectMultiPipelineBuffer &batch,
 		for (idx_t column = 0; column < column_count; column++) {
 			auto output_offset = column * batch.value_stride + output_row;
 			CopyUnifiedValues(batch.values + output_offset, value_data[column], row_offset, append_count);
-			CopyUnifiedValidityToBytes(batch.validity + output_offset, value_data[column], row_offset, append_count);
+			if (!AssumePayloadAllValid()) {
+				CopyUnifiedValidityToBytes(batch.validity + output_offset, value_data[column], row_offset, append_count);
+			}
 		}
 		batch.row_count += append_count;
 		row_offset += append_count;
@@ -1791,7 +1818,9 @@ static void AppendDirectMultiPreparedChunkRows(DirectMultiPipelineBuffer &batch,
 		for (idx_t column = 0; column < column_count; column++) {
 			auto offset = column * batch.value_stride + output_row;
 			batch.values[offset] = value_data[column].Value(row);
-			batch.validity[offset] = value_data[column].RowIsValid(row) ? 1 : 0;
+			if (!AssumePayloadAllValid()) {
+				batch.validity[offset] = value_data[column].RowIsValid(row) ? 1 : 0;
+			}
 		}
 		batch.row_count++;
 	}
@@ -2380,6 +2409,9 @@ static void FinishDirectMappedDecodedChunk(DirectMultiPipelineBuffer &buffer, Da
 		buffer.join_keys[output_row + row] = RowOrderJoinKey(*buffer.mapping, chunk_row_base + row);
 	}
 	for (idx_t column = 0; column < column_count; column++) {
+		if (AssumePayloadAllValid()) {
+			continue;
+		}
 		auto validity_out = buffer.validity + column * buffer.value_stride + output_row;
 		auto &validity = FlatVector::Validity(chunk.data[column]);
 		if (validity.AllValid()) {
@@ -3322,7 +3354,8 @@ static void RunMultiPipelineGPUWorker(FusedLatAggMultiStridedFunc fused_agg,
 			output.row_counts.assign(group_count, 0);
 
 			auto gpu_start = std::chrono::steady_clock::now();
-			auto rc = fused_agg(batch.join_keys.data(), batch.values.data(), batch.validity.data(),
+			auto validity = batch.validity.empty() ? nullptr : batch.validity.data();
+			auto rc = fused_agg(batch.join_keys.data(), batch.values.data(), validity,
 			                    static_cast<uint64_t>(column_count), static_cast<uint64_t>(batch.value_stride),
 			                    static_cast<uint64_t>(row_count), batch.mapping->join_min, batch.mapping->join_max,
 			                    batch.mapping->join_to_group.data(),

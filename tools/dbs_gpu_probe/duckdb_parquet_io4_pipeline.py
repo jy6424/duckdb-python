@@ -78,6 +78,11 @@ def parse_args():
         help="decode Parquet DOUBLE payload columns directly into mapped GPU pipeline slot buffers",
     )
     parser.add_argument(
+        "--assume-payload-all-valid",
+        action="store_true",
+        help="treat payload DOUBLE columns as non-null and skip validity buffer generation/copy",
+    )
+    parser.add_argument(
         "--reader-duckdb-threads",
         type=int,
         default=None,
@@ -244,6 +249,8 @@ def main():
         os.environ["DUCKDB_PARQUET_PAGE_PREFETCH_BYTES"] = str(args.parquet_page_prefetch_bytes)
     if args.parquet_direct_decode:
         os.environ["DUCKDB_GPU_PARQUET_DIRECT_DECODE"] = "1"
+    if args.assume_payload_all_valid:
+        os.environ["DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID"] = "1"
     if args.fetch_raw or (not args.regular_fetch and args.mode.startswith("pipeline-")):
         os.environ["DUCKDB_GPU_FETCH_RAW"] = "1"
     if args.reader_duckdb_threads is not None:
@@ -303,6 +310,8 @@ def main():
         print("[duckdb parquet page prefetch only]: on")
     if os.environ.get("DUCKDB_GPU_PARQUET_DIRECT_DECODE") == "1":
         print("[parquet direct decode]: on")
+    if os.environ.get("DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID") == "1":
+        print("[assume payload all valid]: on")
     if os.environ.get("DUCKDB_GPU_FETCH_RAW") == "1":
         print("[duckdb fetch raw]: on")
     if args.infer_grid_from_row_order:

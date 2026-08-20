@@ -3,9 +3,23 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace {
+
+bool EnvFlag(const char *name) {
+	const auto value = std::getenv(name);
+	if (!value || value[0] == '\0') {
+		return false;
+	}
+	return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 && std::strcmp(value, "FALSE") != 0 &&
+	       std::strcmp(value, "off") != 0 && std::strcmp(value, "OFF") != 0;
+}
+
+bool AssumePayloadAllValid() {
+	return EnvFlag("DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID");
+}
 
 __global__ void DuckDBGpuProbeI64Kernel(const int64_t *keys, const uint8_t *validity, uint64_t count,
                                         int64_t min_value, int64_t max_value, const uint8_t *build_bitmap,
@@ -1292,6 +1306,7 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double_strided(
 	const auto grid_bytes = count * sizeof(int64_t);
 	const auto value_bytes = column_count * value_stride * sizeof(double);
 	const auto validity_bytes = column_count * value_stride * sizeof(uint8_t);
+	const bool assume_all_valid = !value_validity || AssumePayloadAllValid();
 	const auto build_bytes = build_size * sizeof(int32_t);
 	const auto sum_bytes = output_count * sizeof(double);
 	const auto output_count_bytes = output_count * sizeof(unsigned long long);
@@ -1300,7 +1315,9 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double_strided(
 	int error = 0;
 	error |= buffers.grids.Ensure(grid_bytes, "resize multi fused grids");
 	error |= buffers.values.Ensure(value_bytes, "resize multi fused values");
-	error |= buffers.value_validity.Ensure(validity_bytes, "resize multi fused value validity");
+	if (!assume_all_valid) {
+		error |= buffers.value_validity.Ensure(validity_bytes, "resize multi fused value validity");
+	}
 	error |= buffers.grid_to_group.Ensure(build_bytes, "resize multi fused grid to group");
 	error |= buffers.sums.Ensure(sum_bytes, "resize multi fused sums");
 	error |= buffers.counts.Ensure(output_count_bytes, "resize multi fused counts");
@@ -1311,7 +1328,7 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double_strided(
 
 	auto d_grids = buffers.grids.As<int64_t>();
 	auto d_values = buffers.values.As<double>();
-	auto d_value_validity = buffers.value_validity.As<uint8_t>();
+	uint8_t *d_value_validity = nullptr;
 	auto d_grid_to_group = buffers.grid_to_group.As<int32_t>();
 	auto d_sums = buffers.sums.As<double>();
 	auto d_counts = buffers.counts.As<unsigned long long>();
@@ -1321,11 +1338,10 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double_strided(
 	                   "copy multi fused grids to device");
 	error |= CheckCuda(cudaMemcpy(d_values, values, value_bytes, cudaMemcpyHostToDevice),
 	                   "copy multi fused values to device");
-	if (value_validity) {
+	if (!assume_all_valid) {
+		d_value_validity = buffers.value_validity.As<uint8_t>();
 		error |= CheckCuda(cudaMemcpy(d_value_validity, value_validity, validity_bytes, cudaMemcpyHostToDevice),
 		                   "copy multi fused value validity to device");
-	} else {
-		error |= CheckCuda(cudaMemset(d_value_validity, 1, validity_bytes), "set multi fused value validity");
 	}
 	error |= CheckCuda(cudaMemcpy(d_grid_to_group, grid_to_group, build_bytes, cudaMemcpyHostToDevice),
 	                   "copy multi fused grid to group to device");
@@ -1393,6 +1409,7 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double_strided_mapped(
 	const auto grid_bytes = count * sizeof(int64_t);
 	const auto value_bytes = column_count * value_stride * sizeof(double);
 	const auto validity_bytes = column_count * value_stride * sizeof(uint8_t);
+	const bool assume_all_valid = !value_validity || AssumePayloadAllValid();
 	const auto build_bytes = build_size * sizeof(int32_t);
 	const auto sum_bytes = output_count * sizeof(double);
 	const auto output_count_bytes = output_count * sizeof(unsigned long long);
@@ -1401,7 +1418,9 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double_strided_mapped(
 	int error = 0;
 	error |= buffers.grids.Ensure(grid_bytes, "resize mapped multi fused grids");
 	error |= buffers.values.Ensure(value_bytes, "resize mapped multi fused values");
-	error |= buffers.value_validity.Ensure(validity_bytes, "resize mapped multi fused value validity");
+	if (!assume_all_valid) {
+		error |= buffers.value_validity.Ensure(validity_bytes, "resize mapped multi fused value validity");
+	}
 	error |= buffers.grid_to_group.Ensure(build_bytes, "resize mapped multi fused grid to group");
 	error |= buffers.sums.Ensure(sum_bytes, "resize mapped multi fused sums");
 	error |= buffers.counts.Ensure(output_count_bytes, "resize mapped multi fused counts");
@@ -1412,11 +1431,10 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double_strided_mapped(
 
 	auto h_grids = buffers.grids.HostAs<int64_t>();
 	auto h_values = buffers.values.HostAs<double>();
-	auto h_value_validity = buffers.value_validity.HostAs<uint8_t>();
 	auto h_grid_to_group = buffers.grid_to_group.HostAs<int32_t>();
 	auto d_grids = buffers.grids.DeviceAs<int64_t>();
 	auto d_values = buffers.values.DeviceAs<double>();
-	auto d_value_validity = buffers.value_validity.DeviceAs<uint8_t>();
+	uint8_t *d_value_validity = nullptr;
 	auto d_grid_to_group = buffers.grid_to_group.DeviceAs<int32_t>();
 	auto d_sums = buffers.sums.As<double>();
 	auto d_counts = buffers.counts.As<unsigned long long>();
@@ -1424,10 +1442,10 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double_strided_mapped(
 
 	std::memcpy(h_grids, grids, grid_bytes);
 	std::memcpy(h_values, values, value_bytes);
-	if (value_validity) {
+	if (!assume_all_valid) {
+		auto h_value_validity = buffers.value_validity.HostAs<uint8_t>();
 		std::memcpy(h_value_validity, value_validity, validity_bytes);
-	} else {
-		std::memset(h_value_validity, 1, validity_bytes);
+		d_value_validity = buffers.value_validity.DeviceAs<uint8_t>();
 	}
 	std::memcpy(h_grid_to_group, grid_to_group, build_bytes);
 
@@ -1940,28 +1958,33 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_prepare_input_i64_double(
 	const auto grid_bytes = capacity * sizeof(int64_t);
 	const auto value_bytes = column_count * capacity * sizeof(double);
 	const auto validity_bytes = column_count * capacity * sizeof(uint8_t);
+	const bool assume_all_valid = AssumePayloadAllValid();
 
 	int error = 0;
 	if (slot.IsMapped()) {
 		error |= slot.mapped_grids.Ensure(grid_bytes, "resize mapped direct multi pipeline grids");
 		error |= slot.mapped_values.Ensure(value_bytes, "resize mapped direct multi pipeline values");
-		error |= slot.mapped_value_validity.Ensure(validity_bytes, "resize mapped direct multi pipeline validity");
+		if (!assume_all_valid) {
+			error |= slot.mapped_value_validity.Ensure(validity_bytes, "resize mapped direct multi pipeline validity");
+		}
 		if (error) {
 			return 1;
 		}
 		*grids_out = slot.mapped_grids.HostAs<int64_t>();
 		*values_out = slot.mapped_values.HostAs<double>();
-		*value_validity_out = slot.mapped_value_validity.HostAs<uint8_t>();
+		*value_validity_out = assume_all_valid ? nullptr : slot.mapped_value_validity.HostAs<uint8_t>();
 	} else {
 		error |= slot.managed_grids.Ensure(grid_bytes, "resize managed direct multi pipeline grids");
 		error |= slot.managed_values.Ensure(value_bytes, "resize managed direct multi pipeline values");
-		error |= slot.managed_value_validity.Ensure(validity_bytes, "resize managed direct multi pipeline validity");
+		if (!assume_all_valid) {
+			error |= slot.managed_value_validity.Ensure(validity_bytes, "resize managed direct multi pipeline validity");
+		}
 		if (error) {
 			return 1;
 		}
 		*grids_out = slot.managed_grids.As<int64_t>();
 		*values_out = slot.managed_values.As<double>();
-		*value_validity_out = slot.managed_value_validity.As<uint8_t>();
+		*value_validity_out = assume_all_valid ? nullptr : slot.managed_value_validity.As<uint8_t>();
 	}
 
 	slot.column_count = column_count;
@@ -1987,11 +2010,14 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_prepare_device_input_i64_
 	const auto grid_bytes = capacity * sizeof(int64_t);
 	const auto value_bytes = column_count * capacity * sizeof(double);
 	const auto validity_bytes = column_count * capacity * sizeof(uint8_t);
+	const bool assume_all_valid = AssumePayloadAllValid();
 
 	int error = 0;
 	error |= slot.grids.Ensure(grid_bytes, "resize device direct multi pipeline grids");
 	error |= slot.values.Ensure(value_bytes, "resize device direct multi pipeline values");
-	error |= slot.value_validity.Ensure(validity_bytes, "resize device direct multi pipeline validity");
+	if (!assume_all_valid) {
+		error |= slot.value_validity.Ensure(validity_bytes, "resize device direct multi pipeline validity");
+	}
 	if (error) {
 		return 1;
 	}
@@ -2040,17 +2066,19 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_copy_values_double(
 
 	const auto offset = column_idx * slot.value_stride + dst_offset;
 	auto dst_values = slot.values.As<double>() + offset;
-	auto dst_validity = slot.value_validity.As<uint8_t>() + offset;
+	const bool assume_all_valid = AssumePayloadAllValid();
 	int error = 0;
 	error |= CheckCuda(cudaMemcpy(dst_values, values, count * sizeof(double), cudaMemcpyHostToDevice),
 	                   "copy device direct multi pipeline values");
-	if (validity_all_valid) {
+	if (!assume_all_valid && validity_all_valid) {
+		auto dst_validity = slot.value_validity.As<uint8_t>() + offset;
 		error |= CheckCuda(cudaMemset(dst_validity, 1, count * sizeof(uint8_t)),
 		                   "set device direct multi pipeline validity");
-	} else if (value_validity) {
+	} else if (!assume_all_valid && value_validity) {
+		auto dst_validity = slot.value_validity.As<uint8_t>() + offset;
 		error |= CheckCuda(cudaMemcpy(dst_validity, value_validity, count * sizeof(uint8_t), cudaMemcpyHostToDevice),
 		                   "copy device direct multi pipeline validity");
-	} else {
+	} else if (!assume_all_valid) {
 		return 1;
 	}
 	return error ? 1 : 0;
@@ -2156,17 +2184,17 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_submit_prepared_i64_doubl
 	if (slot.IsMapped()) {
 		d_grids = slot.mapped_grids.DeviceAs<int64_t>();
 		d_values = slot.mapped_values.DeviceAs<double>();
-		d_value_validity = slot.mapped_value_validity.DeviceAs<uint8_t>();
+		d_value_validity = AssumePayloadAllValid() ? nullptr : slot.mapped_value_validity.DeviceAs<uint8_t>();
 		d_grid_to_group = slot.mapped_grid_to_group.DeviceAs<int32_t>();
 	} else if (slot.IsManaged()) {
 		d_grids = slot.managed_grids.As<int64_t>();
 		d_values = slot.managed_values.As<double>();
-		d_value_validity = slot.managed_value_validity.As<uint8_t>();
+		d_value_validity = AssumePayloadAllValid() ? nullptr : slot.managed_value_validity.As<uint8_t>();
 		d_grid_to_group = slot.managed_grid_to_group.As<int32_t>();
 	} else {
 		d_grids = slot.grids.As<int64_t>();
 		d_values = slot.values.As<double>();
-		d_value_validity = slot.value_validity.As<uint8_t>();
+		d_value_validity = AssumePayloadAllValid() ? nullptr : slot.value_validity.As<uint8_t>();
 		d_grid_to_group = slot.grid_to_group.As<int32_t>();
 	}
 
