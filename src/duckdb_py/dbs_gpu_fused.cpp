@@ -2397,7 +2397,9 @@ static void MakeDirectMappedParquetOutputChunk(DataChunk &result, DirectMultiPip
 	result.InitializeEmpty(types);
 	for (idx_t column = 0; column < column_count; column++) {
 		auto value_ptr = buffer.values + column * buffer.value_stride + output_row;
+		result.data[column].SetVectorType(VectorType::FLAT_VECTOR);
 		FlatVector::SetData(result.data[column], reinterpret_cast<data_ptr_t>(value_ptr));
+		FlatVector::Validity(result.data[column]).Reset(STANDARD_VECTOR_SIZE);
 	}
 	result.SetCapacity(STANDARD_VECTOR_SIZE);
 }
