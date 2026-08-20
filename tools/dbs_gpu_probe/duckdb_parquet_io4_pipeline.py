@@ -47,6 +47,17 @@ def parse_args():
     parser.add_argument("--local-io-uring-readahead-depth", type=int, default=None)
     parser.add_argument("--duckdb-parquet-async-prefetch", action="store_true")
     parser.add_argument(
+        "--parquet-column-chunk-prefetch",
+        action="store_true",
+        help="force DuckDB Parquet column-chunk prefetch for local files and overlap it with scan/decode",
+    )
+    parser.add_argument(
+        "--parquet-prefetch-workers",
+        type=int,
+        default=None,
+        help="number of DuckDB Parquet async prefetch workers per reader",
+    )
+    parser.add_argument(
         "--parquet-page-prefetch",
         action="store_true",
         help="prefetch compressed Parquet page/window ranges inside DuckDB's Parquet column reader",
@@ -234,6 +245,14 @@ def main():
         os.environ["DUCKDB_LOCAL_IO_URING_READAHEAD_DEPTH"] = str(args.local_io_uring_readahead_depth)
     if args.duckdb_parquet_async_prefetch:
         os.environ["DUCKDB_PARQUET_ASYNC_PREFETCH"] = "1"
+    if args.parquet_column_chunk_prefetch:
+        os.environ["DUCKDB_PARQUET_COLUMN_CHUNK_PREFETCH"] = "1"
+        os.environ.setdefault("DUCKDB_PARQUET_ASYNC_PREFETCH", "1")
+        os.environ.setdefault("DUCKDB_PARQUET_ASYNC_PREFETCH_WORKERS", "4")
+    if args.parquet_prefetch_workers is not None:
+        if args.parquet_prefetch_workers <= 0:
+            raise SystemExit("--parquet-prefetch-workers must be positive")
+        os.environ["DUCKDB_PARQUET_ASYNC_PREFETCH_WORKERS"] = str(args.parquet_prefetch_workers)
     if args.parquet_page_prefetch:
         os.environ["DUCKDB_PARQUET_PAGE_PREFETCH"] = "1"
         os.environ.setdefault("DUCKDB_PARQUET_ASYNC_PREFETCH", "1")
@@ -304,6 +323,12 @@ def main():
         )
     if args.duckdb_parquet_async_prefetch:
         print("[duckdb parquet async prefetch]: on")
+    if os.environ.get("DUCKDB_PARQUET_COLUMN_CHUNK_PREFETCH") == "1":
+        print(
+            "[duckdb parquet column chunk prefetch]: workers={}".format(
+                os.environ.get("DUCKDB_PARQUET_ASYNC_PREFETCH_WORKERS", "1")
+            )
+        )
     if os.environ.get("DUCKDB_PARQUET_PAGE_PREFETCH") == "1":
         print("[duckdb parquet page prefetch]: bytes={}".format(os.environ.get("DUCKDB_PARQUET_PAGE_PREFETCH_BYTES", "default")))
     if os.environ.get("DUCKDB_PARQUET_PAGE_PREFETCH_ONLY") == "1":
@@ -348,6 +373,38 @@ def main():
                 float(stage.get("read_fetch_time", 0.0)),
             )
         )
+        print(
+            "[read fetch] files={} rows={} chunks={} calls={} finished_calls={} "
+            "nonempty={:.6f}s finished={:.6f}s max_call={:.6f}s chunk_object={:.6f}s".format(
+                int(stage.get("read_files", 0)),
+                int(stage.get("read_rows", 0)),
+                int(stage.get("read_chunks", 0)),
+                int(stage.get("read_fetch_calls", 0)),
+                int(stage.get("read_finished_fetches", 0)),
+                float(stage.get("read_fetch_nonempty_time", 0.0)),
+                float(stage.get("read_fetch_finished_time", 0.0)),
+                float(stage.get("read_fetch_max_time", 0.0)),
+                float(stage.get("read_chunk_object_time", 0.0)),
+            )
+        )
+        if any(
+            float(stage.get(key, 0.0)) > 0.0
+            for key in (
+                "direct_slot_start_time",
+                "direct_output_chunk_time",
+                "direct_finish_chunk_time",
+                "direct_flush_time",
+            )
+        ):
+            print(
+                "[direct prepare] slot_start={:.6f}s output_chunk={:.6f}s "
+                "finish_chunk={:.6f}s flush={:.6f}s".format(
+                    float(stage.get("direct_slot_start_time", 0.0)),
+                    float(stage.get("direct_output_chunk_time", 0.0)),
+                    float(stage.get("direct_finish_chunk_time", 0.0)),
+                    float(stage.get("direct_flush_time", 0.0)),
+                )
+            )
         print(
             "[stage queue] read_push={:.6f}s prepare_pop={:.6f}s prepare_push={:.6f}s "
             "gpu_pop={:.6f}s gpu_push={:.6f}s merge_pop={:.6f}s".format(

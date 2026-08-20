@@ -1197,16 +1197,28 @@ struct MultiPipelineStageTimers {
 	double read_query_build_time = 0;
 	double read_query_submit_time = 0;
 	double read_fetch_time = 0;
+	double read_fetch_nonempty_time = 0;
+	double read_fetch_finished_time = 0;
+	double read_fetch_max_time = 0;
+	double read_chunk_object_time = 0;
 	double read_push_time = 0;
 	double read_thread_max_time = 0;
 	double prepare_pop_time = 0;
 	double prepare_work_time = 0;
 	double prepare_push_time = 0;
+	double direct_slot_start_time = 0;
+	double direct_output_chunk_time = 0;
+	double direct_finish_chunk_time = 0;
+	double direct_flush_time = 0;
 	double gpu_pop_time = 0;
 	double gpu_work_time = 0;
 	double gpu_push_time = 0;
 	double merge_pop_time = 0;
 	double merge_work_time = 0;
+	uint64_t read_files = 0;
+	uint64_t read_rows = 0;
+	uint64_t read_fetch_calls = 0;
+	uint64_t read_finished_fetches = 0;
 	uint64_t read_chunks = 0;
 	uint64_t prepared_batches = 0;
 	uint64_t gpu_batches = 0;
@@ -2169,7 +2181,15 @@ static void ReadMultiPipelineChunkBatchWorker(DuckDB &db, BlockingQueue<string> 
 	double query_build_elapsed = 0;
 	double query_submit_elapsed = 0;
 	double fetch_elapsed = 0;
+	double fetch_nonempty_elapsed = 0;
+	double fetch_finished_elapsed = 0;
+	double fetch_max_elapsed = 0;
+	double chunk_object_elapsed = 0;
 	double push_elapsed = 0;
+	uint64_t file_count = 0;
+	uint64_t row_count = 0;
+	uint64_t fetch_calls = 0;
+	uint64_t finished_fetches = 0;
 	uint64_t mapping_reads = 0;
 	uint64_t mapping_reuses = 0;
 	try {
@@ -2180,6 +2200,7 @@ static void ReadMultiPipelineChunkBatchWorker(DuckDB &db, BlockingQueue<string> 
 		auto reuse_dimension_mapping = ReadEnvFlag("DUCKDB_GPU_REUSE_DIMENSION_MAPPING", false);
 		string fact_path;
 		while (file_queue.Pop(fact_path)) {
+			file_count++;
 			auto setup_start = std::chrono::steady_clock::now();
 			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
 			auto cache_key =
@@ -2214,17 +2235,26 @@ static void ReadMultiPipelineChunkBatchWorker(DuckDB &db, BlockingQueue<string> 
 			while (true) {
 				auto fetch_start = std::chrono::steady_clock::now();
 				auto chunk = FetchGpuPipelineChunk(*result);
-				fetch_elapsed += ElapsedSeconds(fetch_start);
+				auto fetch_call_elapsed = ElapsedSeconds(fetch_start);
+				fetch_elapsed += fetch_call_elapsed;
+				fetch_max_elapsed = std::max(fetch_max_elapsed, fetch_call_elapsed);
+				fetch_calls++;
 				if (!chunk || chunk->size() == 0) {
+					fetch_finished_elapsed += fetch_call_elapsed;
+					finished_fetches++;
 					break;
 				}
+				fetch_nonempty_elapsed += fetch_call_elapsed;
+				row_count += chunk->size();
 
+				auto chunk_object_start = std::chrono::steady_clock::now();
 				MultiPipelineChunkBatch batch;
 				batch.fact_path = fact_path;
 				batch.mapping = mapping;
 				batch.row_base = fact_row_base;
 				fact_row_base += chunk->size();
 				batch.chunk = std::move(chunk);
+				chunk_object_elapsed += ElapsedSeconds(chunk_object_start);
 				auto push_start = std::chrono::steady_clock::now();
 				chunk_queue.Push(std::move(batch));
 				push_elapsed += ElapsedSeconds(push_start);
@@ -2248,8 +2278,16 @@ static void ReadMultiPipelineChunkBatchWorker(DuckDB &db, BlockingQueue<string> 
 		timers->read_query_build_time += query_build_elapsed;
 		timers->read_query_submit_time += query_submit_elapsed;
 		timers->read_fetch_time += fetch_elapsed;
+		timers->read_fetch_nonempty_time += fetch_nonempty_elapsed;
+		timers->read_fetch_finished_time += fetch_finished_elapsed;
+		timers->read_fetch_max_time = std::max(timers->read_fetch_max_time, fetch_max_elapsed);
+		timers->read_chunk_object_time += chunk_object_elapsed;
 		timers->read_push_time += push_elapsed;
 		timers->read_thread_max_time = std::max(timers->read_thread_max_time, read_elapsed);
+		timers->read_files += file_count;
+		timers->read_rows += row_count;
+		timers->read_fetch_calls += fetch_calls;
+		timers->read_finished_fetches += finished_fetches;
 		timers->read_chunks += chunk_count;
 		timers->dimension_mapping_reads += mapping_reads;
 		timers->dimension_mapping_reuses += mapping_reuses;
@@ -2270,7 +2308,15 @@ static void ReadMultiPipelineChunkBatches(DuckDB &db, const vector<string> &fact
 	double query_build_elapsed = 0;
 	double query_submit_elapsed = 0;
 	double fetch_elapsed = 0;
+	double fetch_nonempty_elapsed = 0;
+	double fetch_finished_elapsed = 0;
+	double fetch_max_elapsed = 0;
+	double chunk_object_elapsed = 0;
 	double push_elapsed = 0;
+	uint64_t file_count = 0;
+	uint64_t row_count = 0;
+	uint64_t fetch_calls = 0;
+	uint64_t finished_fetches = 0;
 	uint64_t mapping_reads = 0;
 	uint64_t mapping_reuses = 0;
 	try {
@@ -2281,6 +2327,7 @@ static void ReadMultiPipelineChunkBatches(DuckDB &db, const vector<string> &fact
 		std::map<string, std::shared_ptr<GroupMapping>> dimension_mapping_cache;
 		auto reuse_dimension_mapping = ReadEnvFlag("DUCKDB_GPU_REUSE_DIMENSION_MAPPING", false);
 		for (auto &fact_path : fact_paths) {
+			file_count++;
 			auto setup_start = std::chrono::steady_clock::now();
 			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
 			auto cache_key =
@@ -2310,17 +2357,26 @@ static void ReadMultiPipelineChunkBatches(DuckDB &db, const vector<string> &fact
 			while (true) {
 				auto fetch_start = std::chrono::steady_clock::now();
 				auto chunk = FetchGpuPipelineChunk(*result);
-				fetch_elapsed += ElapsedSeconds(fetch_start);
+				auto fetch_call_elapsed = ElapsedSeconds(fetch_start);
+				fetch_elapsed += fetch_call_elapsed;
+				fetch_max_elapsed = std::max(fetch_max_elapsed, fetch_call_elapsed);
+				fetch_calls++;
 				if (!chunk || chunk->size() == 0) {
+					fetch_finished_elapsed += fetch_call_elapsed;
+					finished_fetches++;
 					break;
 				}
+				fetch_nonempty_elapsed += fetch_call_elapsed;
+				row_count += chunk->size();
 
+				auto chunk_object_start = std::chrono::steady_clock::now();
 				MultiPipelineChunkBatch batch;
 				batch.fact_path = fact_path;
 				batch.mapping = mapping;
 				batch.row_base = fact_row_base;
 				fact_row_base += chunk->size();
 				batch.chunk = std::move(chunk);
+				chunk_object_elapsed += ElapsedSeconds(chunk_object_start);
 				auto push_start = std::chrono::steady_clock::now();
 				chunk_queue.Push(std::move(batch));
 				push_elapsed += ElapsedSeconds(push_start);
@@ -2343,8 +2399,16 @@ static void ReadMultiPipelineChunkBatches(DuckDB &db, const vector<string> &fact
 		timers->read_query_build_time += query_build_elapsed;
 		timers->read_query_submit_time += query_submit_elapsed;
 		timers->read_fetch_time += fetch_elapsed;
+		timers->read_fetch_nonempty_time += fetch_nonempty_elapsed;
+		timers->read_fetch_finished_time += fetch_finished_elapsed;
+		timers->read_fetch_max_time = std::max(timers->read_fetch_max_time, fetch_max_elapsed);
+		timers->read_chunk_object_time += chunk_object_elapsed;
 		timers->read_push_time += push_elapsed;
 		timers->read_thread_max_time = std::max(timers->read_thread_max_time, read_elapsed);
+		timers->read_files += file_count;
+		timers->read_rows += row_count;
+		timers->read_fetch_calls += fetch_calls;
+		timers->read_finished_fetches += finished_fetches;
 		timers->read_chunks += chunk_count;
 		timers->dimension_mapping_reads += mapping_reads;
 		timers->dimension_mapping_reuses += mapping_reuses;
@@ -2429,14 +2493,17 @@ static void FinishDirectMappedDecodedChunk(DirectMultiPipelineBuffer &buffer, Da
 static void FlushDirectMappedDecodedBatch(DirectMultiPipelineBuffer &current,
                                           BlockingQueue<DirectMultiPipelineInputBatch> &input_queue,
                                           BlockingQueue<idx_t> &free_slots, uint64_t &batch_count,
-                                          double &push_elapsed) {
+                                          double &push_elapsed, double &flush_elapsed) {
+	auto flush_start = std::chrono::steady_clock::now();
 	if (!current.active) {
 		current = DirectMultiPipelineBuffer();
+		flush_elapsed += ElapsedSeconds(flush_start);
 		return;
 	}
 	if (current.row_count == 0) {
 		free_slots.Push(current.slot);
 		current = DirectMultiPipelineBuffer();
+		flush_elapsed += ElapsedSeconds(flush_start);
 		return;
 	}
 	DirectMultiPipelineInputBatch batch;
@@ -2451,6 +2518,7 @@ static void FlushDirectMappedDecodedBatch(DirectMultiPipelineBuffer &current,
 	push_elapsed += ElapsedSeconds(push_start);
 	batch_count++;
 	current = DirectMultiPipelineBuffer();
+	flush_elapsed += ElapsedSeconds(flush_start);
 }
 
 static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipelineFuncs pipeline, void *handle,
@@ -2475,10 +2543,21 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 	double query_build_elapsed = 0;
 	double query_submit_elapsed = 0;
 	double fetch_elapsed = 0;
+	double fetch_nonempty_elapsed = 0;
+	double fetch_finished_elapsed = 0;
+	double fetch_max_elapsed = 0;
 	double push_elapsed = 0;
 	double prepare_work_elapsed = 0;
 	double prepare_pop_elapsed = 0;
 	double prepare_push_elapsed = 0;
+	double direct_slot_start_elapsed = 0;
+	double direct_output_chunk_elapsed = 0;
+	double direct_finish_chunk_elapsed = 0;
+	double direct_flush_elapsed = 0;
+	uint64_t file_count = 0;
+	uint64_t row_count = 0;
+	uint64_t fetch_calls = 0;
+	uint64_t finished_fetches = 0;
 	try {
 		if (!InferGridFromRowOrder()) {
 			throw InvalidInputException("direct parquet decode requires row-order grid inference");
@@ -2498,6 +2577,7 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 
 		string fact_path;
 		while (file_queue.Pop(fact_path)) {
+			file_count++;
 			auto setup_start = std::chrono::steady_clock::now();
 			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
 			auto cache_key =
@@ -2543,38 +2623,55 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 			while (true) {
 				if (!current.active || current.chunks >= target_batch_chunks ||
 				    target_batch_rows - current.row_count < STANDARD_VECTOR_SIZE) {
-					FlushDirectMappedDecodedBatch(current, input_queue, free_slots, batch_count, prepare_push_elapsed);
+					FlushDirectMappedDecodedBatch(current, input_queue, free_slots, batch_count, prepare_push_elapsed,
+					                              direct_flush_elapsed);
 					auto prepare_start = std::chrono::steady_clock::now();
 					MultiPipelineChunkBatch start_batch;
 					start_batch.fact_path = fact_path;
 					start_batch.mapping = mapping;
 					StartDirectMultiPipelineBuffer(pipeline, handle, free_slots, target_batch_rows,
 					                               payload_columns.size(), start_batch, current, false);
-					prepare_work_elapsed += ElapsedSeconds(prepare_start);
+					auto slot_start_elapsed = ElapsedSeconds(prepare_start);
+					prepare_work_elapsed += slot_start_elapsed;
+					direct_slot_start_elapsed += slot_start_elapsed;
 				}
 
 				auto output_row = current.row_count;
+				auto output_chunk_start = std::chrono::steady_clock::now();
 				DataChunk result;
 				MakeDirectMappedParquetOutputChunk(result, current, output_row, payload_columns.size());
+				auto output_chunk_elapsed = ElapsedSeconds(output_chunk_start);
+				prepare_work_elapsed += output_chunk_elapsed;
+				direct_output_chunk_elapsed += output_chunk_elapsed;
 				auto fetch_start = std::chrono::steady_clock::now();
 				auto scan_result = reader.Scan(context, scan_state, result);
 				if (scan_result.GetResultType() == AsyncResultType::BLOCKED) {
 					scan_result.ExecuteTasksSynchronously();
 				}
-				fetch_elapsed += ElapsedSeconds(fetch_start);
+				auto fetch_call_elapsed = ElapsedSeconds(fetch_start);
+				fetch_elapsed += fetch_call_elapsed;
+				fetch_max_elapsed = std::max(fetch_max_elapsed, fetch_call_elapsed);
+				fetch_calls++;
 				if (scan_result.GetResultType() == AsyncResultType::FINISHED) {
+					fetch_finished_elapsed += fetch_call_elapsed;
+					finished_fetches++;
 					break;
 				}
 				if (result.size() == 0) {
 					continue;
 				}
+				fetch_nonempty_elapsed += fetch_call_elapsed;
 				auto work_start = std::chrono::steady_clock::now();
 				FinishDirectMappedDecodedChunk(current, result, fact_row_base, output_row, payload_columns.size());
-				prepare_work_elapsed += ElapsedSeconds(work_start);
+				auto finish_chunk_elapsed = ElapsedSeconds(work_start);
+				prepare_work_elapsed += finish_chunk_elapsed;
+				direct_finish_chunk_elapsed += finish_chunk_elapsed;
 				fact_row_base += result.size();
+				row_count += result.size();
 				chunk_count++;
 			}
-			FlushDirectMappedDecodedBatch(current, input_queue, free_slots, batch_count, prepare_push_elapsed);
+			FlushDirectMappedDecodedBatch(current, input_queue, free_slots, batch_count, prepare_push_elapsed,
+			                              direct_flush_elapsed);
 		}
 	} catch (...) {
 		std::lock_guard<std::mutex> guard(error_lock);
@@ -2593,13 +2690,24 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 		timers->read_query_build_time += query_build_elapsed;
 		timers->read_query_submit_time += query_submit_elapsed;
 		timers->read_fetch_time += fetch_elapsed;
+		timers->read_fetch_nonempty_time += fetch_nonempty_elapsed;
+		timers->read_fetch_finished_time += fetch_finished_elapsed;
+		timers->read_fetch_max_time = std::max(timers->read_fetch_max_time, fetch_max_elapsed);
 		timers->read_push_time += push_elapsed;
 		timers->read_thread_max_time = std::max(timers->read_thread_max_time, read_elapsed);
+		timers->read_files += file_count;
+		timers->read_rows += row_count;
+		timers->read_fetch_calls += fetch_calls;
+		timers->read_finished_fetches += finished_fetches;
 		timers->read_chunks += chunk_count;
 		timers->prepare_time += read_elapsed;
 		timers->prepare_pop_time += prepare_pop_elapsed;
 		timers->prepare_work_time += prepare_work_elapsed;
 		timers->prepare_push_time += prepare_push_elapsed;
+		timers->direct_slot_start_time += direct_slot_start_elapsed;
+		timers->direct_output_chunk_time += direct_output_chunk_elapsed;
+		timers->direct_finish_chunk_time += direct_finish_chunk_elapsed;
+		timers->direct_flush_time += direct_flush_elapsed;
 		timers->prepared_batches += batch_count;
 		timers->dimension_mapping_reads += mapping_reads;
 		timers->dimension_mapping_reuses += mapping_reuses;
@@ -4036,16 +4144,28 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		stage_times["read_query_build_time"] = py::float_(stage_timers.read_query_build_time);
 		stage_times["read_query_submit_time"] = py::float_(stage_timers.read_query_submit_time);
 		stage_times["read_fetch_time"] = py::float_(stage_timers.read_fetch_time);
+		stage_times["read_fetch_nonempty_time"] = py::float_(stage_timers.read_fetch_nonempty_time);
+		stage_times["read_fetch_finished_time"] = py::float_(stage_timers.read_fetch_finished_time);
+		stage_times["read_fetch_max_time"] = py::float_(stage_timers.read_fetch_max_time);
+		stage_times["read_chunk_object_time"] = py::float_(stage_timers.read_chunk_object_time);
 		stage_times["read_push_time"] = py::float_(stage_timers.read_push_time);
 		stage_times["read_thread_max_time"] = py::float_(stage_timers.read_thread_max_time);
 		stage_times["prepare_pop_time"] = py::float_(stage_timers.prepare_pop_time);
 		stage_times["prepare_work_time"] = py::float_(stage_timers.prepare_work_time);
 		stage_times["prepare_push_time"] = py::float_(stage_timers.prepare_push_time);
+		stage_times["direct_slot_start_time"] = py::float_(stage_timers.direct_slot_start_time);
+		stage_times["direct_output_chunk_time"] = py::float_(stage_timers.direct_output_chunk_time);
+		stage_times["direct_finish_chunk_time"] = py::float_(stage_timers.direct_finish_chunk_time);
+		stage_times["direct_flush_time"] = py::float_(stage_timers.direct_flush_time);
 		stage_times["gpu_pop_time"] = py::float_(stage_timers.gpu_pop_time);
 		stage_times["gpu_work_time"] = py::float_(stage_timers.gpu_work_time);
 		stage_times["gpu_push_time"] = py::float_(stage_timers.gpu_push_time);
 		stage_times["merge_pop_time"] = py::float_(stage_timers.merge_pop_time);
 		stage_times["merge_work_time"] = py::float_(stage_timers.merge_work_time);
+		stage_times["read_files"] = py::int_(stage_timers.read_files);
+		stage_times["read_rows"] = py::int_(stage_timers.read_rows);
+		stage_times["read_fetch_calls"] = py::int_(stage_timers.read_fetch_calls);
+		stage_times["read_finished_fetches"] = py::int_(stage_timers.read_finished_fetches);
 		stage_times["read_chunks"] = py::int_(stage_timers.read_chunks);
 		stage_times["prepared_batches"] = py::int_(stage_timers.prepared_batches);
 		stage_times["gpu_batches"] = py::int_(stage_timers.gpu_batches);
