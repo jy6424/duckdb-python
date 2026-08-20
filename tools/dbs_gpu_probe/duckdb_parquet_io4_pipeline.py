@@ -31,7 +31,20 @@ def parse_args():
         help="do not scan the fact grid column; infer groups from fact row order matching the dimension file",
     )
     parser.add_argument("--prefetch-files", action="store_true")
-    parser.add_argument("--prefetch-method", default="both", choices=["fadvise", "readahead", "both", "io_uring"])
+    parser.add_argument("--prefetch-method", default="both", choices=["fadvise", "readahead", "both", "io_uring", "all"])
+    parser.add_argument(
+        "--prefetch-threads",
+        type=int,
+        default=None,
+        help="number of background file prefetch workers",
+    )
+    parser.add_argument(
+        "--local-io-uring-readahead",
+        action="store_true",
+        help="enable io_uring read-ahead inside DuckDB local file reads",
+    )
+    parser.add_argument("--local-io-uring-readahead-bytes", type=int, default=None)
+    parser.add_argument("--local-io-uring-readahead-depth", type=int, default=None)
     parser.add_argument("--duckdb-parquet-async-prefetch", action="store_true")
     parser.add_argument(
         "--fetch-raw",
@@ -184,6 +197,20 @@ def main():
     if args.prefetch_files:
         os.environ["DUCKDB_GPU_PREFETCH_FILES"] = "1"
         os.environ["DUCKDB_GPU_PREFETCH_METHOD"] = args.prefetch_method
+    if args.prefetch_threads is not None:
+        if args.prefetch_threads <= 0:
+            raise SystemExit("--prefetch-threads must be positive")
+        os.environ["DUCKDB_GPU_PREFETCH_THREADS"] = str(args.prefetch_threads)
+    if args.local_io_uring_readahead:
+        os.environ["DUCKDB_LOCAL_IO_URING_READAHEAD"] = "1"
+    if args.local_io_uring_readahead_bytes is not None:
+        if args.local_io_uring_readahead_bytes <= 0:
+            raise SystemExit("--local-io-uring-readahead-bytes must be positive")
+        os.environ["DUCKDB_LOCAL_IO_URING_READAHEAD_BYTES"] = str(args.local_io_uring_readahead_bytes)
+    if args.local_io_uring_readahead_depth is not None:
+        if args.local_io_uring_readahead_depth <= 0:
+            raise SystemExit("--local-io-uring-readahead-depth must be positive")
+        os.environ["DUCKDB_LOCAL_IO_URING_READAHEAD_DEPTH"] = str(args.local_io_uring_readahead_depth)
     if args.duckdb_parquet_async_prefetch:
         os.environ["DUCKDB_PARQUET_ASYNC_PREFETCH"] = "1"
     if args.parquet_direct_decode:
@@ -231,6 +258,14 @@ def main():
     print("[reader duckdb threads]: {}".format(os.environ.get("DUCKDB_GPU_READER_DUCKDB_THREADS", "default")))
     if args.prefetch_files:
         print("[prefetch]: {}".format(args.prefetch_method))
+        print("[prefetch threads]: {}".format(os.environ.get("DUCKDB_GPU_PREFETCH_THREADS", "1")))
+    if os.environ.get("DUCKDB_LOCAL_IO_URING_READAHEAD") == "1":
+        print(
+            "[local io_uring readahead]: bytes={} depth={}".format(
+                os.environ.get("DUCKDB_LOCAL_IO_URING_READAHEAD_BYTES", "default"),
+                os.environ.get("DUCKDB_LOCAL_IO_URING_READAHEAD_DEPTH", "default"),
+            )
+        )
     if args.duckdb_parquet_async_prefetch:
         print("[duckdb parquet async prefetch]: on")
     if os.environ.get("DUCKDB_GPU_PARQUET_DIRECT_DECODE") == "1":

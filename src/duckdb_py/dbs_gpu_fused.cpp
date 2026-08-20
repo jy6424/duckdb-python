@@ -747,8 +747,8 @@ static void PrefetchFileBestEffort(const string &path, const string &method) {
 		return;
 	}
 
-	const bool use_fadvise = method == "fadvise" || method == "both";
-	const bool use_readahead = method == "readahead" || method == "both";
+	const bool use_fadvise = method == "fadvise" || method == "both" || method == "all";
+	const bool use_readahead = method == "readahead" || method == "both" || method == "all";
 	if (use_fadvise) {
 		(void)posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
 	}
@@ -766,6 +766,11 @@ static void PrefetchFileBestEffort(const string &path, const string &method) {
 #endif
 	}
 	close(fd);
+	if (method == "all") {
+#if defined(SYS_io_uring_setup) && defined(SYS_io_uring_enter)
+		PrefetchFileWithIoUring(path);
+#endif
+	}
 #else
 	(void)path;
 	(void)method;
@@ -774,7 +779,7 @@ static void PrefetchFileBestEffort(const string &path, const string &method) {
 
 static void PrefetchPipelineFiles(vector<string> fact_paths, string dimension_file) {
 	auto method = ReadEnvString("DUCKDB_GPU_PREFETCH_METHOD", "both");
-	if (method != "fadvise" && method != "readahead" && method != "both" && method != "io_uring") {
+	if (method != "fadvise" && method != "readahead" && method != "both" && method != "io_uring" && method != "all") {
 		method = "both";
 	}
 	std::set<string> prefetch_paths;
@@ -796,8 +801,34 @@ static void PrefetchPipelineFiles(vector<string> fact_paths, string dimension_fi
 			}
 		}
 	}
+	vector<string> paths;
+	paths.reserve(prefetch_paths.size());
 	for (auto &path : prefetch_paths) {
-		PrefetchFileBestEffort(path, method);
+		paths.push_back(path);
+	}
+	if (paths.empty()) {
+		return;
+	}
+	auto prefetch_threads = std::min<idx_t>(ReadEnvIdx("DUCKDB_GPU_PREFETCH_THREADS", 1), paths.size());
+	prefetch_threads = std::max<idx_t>(prefetch_threads, 1);
+	std::atomic<idx_t> next_path(0);
+	vector<std::thread> workers;
+	workers.reserve(prefetch_threads);
+	for (idx_t thread_idx = 0; thread_idx < prefetch_threads; thread_idx++) {
+		workers.emplace_back([&]() {
+			while (true) {
+				auto path_idx = next_path.fetch_add(1);
+				if (path_idx >= paths.size()) {
+					break;
+				}
+				PrefetchFileBestEffort(paths[path_idx], method);
+			}
+		});
+	}
+	for (auto &worker : workers) {
+		if (worker.joinable()) {
+			worker.join();
+		}
 	}
 }
 
