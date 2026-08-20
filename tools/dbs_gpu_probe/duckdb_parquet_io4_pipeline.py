@@ -58,6 +58,11 @@ def parse_args():
         help="byte window used by --parquet-page-prefetch; defaults to 1 MiB in the C++ reader",
     )
     parser.add_argument(
+        "--parquet-page-prefetch-force",
+        action="store_true",
+        help="disable DuckDB's row-group/column prefetch and use page/window prefetch only",
+    )
+    parser.add_argument(
         "--fetch-raw",
         action="store_true",
         help="use DuckDB FetchRaw and consume scan vectors without the regular Fetch materialization path",
@@ -228,6 +233,11 @@ def main():
         os.environ["DUCKDB_PARQUET_PAGE_PREFETCH"] = "1"
         os.environ.setdefault("DUCKDB_PARQUET_ASYNC_PREFETCH", "1")
         os.environ.setdefault("DUCKDB_PARQUET_ASYNC_SINGLE_PREFETCH", "1")
+    if args.parquet_page_prefetch_force:
+        os.environ["DUCKDB_PARQUET_PAGE_PREFETCH"] = "1"
+        os.environ["DUCKDB_PARQUET_PAGE_PREFETCH_ONLY"] = "1"
+        os.environ.setdefault("DUCKDB_PARQUET_ASYNC_PREFETCH", "1")
+        os.environ.setdefault("DUCKDB_PARQUET_ASYNC_SINGLE_PREFETCH", "1")
     if args.parquet_page_prefetch_bytes is not None:
         if args.parquet_page_prefetch_bytes <= 0:
             raise SystemExit("--parquet-page-prefetch-bytes must be positive")
@@ -289,6 +299,8 @@ def main():
         print("[duckdb parquet async prefetch]: on")
     if os.environ.get("DUCKDB_PARQUET_PAGE_PREFETCH") == "1":
         print("[duckdb parquet page prefetch]: bytes={}".format(os.environ.get("DUCKDB_PARQUET_PAGE_PREFETCH_BYTES", "default")))
+    if os.environ.get("DUCKDB_PARQUET_PAGE_PREFETCH_ONLY") == "1":
+        print("[duckdb parquet page prefetch only]: on")
     if os.environ.get("DUCKDB_GPU_PARQUET_DIRECT_DECODE") == "1":
         print("[parquet direct decode]: on")
     if os.environ.get("DUCKDB_GPU_FETCH_RAW") == "1":
