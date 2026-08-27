@@ -39,6 +39,11 @@ def parse_args():
     parser.add_argument("--dimension-file", default="grid.parquet")
     parser.add_argument("--read-mode", default="per-file", choices=["per-file", "glob"])
     parser.add_argument("--reuse-dimension-mapping", action="store_true")
+    parser.add_argument(
+        "--infer-grid-from-row-order",
+        action="store_true",
+        help="skip fact grid reads and join by repeating the dimension group column in fact row order",
+    )
     parser.add_argument("--assume-payload-all-valid", action="store_true")
     parser.add_argument("--print-stage-times", action="store_true")
     parser.add_argument("--print-results", action="store_true")
@@ -129,6 +134,32 @@ def read_parquet_gpu(cudf, source, columns):
     return cudf.read_parquet(source, columns=columns)
 
 
+def attach_group_from_row_order(cudf, fact, dim, group_column):
+    dim_rows = len(dim)
+    fact_rows = len(fact)
+    if dim_rows <= 0:
+        raise ValueError("dimension file has no rows")
+    if fact_rows % dim_rows != 0:
+        raise ValueError(
+            "cannot infer {} from row order: fact rows {} is not a multiple of dimension rows {}".format(
+                group_column, fact_rows, dim_rows
+            )
+        )
+
+    repeats = fact_rows // dim_rows
+    group_values = dim[group_column]
+    if repeats == 1:
+        fact[group_column] = group_values
+    else:
+        try:
+            import cupy
+
+            fact[group_column] = cudf.Series(cupy.tile(group_values.values, repeats))
+        except Exception:
+            fact[group_column] = cudf.concat([group_values] * repeats, ignore_index=True)
+    return fact
+
+
 def combine_frames(cudf, frames, group_column, payload_columns, timers, is_row_count=False):
     if not frames:
         columns = [group_column, "row_count"] if is_row_count else [group_column] + payload_columns
@@ -178,21 +209,30 @@ def main():
         dimension_path = resolve_dimension_path(parquet_paths[0], args.dimension_file)
         read_start = time.time()
         timer_start = time.time()
-        dim = read_parquet_gpu(cudf, dimension_path, columns=[args.join_key, args.group_column])
+        dimension_columns = [args.group_column] if args.infer_grid_from_row_order else [args.join_key, args.group_column]
+        dim = read_parquet_gpu(cudf, dimension_path, columns=dimension_columns)
         cuda_synchronize()
         add_elapsed(detail_timers, "dimension_read", timer_start)
 
         timer_start = time.time()
-        fact = read_parquet_gpu(cudf, parquet_paths, columns=[args.join_key] + payload_columns)
+        fact_columns = payload_columns if args.infer_grid_from_row_order else [args.join_key] + payload_columns
+        fact = read_parquet_gpu(cudf, parquet_paths, columns=fact_columns)
         cuda_synchronize()
         add_elapsed(detail_timers, "fact_read", timer_start)
         read_seconds += time.time() - read_start
 
-        join_start = time.time()
-        joined = fact.merge(dim, on=args.join_key, how="inner")
-        cuda_synchronize()
-        join_seconds += time.time() - join_start
-        add_elapsed(detail_timers, "join", join_start)
+        if args.infer_grid_from_row_order:
+            join_start = time.time()
+            joined = attach_group_from_row_order(cudf, fact, dim, args.group_column)
+            cuda_synchronize()
+            join_seconds += time.time() - join_start
+            add_elapsed(detail_timers, "join", join_start)
+        else:
+            join_start = time.time()
+            joined = fact.merge(dim, on=args.join_key, how="inner")
+            cuda_synchronize()
+            join_seconds += time.time() - join_start
+            add_elapsed(detail_timers, "join", join_start)
 
         group_start = time.time()
         sums, counts, row_counts = aggregate_joined(
@@ -210,21 +250,32 @@ def main():
             read_start = time.time()
             if cached_dim is None or not args.reuse_dimension_mapping:
                 timer_start = time.time()
-                cached_dim = read_parquet_gpu(cudf, dimension_path, columns=[args.join_key, args.group_column])
+                dimension_columns = (
+                    [args.group_column] if args.infer_grid_from_row_order else [args.join_key, args.group_column]
+                )
+                cached_dim = read_parquet_gpu(cudf, dimension_path, columns=dimension_columns)
                 cuda_synchronize()
                 add_elapsed(detail_timers, "dimension_read", timer_start)
             dim = cached_dim
             timer_start = time.time()
-            fact = read_parquet_gpu(cudf, fact_path, columns=[args.join_key] + payload_columns)
+            fact_columns = payload_columns if args.infer_grid_from_row_order else [args.join_key] + payload_columns
+            fact = read_parquet_gpu(cudf, fact_path, columns=fact_columns)
             cuda_synchronize()
             add_elapsed(detail_timers, "fact_read", timer_start)
             read_seconds += time.time() - read_start
 
-            join_start = time.time()
-            joined = fact.merge(dim, on=args.join_key, how="inner")
-            cuda_synchronize()
-            join_seconds += time.time() - join_start
-            add_elapsed(detail_timers, "join", join_start)
+            if args.infer_grid_from_row_order:
+                join_start = time.time()
+                joined = attach_group_from_row_order(cudf, fact, dim, args.group_column)
+                cuda_synchronize()
+                join_seconds += time.time() - join_start
+                add_elapsed(detail_timers, "join", join_start)
+            else:
+                join_start = time.time()
+                joined = fact.merge(dim, on=args.join_key, how="inner")
+                cuda_synchronize()
+                join_seconds += time.time() - join_start
+                add_elapsed(detail_timers, "join", join_start)
 
             group_start = time.time()
             sums, counts, row_counts = aggregate_joined(
@@ -257,6 +308,8 @@ def main():
     print("[scan/decode engine]: cudf/libcudf")
     if args.assume_payload_all_valid:
         print("[assume payload all valid]: on")
+    if args.infer_grid_from_row_order:
+        print("[grid inference]: row-order")
     print("[payload columns]: {}".format(",".join(payload_columns)))
     if args.print_stage_times:
         print(
