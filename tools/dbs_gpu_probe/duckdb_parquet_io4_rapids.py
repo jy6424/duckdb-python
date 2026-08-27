@@ -11,6 +11,25 @@ import time
 EXCLUDED_AUTO_COLUMNS = set(["grid", "time", "levs"])
 
 
+def new_timers():
+    return {
+        "dimension_read": 0.0,
+        "fact_read": 0.0,
+        "join": 0.0,
+        "groupby_size": 0.0,
+        "groupby_sum": 0.0,
+        "groupby_count": 0.0,
+        "count_from_rows": 0.0,
+        "merge_concat": 0.0,
+        "merge_groupby": 0.0,
+        "row_count_sum": 0.0,
+    }
+
+
+def add_elapsed(timers, name, start):
+    timers[name] += time.time() - start
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("base_dir")
@@ -59,15 +78,29 @@ def make_counts_from_row_counts(row_counts, group_column, payload_columns):
     return counts
 
 
-def aggregate_joined(joined, group_column, payload_columns, assume_payload_all_valid):
+def aggregate_joined(joined, group_column, payload_columns, assume_payload_all_valid, timers):
     grouped = joined.groupby(group_column)
+    timer_start = time.time()
     row_counts = grouped.size().reset_index()
     row_counts = row_counts.rename(columns={row_counts.columns[-1]: "row_count"})
+    cuda_synchronize()
+    add_elapsed(timers, "groupby_size", timer_start)
+
+    timer_start = time.time()
     sums = grouped[payload_columns].sum().reset_index()
+    cuda_synchronize()
+    add_elapsed(timers, "groupby_sum", timer_start)
+
     if assume_payload_all_valid:
+        timer_start = time.time()
         counts = make_counts_from_row_counts(row_counts, group_column, payload_columns)
+        cuda_synchronize()
+        add_elapsed(timers, "count_from_rows", timer_start)
     else:
+        timer_start = time.time()
         counts = grouped[payload_columns].count().reset_index()
+        cuda_synchronize()
+        add_elapsed(timers, "groupby_count", timer_start)
     return sums, counts, row_counts
 
 
@@ -96,14 +129,23 @@ def read_parquet_gpu(cudf, source, columns):
     return cudf.read_parquet(source, columns=columns)
 
 
-def combine_frames(cudf, frames, group_column, payload_columns, is_row_count=False):
+def combine_frames(cudf, frames, group_column, payload_columns, timers, is_row_count=False):
     if not frames:
         columns = [group_column, "row_count"] if is_row_count else [group_column] + payload_columns
         return cudf.DataFrame({column: [] for column in columns})
+    timer_start = time.time()
     combined = cudf.concat(frames, ignore_index=True)
+    cuda_synchronize()
+    add_elapsed(timers, "merge_concat", timer_start)
+
+    timer_start = time.time()
     if is_row_count:
-        return combined.groupby(group_column).sum().reset_index()
-    return combined.groupby(group_column)[payload_columns].sum().reset_index()
+        result = combined.groupby(group_column).sum().reset_index()
+    else:
+        result = combined.groupby(group_column)[payload_columns].sum().reset_index()
+    cuda_synchronize()
+    add_elapsed(timers, "merge_groupby", timer_start)
+    return result
 
 
 def main():
@@ -121,6 +163,7 @@ def main():
     if not payload_columns:
         raise SystemExit("no payload columns specified")
 
+    detail_timers = new_timers()
     read_seconds = 0.0
     join_seconds = 0.0
     group_seconds = 0.0
@@ -134,19 +177,26 @@ def main():
     if args.read_mode == "glob":
         dimension_path = resolve_dimension_path(parquet_paths[0], args.dimension_file)
         read_start = time.time()
+        timer_start = time.time()
         dim = read_parquet_gpu(cudf, dimension_path, columns=[args.join_key, args.group_column])
+        cuda_synchronize()
+        add_elapsed(detail_timers, "dimension_read", timer_start)
+
+        timer_start = time.time()
         fact = read_parquet_gpu(cudf, parquet_paths, columns=[args.join_key] + payload_columns)
         cuda_synchronize()
+        add_elapsed(detail_timers, "fact_read", timer_start)
         read_seconds += time.time() - read_start
 
         join_start = time.time()
         joined = fact.merge(dim, on=args.join_key, how="inner")
         cuda_synchronize()
         join_seconds += time.time() - join_start
+        add_elapsed(detail_timers, "join", join_start)
 
         group_start = time.time()
         sums, counts, row_counts = aggregate_joined(
-            joined, args.group_column, payload_columns, args.assume_payload_all_valid
+            joined, args.group_column, payload_columns, args.assume_payload_all_valid, detail_timers
         )
         cuda_synchronize()
         group_seconds += time.time() - group_start
@@ -159,20 +209,26 @@ def main():
             dimension_path = resolve_dimension_path(fact_path, args.dimension_file)
             read_start = time.time()
             if cached_dim is None or not args.reuse_dimension_mapping:
+                timer_start = time.time()
                 cached_dim = read_parquet_gpu(cudf, dimension_path, columns=[args.join_key, args.group_column])
+                cuda_synchronize()
+                add_elapsed(detail_timers, "dimension_read", timer_start)
             dim = cached_dim
+            timer_start = time.time()
             fact = read_parquet_gpu(cudf, fact_path, columns=[args.join_key] + payload_columns)
             cuda_synchronize()
+            add_elapsed(detail_timers, "fact_read", timer_start)
             read_seconds += time.time() - read_start
 
             join_start = time.time()
             joined = fact.merge(dim, on=args.join_key, how="inner")
             cuda_synchronize()
             join_seconds += time.time() - join_start
+            add_elapsed(detail_timers, "join", join_start)
 
             group_start = time.time()
             sums, counts, row_counts = aggregate_joined(
-                joined, args.group_column, payload_columns, args.assume_payload_all_valid
+                joined, args.group_column, payload_columns, args.assume_payload_all_valid, detail_timers
             )
             cuda_synchronize()
             group_seconds += time.time() - group_start
@@ -181,11 +237,14 @@ def main():
             append_frame(row_count_frames, row_counts)
 
     merge_start = time.time()
-    total_sums = combine_frames(cudf, sum_frames, args.group_column, payload_columns)
-    total_counts = combine_frames(cudf, count_frames, args.group_column, payload_columns)
-    total_row_counts = combine_frames(cudf, row_count_frames, args.group_column, payload_columns, True)
+    total_sums = combine_frames(cudf, sum_frames, args.group_column, payload_columns, detail_timers)
+    total_counts = combine_frames(cudf, count_frames, args.group_column, payload_columns, detail_timers)
+    total_row_counts = combine_frames(cudf, row_count_frames, args.group_column, payload_columns, detail_timers, True)
     cuda_synchronize()
+    timer_start = time.time()
     row_count = int(total_row_counts["row_count"].sum()) if len(total_row_counts) else 0
+    cuda_synchronize()
+    add_elapsed(detail_timers, "row_count_sum", timer_start)
     # Keep final aggregate columns alive until after the last GPU operation has completed.
     _ = (total_sums, total_counts)
     merge_seconds += time.time() - merge_start
@@ -203,6 +262,22 @@ def main():
         print(
             "[stage work] gpu_read={:.6f}s gpu_join={:.6f}s gpu_groupby={:.6f}s gpu_merge={:.6f}s".format(
                 read_seconds, join_seconds, group_seconds, merge_seconds
+            )
+        )
+        print(
+            "[stage detail] dimension_read={:.6f}s fact_read={:.6f}s join={:.6f}s "
+            "groupby_size={:.6f}s groupby_sum={:.6f}s groupby_count={:.6f}s "
+            "count_from_rows={:.6f}s merge_concat={:.6f}s merge_groupby={:.6f}s row_count_sum={:.6f}s".format(
+                detail_timers["dimension_read"],
+                detail_timers["fact_read"],
+                detail_timers["join"],
+                detail_timers["groupby_size"],
+                detail_timers["groupby_sum"],
+                detail_timers["groupby_count"],
+                detail_timers["count_from_rows"],
+                detail_timers["merge_concat"],
+                detail_timers["merge_groupby"],
+                detail_timers["row_count_sum"],
             )
         )
     if args.print_results:
