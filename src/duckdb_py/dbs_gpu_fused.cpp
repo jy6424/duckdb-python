@@ -2137,6 +2137,30 @@ static void CudaSynchronizeIfAvailable() {
 	}
 }
 
+static int ReadEnvInt(const char *name, int default_value) {
+	auto value = std::getenv(name);
+	if (!value || !value[0]) {
+		return default_value;
+	}
+	try {
+		return std::stoi(value);
+	} catch (...) {
+		return default_value;
+	}
+}
+
+static void UseCudaDeviceIfAvailable(int device) {
+	if (device < 0) {
+		return;
+	}
+	try {
+		auto cupy = py::module_::import("cupy");
+		cupy.attr("cuda").attr("Device")(device).attr("use")();
+	} catch (py::error_already_set &ex) {
+		ex.discard_as_unraisable(__func__);
+	}
+}
+
 static py::object CudfReadParquet(py::module_ &cudf, const py::object &source, const vector<string> &columns) {
 	return cudf.attr("read_parquet")(source, py::arg("columns") = StringVectorToPyList(columns));
 }
@@ -2241,6 +2265,7 @@ static py::dict DBSGPUCudfLatMulti(const py::iterable &fact_paths_p, const py::o
 	dimension_columns.push_back(join_key);
 	dimension_columns.push_back(group_column);
 
+	UseCudaDeviceIfAvailable(ReadEnvInt("DUCKDB_GPU_CUDF_DEVICE", 0));
 	auto cudf = py::module_::import("cudf");
 
 	double read_seconds = 0;

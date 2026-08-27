@@ -132,6 +132,12 @@ def parse_args():
             "/home/jiwan/duckdb-python-pipeline/tools/dbs_gpu_probe/libduckdb_gpu_probe.so",
         ),
     )
+    parser.add_argument(
+        "--cudf-device",
+        type=int,
+        default=int(os.environ.get("DUCKDB_GPU_CUDF_DEVICE", "0")),
+        help="CUDA device ordinal used by --mode cudf",
+    )
     return parser.parse_args()
 
 
@@ -230,6 +236,11 @@ def main():
     if args.mode == "cudf" and args.read_mode == "glob":
         fact_inputs = parquet_paths
         dimension_file = grid_paths[0]
+    if args.mode == "cudf":
+        if args.cudf_device < 0:
+            raise SystemExit("--cudf-device must be non-negative")
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(args.cudf_device))
+        os.environ["DUCKDB_GPU_CUDF_DEVICE"] = str(args.cudf_device)
     if len(payload_columns) > 1 and args.mode in ("pipeline-managed", "pipeline-cpu"):
         raise SystemExit(
             "{} does not support --vars yet; use pipeline-device, pipeline-device-direct, pipeline-mapped, "
@@ -347,6 +358,8 @@ def main():
     print("[read mode]: {}".format(args.read_mode))
     if "scan_decode_engine" in result:
         print("[scan/decode engine]: {}".format(result["scan_decode_engine"]))
+    if args.mode == "cudf":
+        print("[cudf device]: {}".format(args.cudf_device))
     print("[reader threads]: {}".format(os.environ.get("DUCKDB_GPU_PIPELINE_READER_THREADS", "1")))
     print("[reader duckdb threads]: {}".format(os.environ.get("DUCKDB_GPU_READER_DUCKDB_THREADS", "default")))
     if args.prefetch_files:
