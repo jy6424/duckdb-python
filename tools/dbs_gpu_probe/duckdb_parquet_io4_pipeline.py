@@ -74,6 +74,17 @@ def parse_args():
         help="disable DuckDB's row-group/column prefetch and use page/window prefetch only",
     )
     parser.add_argument(
+        "--parquet-pipelined-page-read",
+        action="store_true",
+        help="pipeline Parquet page reads by prefetching the next page/window while the current page is decoded",
+    )
+    parser.add_argument(
+        "--parquet-pipelined-page-read-bytes",
+        type=int,
+        default=None,
+        help="byte window used by --parquet-pipelined-page-read; defaults to 8 MiB in the C++ reader",
+    )
+    parser.add_argument(
         "--fetch-raw",
         action="store_true",
         help="use DuckDB FetchRaw and consume scan vectors without the regular Fetch materialization path",
@@ -266,6 +277,14 @@ def main():
         if args.parquet_page_prefetch_bytes <= 0:
             raise SystemExit("--parquet-page-prefetch-bytes must be positive")
         os.environ["DUCKDB_PARQUET_PAGE_PREFETCH_BYTES"] = str(args.parquet_page_prefetch_bytes)
+    if args.parquet_pipelined_page_read:
+        os.environ["DUCKDB_PARQUET_PIPELINED_PAGE_READ"] = "1"
+        os.environ.setdefault("DUCKDB_PARQUET_ASYNC_PREFETCH", "1")
+        os.environ.setdefault("DUCKDB_PARQUET_ASYNC_SINGLE_PREFETCH", "1")
+    if args.parquet_pipelined_page_read_bytes is not None:
+        if args.parquet_pipelined_page_read_bytes <= 0:
+            raise SystemExit("--parquet-pipelined-page-read-bytes must be positive")
+        os.environ["DUCKDB_PARQUET_PIPELINED_PAGE_READ_BYTES"] = str(args.parquet_pipelined_page_read_bytes)
     if args.parquet_direct_decode:
         os.environ["DUCKDB_GPU_PARQUET_DIRECT_DECODE"] = "1"
     if args.assume_payload_all_valid:
@@ -333,8 +352,16 @@ def main():
         print("[duckdb parquet page prefetch]: bytes={}".format(os.environ.get("DUCKDB_PARQUET_PAGE_PREFETCH_BYTES", "default")))
     if os.environ.get("DUCKDB_PARQUET_PAGE_PREFETCH_ONLY") == "1":
         print("[duckdb parquet page prefetch only]: on")
+    if os.environ.get("DUCKDB_PARQUET_PIPELINED_PAGE_READ") == "1":
+        print(
+            "[duckdb parquet pipelined page read]: bytes={}".format(
+                os.environ.get("DUCKDB_PARQUET_PIPELINED_PAGE_READ_BYTES", "default")
+            )
+        )
     if os.environ.get("DUCKDB_GPU_PARQUET_DIRECT_DECODE") == "1":
         print("[parquet direct decode]: on")
+        if args.mode == "pipeline-mapped-direct" and args.infer_grid_from_row_order:
+            print("[direct decode emit split]: on")
     if os.environ.get("DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID") == "1":
         print("[assume payload all valid]: on")
     if os.environ.get("DUCKDB_GPU_FETCH_RAW") == "1":

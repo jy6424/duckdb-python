@@ -565,10 +565,42 @@ public:
 
 	bool Init(uint32_t entries) {
 		params = {};
+		auto use_sq_poll = ReadEnvFlag("DUCKDB_GPU_IO_URING_SQPOLL", ReadEnvFlag("DUCKDB_LOCAL_IO_URING_SQPOLL", false));
+#if defined(IORING_SETUP_SQPOLL)
+		if (use_sq_poll) {
+			params.flags |= IORING_SETUP_SQPOLL;
+			params.sq_thread_idle = UnsafeNumericCast<unsigned int>(ReadEnvIdx("DUCKDB_GPU_IO_URING_SQPOLL_IDLE_MS", 2000));
+		}
+#else
+		use_sq_poll = false;
+#endif
 		ring_fd = static_cast<int>(syscall(SYS_io_uring_setup, entries, &params));
+#if defined(IORING_SETUP_SQPOLL)
+		if (ring_fd < 0 && use_sq_poll) {
+			params = {};
+			use_sq_poll = false;
+			ring_fd = static_cast<int>(syscall(SYS_io_uring_setup, entries, &params));
+		}
+#endif
 		if (ring_fd < 0) {
 			return false;
 		}
+#if defined(IORING_SETUP_SQPOLL)
+#if defined(IORING_FEAT_SQPOLL_NONFIXED)
+		if (use_sq_poll && !(params.features & IORING_FEAT_SQPOLL_NONFIXED)) {
+#else
+		if (use_sq_poll) {
+#endif
+			close(ring_fd);
+			ring_fd = -1;
+			params = {};
+			use_sq_poll = false;
+			ring_fd = static_cast<int>(syscall(SYS_io_uring_setup, entries, &params));
+			if (ring_fd < 0) {
+				return false;
+			}
+		}
+#endif
 
 		sq_ring_size = params.sq_off.array + params.sq_entries * sizeof(uint32_t);
 		cq_ring_size = params.cq_off.cqes + params.cq_entries * sizeof(struct io_uring_cqe);
@@ -586,6 +618,7 @@ public:
 		sq_head = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ring) + params.sq_off.head);
 		sq_tail = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ring) + params.sq_off.tail);
 		sq_ring_mask = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ring) + params.sq_off.ring_mask);
+		sq_flags = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ring) + params.sq_off.flags);
 		sq_array = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ring) + params.sq_off.array);
 
 		cq_head = reinterpret_cast<uint32_t *>(static_cast<char *>(cq_ring) + params.cq_off.head);
@@ -593,6 +626,7 @@ public:
 		cq_ring_mask = reinterpret_cast<uint32_t *>(static_cast<char *>(cq_ring) + params.cq_off.ring_mask);
 		cqes = reinterpret_cast<struct io_uring_cqe *>(static_cast<char *>(cq_ring) + params.cq_off.cqes);
 		iovecs.resize(params.sq_entries);
+		sq_poll_enabled = use_sq_poll;
 		return true;
 	}
 
@@ -644,6 +678,18 @@ public:
 	bool SubmitAndWait(uint32_t wait_nr) {
 		auto submit_count = pending_submissions;
 		pending_submissions = 0;
+		if (sq_poll_enabled) {
+#if defined(IORING_SQ_NEED_WAKEUP) && defined(IORING_ENTER_SQ_WAKEUP)
+			if (sq_flags && (*sq_flags & IORING_SQ_NEED_WAKEUP)) {
+				auto wake_result = syscall(SYS_io_uring_enter, ring_fd, 0, 0, IORING_ENTER_SQ_WAKEUP, nullptr, 0);
+				if (wake_result < 0) {
+					return false;
+				}
+			}
+			auto wait_result = syscall(SYS_io_uring_enter, ring_fd, 0, wait_nr, IORING_ENTER_GETEVENTS, nullptr, 0);
+			return wait_result >= 0;
+#endif
+		}
 		auto result = syscall(SYS_io_uring_enter, ring_fd, submit_count, wait_nr, IORING_ENTER_GETEVENTS, nullptr, 0);
 		return result >= 0;
 	}
@@ -676,11 +722,13 @@ private:
 	uint32_t *sq_head = nullptr;
 	uint32_t *sq_tail = nullptr;
 	uint32_t *sq_ring_mask = nullptr;
+	uint32_t *sq_flags = nullptr;
 	uint32_t *sq_array = nullptr;
 	uint32_t *cq_head = nullptr;
 	uint32_t *cq_tail = nullptr;
 	uint32_t *cq_ring_mask = nullptr;
 	uint32_t pending_submissions = 0;
+	bool sq_poll_enabled = false;
 	vector<struct iovec> iovecs;
 };
 
@@ -1163,6 +1211,17 @@ struct DirectMultiPipelineBuffer {
 	int64_t *join_keys = nullptr;
 	double *values = nullptr;
 	uint8_t *validity = nullptr;
+};
+
+enum class DirectMappedDecodedEventType { CHUNK, FLUSH };
+
+struct DirectMappedDecodedEvent {
+	DirectMappedDecodedEventType type = DirectMappedDecodedEventType::CHUNK;
+	std::shared_ptr<DirectMultiPipelineBuffer> buffer;
+	std::unique_ptr<DataChunk> chunk;
+	idx_t chunk_row_base = 0;
+	idx_t output_row = 0;
+	idx_t column_count = 0;
 };
 
 struct MultiPipelineOutputBatch {
@@ -2521,6 +2580,49 @@ static void FlushDirectMappedDecodedBatch(DirectMultiPipelineBuffer &current,
 	flush_elapsed += ElapsedSeconds(flush_start);
 }
 
+static void RunDirectMappedDecodedEmitWorker(BlockingQueue<DirectMappedDecodedEvent> &decoded_queue,
+                                             BlockingQueue<DirectMultiPipelineInputBatch> &input_queue,
+                                             BlockingQueue<idx_t> &free_slots, uint64_t &batch_count,
+                                             double &prepare_stage_elapsed,
+                                             double &prepare_pop_elapsed, double &prepare_push_elapsed,
+                                             double &direct_finish_chunk_elapsed, double &direct_flush_elapsed,
+                                             std::exception_ptr &error_out, std::mutex &error_lock) {
+	auto stage_start = std::chrono::steady_clock::now();
+	try {
+		DirectMappedDecodedEvent event;
+		while (true) {
+			auto pop_start = std::chrono::steady_clock::now();
+			auto has_event = decoded_queue.Pop(event);
+			prepare_pop_elapsed += ElapsedSeconds(pop_start);
+			if (!has_event) {
+				break;
+			}
+			if (!event.buffer) {
+				continue;
+			}
+			if (event.type == DirectMappedDecodedEventType::FLUSH) {
+				FlushDirectMappedDecodedBatch(*event.buffer, input_queue, free_slots, batch_count,
+				                              prepare_push_elapsed, direct_flush_elapsed);
+				continue;
+			}
+			if (!event.chunk || event.chunk->size() == 0) {
+				continue;
+			}
+			auto work_start = std::chrono::steady_clock::now();
+			FinishDirectMappedDecodedChunk(*event.buffer, *event.chunk, event.chunk_row_base, event.output_row,
+			                               event.column_count);
+			auto finish_chunk_elapsed = ElapsedSeconds(work_start);
+			direct_finish_chunk_elapsed += finish_chunk_elapsed;
+		}
+	} catch (...) {
+		std::lock_guard<std::mutex> guard(error_lock);
+		if (!error_out) {
+			error_out = std::current_exception();
+		}
+	}
+	prepare_stage_elapsed += ElapsedSeconds(stage_start);
+}
+
 static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipelineFuncs pipeline, void *handle,
                                                   BlockingQueue<string> &file_queue,
                                                   BlockingQueue<DirectMultiPipelineInputBatch> &input_queue,
@@ -2547,6 +2649,7 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 	double fetch_finished_elapsed = 0;
 	double fetch_max_elapsed = 0;
 	double push_elapsed = 0;
+	double prepare_stage_elapsed = 0;
 	double prepare_work_elapsed = 0;
 	double prepare_pop_elapsed = 0;
 	double prepare_push_elapsed = 0;
@@ -2558,7 +2661,17 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 	uint64_t row_count = 0;
 	uint64_t fetch_calls = 0;
 	uint64_t finished_fetches = 0;
+	BlockingQueue<DirectMappedDecodedEvent> decoded_queue(8);
+	std::thread emit_thread;
+	bool emit_thread_started = false;
+	double reader_stage_elapsed = 0;
 	try {
+		emit_thread = std::thread(RunDirectMappedDecodedEmitWorker, std::ref(decoded_queue), std::ref(input_queue),
+		                          std::ref(free_slots), std::ref(batch_count), std::ref(prepare_stage_elapsed),
+		                          std::ref(prepare_pop_elapsed), std::ref(prepare_push_elapsed),
+		                          std::ref(direct_finish_chunk_elapsed),
+		                          std::ref(direct_flush_elapsed), std::ref(error_out), std::ref(error_lock));
+		emit_thread_started = true;
 		if (!InferGridFromRowOrder()) {
 			throw InvalidInputException("direct parquet decode requires row-order grid inference");
 		}
@@ -2618,33 +2731,49 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 			query_submit_elapsed += ElapsedSeconds(query_submit_start);
 			setup_elapsed += ElapsedSeconds(setup_start);
 
-			DirectMultiPipelineBuffer current;
+			std::shared_ptr<DirectMultiPipelineBuffer> current;
+			idx_t reserved_rows = 0;
+			idx_t reserved_chunks = 0;
 			idx_t fact_row_base = 0;
+			auto flush_current = [&]() {
+				if (!current) {
+					return;
+				}
+				DirectMappedDecodedEvent event;
+				event.type = DirectMappedDecodedEventType::FLUSH;
+				event.buffer = current;
+				auto push_start = std::chrono::steady_clock::now();
+				decoded_queue.Push(std::move(event));
+				push_elapsed += ElapsedSeconds(push_start);
+				current.reset();
+				reserved_rows = 0;
+				reserved_chunks = 0;
+			};
 			while (true) {
-				if (!current.active || current.chunks >= target_batch_chunks ||
-				    target_batch_rows - current.row_count < STANDARD_VECTOR_SIZE) {
-					FlushDirectMappedDecodedBatch(current, input_queue, free_slots, batch_count, prepare_push_elapsed,
-					                              direct_flush_elapsed);
+				if (!current || reserved_chunks >= target_batch_chunks ||
+				    target_batch_rows - reserved_rows < STANDARD_VECTOR_SIZE) {
+					flush_current();
 					auto prepare_start = std::chrono::steady_clock::now();
 					MultiPipelineChunkBatch start_batch;
 					start_batch.fact_path = fact_path;
 					start_batch.mapping = mapping;
+					current = std::make_shared<DirectMultiPipelineBuffer>();
 					StartDirectMultiPipelineBuffer(pipeline, handle, free_slots, target_batch_rows,
-					                               payload_columns.size(), start_batch, current, false);
+					                               payload_columns.size(), start_batch, *current, false);
 					auto slot_start_elapsed = ElapsedSeconds(prepare_start);
 					prepare_work_elapsed += slot_start_elapsed;
 					direct_slot_start_elapsed += slot_start_elapsed;
 				}
 
-				auto output_row = current.row_count;
+				auto output_row = reserved_rows;
 				auto output_chunk_start = std::chrono::steady_clock::now();
-				DataChunk result;
-				MakeDirectMappedParquetOutputChunk(result, current, output_row, payload_columns.size());
+				auto result = make_uniq<DataChunk>();
+				MakeDirectMappedParquetOutputChunk(*result, *current, output_row, payload_columns.size());
 				auto output_chunk_elapsed = ElapsedSeconds(output_chunk_start);
 				prepare_work_elapsed += output_chunk_elapsed;
 				direct_output_chunk_elapsed += output_chunk_elapsed;
 				auto fetch_start = std::chrono::steady_clock::now();
-				auto scan_result = reader.Scan(context, scan_state, result);
+				auto scan_result = reader.Scan(context, scan_state, *result);
 				if (scan_result.GetResultType() == AsyncResultType::BLOCKED) {
 					scan_result.ExecuteTasksSynchronously();
 				}
@@ -2657,21 +2786,31 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 					finished_fetches++;
 					break;
 				}
-				if (result.size() == 0) {
+				if (result->size() == 0) {
 					continue;
 				}
 				fetch_nonempty_elapsed += fetch_call_elapsed;
-				auto work_start = std::chrono::steady_clock::now();
-				FinishDirectMappedDecodedChunk(current, result, fact_row_base, output_row, payload_columns.size());
-				auto finish_chunk_elapsed = ElapsedSeconds(work_start);
-				prepare_work_elapsed += finish_chunk_elapsed;
-				direct_finish_chunk_elapsed += finish_chunk_elapsed;
-				fact_row_base += result.size();
-				row_count += result.size();
+				auto result_size = result->size();
+				DirectMappedDecodedEvent event;
+				event.type = DirectMappedDecodedEventType::CHUNK;
+				event.buffer = current;
+				event.chunk = std::move(result);
+				event.chunk_row_base = fact_row_base;
+				event.output_row = output_row;
+				event.column_count = payload_columns.size();
+				auto push_start = std::chrono::steady_clock::now();
+				decoded_queue.Push(std::move(event));
+				push_elapsed += ElapsedSeconds(push_start);
+				fact_row_base += result_size;
+				reserved_rows += result_size;
+				reserved_chunks++;
+				row_count += result_size;
 				chunk_count++;
+				if (reserved_rows >= target_batch_rows || reserved_chunks >= target_batch_chunks) {
+					flush_current();
+				}
 			}
-			FlushDirectMappedDecodedBatch(current, input_queue, free_slots, batch_count, prepare_push_elapsed,
-			                              direct_flush_elapsed);
+			flush_current();
 		}
 	} catch (...) {
 		std::lock_guard<std::mutex> guard(error_lock);
@@ -2679,8 +2818,14 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 			error_out = std::current_exception();
 		}
 	}
+	reader_stage_elapsed = ElapsedSeconds(stage_start);
+	decoded_queue.Close();
+	if (emit_thread_started && emit_thread.joinable()) {
+		emit_thread.join();
+	}
+	prepare_work_elapsed += direct_finish_chunk_elapsed;
 	if (timers) {
-		auto read_elapsed = ElapsedSeconds(stage_start);
+		auto read_elapsed = reader_stage_elapsed;
 		std::lock_guard<std::mutex> guard(timers->lock);
 		timers->read_time += read_elapsed;
 		timers->read_setup_time += setup_elapsed;
@@ -2700,7 +2845,7 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 		timers->read_fetch_calls += fetch_calls;
 		timers->read_finished_fetches += finished_fetches;
 		timers->read_chunks += chunk_count;
-		timers->prepare_time += read_elapsed;
+		timers->prepare_time += prepare_stage_elapsed;
 		timers->prepare_pop_time += prepare_pop_elapsed;
 		timers->prepare_work_time += prepare_work_elapsed;
 		timers->prepare_push_time += prepare_push_elapsed;
