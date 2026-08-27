@@ -20,6 +20,7 @@ def parse_args():
     parser.add_argument("--dimension-file", default="grid.parquet")
     parser.add_argument("--read-mode", default="per-file", choices=["per-file", "glob"])
     parser.add_argument("--reuse-dimension-mapping", action="store_true")
+    parser.add_argument("--assume-payload-all-valid", action="store_true")
     parser.add_argument("--print-stage-times", action="store_true")
     parser.add_argument("--print-results", action="store_true")
     return parser.parse_args()
@@ -51,11 +52,21 @@ def resolve_dimension_path(fact_path, dimension_file):
     return os.path.join(os.path.dirname(fact_path), dimension_file)
 
 
-def aggregate_joined(joined, group_column, payload_columns):
+def make_counts_from_row_counts(row_counts, group_column, payload_columns):
+    counts = row_counts[[group_column]].copy()
+    for payload_column in payload_columns:
+        counts[payload_column] = row_counts["row_count"]
+    return counts
+
+
+def aggregate_joined(joined, group_column, payload_columns, assume_payload_all_valid):
     grouped = joined.groupby(group_column)
     row_counts = grouped.size().reset_index(name="row_count")
     sums = grouped[payload_columns].sum().reset_index()
-    counts = grouped[payload_columns].count().reset_index()
+    if assume_payload_all_valid:
+        counts = make_counts_from_row_counts(row_counts, group_column, payload_columns)
+    else:
+        counts = grouped[payload_columns].count().reset_index()
     return sums, counts, row_counts
 
 
@@ -133,7 +144,9 @@ def main():
         join_seconds += time.time() - join_start
 
         group_start = time.time()
-        sums, counts, row_counts = aggregate_joined(joined, args.group_column, payload_columns)
+        sums, counts, row_counts = aggregate_joined(
+            joined, args.group_column, payload_columns, args.assume_payload_all_valid
+        )
         cuda_synchronize()
         group_seconds += time.time() - group_start
         append_frame(sum_frames, sums)
@@ -157,7 +170,9 @@ def main():
             join_seconds += time.time() - join_start
 
             group_start = time.time()
-            sums, counts, row_counts = aggregate_joined(joined, args.group_column, payload_columns)
+            sums, counts, row_counts = aggregate_joined(
+                joined, args.group_column, payload_columns, args.assume_payload_all_valid
+            )
             cuda_synchronize()
             group_seconds += time.time() - group_start
             append_frame(sum_frames, sums)
@@ -179,7 +194,9 @@ def main():
     print(row_count)
     print("[number of input file]: {}".format(len(parquet_paths)))
     print("[read mode]: {}".format(args.read_mode))
-    print("[scan/decode engine]: cudf")
+    print("[scan/decode engine]: cudf/libcudf")
+    if args.assume_payload_all_valid:
+        print("[assume payload all valid]: on")
     print("[payload columns]: {}".format(",".join(payload_columns)))
     if args.print_stage_times:
         print(

@@ -122,6 +122,7 @@ def parse_args():
             "pipeline-mapped-direct",
             "pipeline-managed",
             "pipeline-cpu",
+            "cudf",
         ],
     )
     parser.add_argument(
@@ -224,6 +225,11 @@ def main():
         payload_columns = [args.var or "qicps"]
     if not payload_columns:
         raise SystemExit("no payload columns specified")
+    if args.mode == "cudf" and args.read_mode == "sharded":
+        raise SystemExit("mode=cudf supports --read-mode per-file or glob")
+    if args.mode == "cudf" and args.read_mode == "glob":
+        fact_inputs = parquet_paths
+        dimension_file = grid_paths[0]
     if len(payload_columns) > 1 and args.mode in ("pipeline-managed", "pipeline-cpu"):
         raise SystemExit(
             "{} does not support --vars yet; use pipeline-device, pipeline-device-direct, pipeline-mapped, "
@@ -298,7 +304,18 @@ def main():
     elif read_env_positive_int("DUCKDB_GPU_PIPELINE_READER_THREADS", 1) > 1:
         os.environ.setdefault("DUCKDB_GPU_READER_DUCKDB_THREADS", "1")
 
-    if len(payload_columns) == 1:
+    if args.mode == "cudf":
+        result = duckdb.dbs_gpu_cudf_lat_multi(
+            fact_inputs,
+            payload_columns=payload_columns,
+            join_key=args.join_key,
+            group_column=args.group_column,
+            dimension_file=dimension_file,
+            read_mode=args.read_mode,
+            reuse_dimension_mapping=args.reuse_dimension_mapping,
+            assume_payload_all_valid=args.assume_payload_all_valid,
+        )
+    elif len(payload_columns) == 1:
         result = duckdb.dbs_gpu_fused_lat_pipeline(
             fact_inputs,
             payload_column=payload_columns[0],
@@ -328,6 +345,8 @@ def main():
     print(result["row_count"])
     print("[number of input file]: {}".format(len(parquet_paths)))
     print("[read mode]: {}".format(args.read_mode))
+    if "scan_decode_engine" in result:
+        print("[scan/decode engine]: {}".format(result["scan_decode_engine"]))
     print("[reader threads]: {}".format(os.environ.get("DUCKDB_GPU_PIPELINE_READER_THREADS", "1")))
     print("[reader duckdb threads]: {}".format(os.environ.get("DUCKDB_GPU_READER_DUCKDB_THREADS", "default")))
     if args.prefetch_files:
@@ -371,6 +390,18 @@ def main():
     print("[payload columns]: {}".format(",".join(payload_columns)))
     if args.print_stage_times and "stage_times" in result:
         stage = result["stage_times"]
+        if "gpu_read_time" in stage:
+            print(
+                "[stage work] gpu_read={:.6f}s gpu_join={:.6f}s gpu_groupby={:.6f}s gpu_merge={:.6f}s".format(
+                    float(stage.get("gpu_read_time", 0.0)),
+                    float(stage.get("gpu_join_time", 0.0)),
+                    float(stage.get("gpu_groupby_time", 0.0)),
+                    float(stage.get("gpu_merge_time", 0.0)),
+                )
+            )
+            print("[query time]: {:.6f}s".format(float(result["query_time"])))
+            print("[wrapper time]: {:.6f}s".format(elapsed))
+            return
         print(
             "[stage total] read={:.6f}s prepare={:.6f}s gpu={:.6f}s merge={:.6f}s".format(
                 float(stage.get("read_time", 0.0)),

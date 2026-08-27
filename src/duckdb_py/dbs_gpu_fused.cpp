@@ -2120,6 +2120,232 @@ static vector<string> ParsePayloadColumns(const py::object &payload_columns_p) {
 	return payload_columns;
 }
 
+static py::list StringVectorToPyList(const vector<string> &values) {
+	py::list result;
+	for (auto &value : values) {
+		result.append(value);
+	}
+	return result;
+}
+
+static void CudaSynchronizeIfAvailable() {
+	try {
+		auto cupy = py::module_::import("cupy");
+		cupy.attr("cuda").attr("Stream").attr("null").attr("synchronize")();
+	} catch (py::error_already_set &ex) {
+		ex.discard_as_unraisable(__func__);
+	}
+}
+
+static py::object CudfReadParquet(py::module_ &cudf, const py::object &source, const vector<string> &columns) {
+	return cudf.attr("read_parquet")(source, py::arg("columns") = StringVectorToPyList(columns));
+}
+
+static py::object CudfDataFrameForColumns(py::module_ &cudf, const vector<string> &columns) {
+	py::dict data;
+	for (auto &column : columns) {
+		data[py::str(column)] = py::list();
+	}
+	return cudf.attr("DataFrame")(data);
+}
+
+static py::object CudfCountsFromRowCounts(py::object row_counts, const string &group_column,
+                                          const vector<string> &payload_columns) {
+	vector<string> count_columns;
+	count_columns.push_back(group_column);
+	auto counts = row_counts.attr("__getitem__")(StringVectorToPyList(count_columns)).attr("copy")();
+	auto row_count_column = row_counts.attr("__getitem__")("row_count");
+	for (auto &payload_column : payload_columns) {
+		counts.attr("__setitem__")(payload_column, row_count_column);
+	}
+	return counts;
+}
+
+static void CudfAggregateJoined(py::object joined, const string &group_column, const vector<string> &payload_columns,
+                                bool assume_payload_all_valid, py::object &sums, py::object &counts,
+                                py::object &row_counts) {
+	auto grouped = joined.attr("groupby")(group_column);
+	row_counts = grouped.attr("size")().attr("reset_index")(py::arg("name") = "row_count");
+	sums = grouped.attr("__getitem__")(StringVectorToPyList(payload_columns)).attr("sum")().attr("reset_index")();
+	if (assume_payload_all_valid) {
+		counts = CudfCountsFromRowCounts(row_counts, group_column, payload_columns);
+	} else {
+		counts = grouped.attr("__getitem__")(StringVectorToPyList(payload_columns)).attr("count")().attr("reset_index")();
+	}
+}
+
+static void AppendNonEmptyCudfFrame(vector<py::object> &frames, const py::object &frame) {
+	if (!frame.is_none() && py::len(frame) > 0) {
+		frames.push_back(frame);
+	}
+}
+
+static py::object CudfCombineFrames(py::module_ &cudf, const vector<py::object> &frames, const string &group_column,
+                                    const vector<string> &payload_columns, bool is_row_count) {
+	if (frames.empty()) {
+		vector<string> columns;
+		columns.push_back(group_column);
+		if (is_row_count) {
+			columns.push_back("row_count");
+		} else {
+			for (auto &payload_column : payload_columns) {
+				columns.push_back(payload_column);
+			}
+		}
+		return CudfDataFrameForColumns(cudf, columns);
+	}
+
+	py::list frame_list;
+	for (auto &frame : frames) {
+		frame_list.append(frame);
+	}
+	auto combined = cudf.attr("concat")(frame_list, py::arg("ignore_index") = true);
+	if (is_row_count) {
+		return combined.attr("groupby")(group_column).attr("sum")().attr("reset_index")();
+	}
+	return combined.attr("groupby")(group_column)
+	    .attr("__getitem__")(StringVectorToPyList(payload_columns))
+	    .attr("sum")()
+	    .attr("reset_index")();
+}
+
+static uint64_t CudfScalarToUInt64(py::object value) {
+	if (py::hasattr(value, "item")) {
+		value = value.attr("item")();
+	}
+	return value.cast<uint64_t>();
+}
+
+static py::dict DBSGPUCudfLatMulti(const py::iterable &fact_paths_p, const py::object &payload_columns_p,
+                                   const string &join_key, const string &group_column, const string &dimension_file,
+                                   const string &read_mode, bool reuse_dimension_mapping,
+                                   bool assume_payload_all_valid) {
+	if (read_mode != "per-file" && read_mode != "glob") {
+		throw InvalidInputException("read_mode must be 'per-file' or 'glob'");
+	}
+
+	vector<string> fact_paths;
+	for (auto item : fact_paths_p) {
+		fact_paths.push_back(py::str(item));
+	}
+	if (fact_paths.empty()) {
+		throw InvalidInputException("fact_paths cannot be empty");
+	}
+	auto payload_columns = ParsePayloadColumns(payload_columns_p);
+	vector<string> fact_columns;
+	fact_columns.push_back(join_key);
+	for (auto &payload_column : payload_columns) {
+		fact_columns.push_back(payload_column);
+	}
+	vector<string> dimension_columns;
+	dimension_columns.push_back(join_key);
+	dimension_columns.push_back(group_column);
+
+	auto cudf = py::module_::import("cudf");
+
+	double read_seconds = 0;
+	double join_seconds = 0;
+	double group_seconds = 0;
+	double merge_seconds = 0;
+	auto start = std::chrono::steady_clock::now();
+
+	vector<py::object> sum_frames;
+	vector<py::object> count_frames;
+	vector<py::object> row_count_frames;
+
+	if (read_mode == "glob") {
+		auto dimension_path = ResolveDimensionPath(fact_paths[0], dimension_file);
+		auto read_start = std::chrono::steady_clock::now();
+		auto dim = CudfReadParquet(cudf, py::str(dimension_path), dimension_columns);
+		py::list fact_path_list;
+		for (auto &fact_path : fact_paths) {
+			fact_path_list.append(fact_path);
+		}
+		auto fact = CudfReadParquet(cudf, fact_path_list, fact_columns);
+		CudaSynchronizeIfAvailable();
+		read_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - read_start).count();
+
+		auto join_start = std::chrono::steady_clock::now();
+		auto joined = fact.attr("merge")(dim, py::arg("on") = join_key, py::arg("how") = "inner");
+		CudaSynchronizeIfAvailable();
+		join_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - join_start).count();
+
+		auto group_start = std::chrono::steady_clock::now();
+		py::object sums;
+		py::object counts;
+		py::object row_counts;
+		CudfAggregateJoined(joined, group_column, payload_columns, assume_payload_all_valid, sums, counts, row_counts);
+		CudaSynchronizeIfAvailable();
+		group_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - group_start).count();
+		AppendNonEmptyCudfFrame(sum_frames, sums);
+		AppendNonEmptyCudfFrame(count_frames, counts);
+		AppendNonEmptyCudfFrame(row_count_frames, row_counts);
+	} else {
+		py::object cached_dim = py::none();
+		for (auto &fact_path : fact_paths) {
+			auto read_start = std::chrono::steady_clock::now();
+			if (cached_dim.is_none() || !reuse_dimension_mapping) {
+				auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
+				cached_dim = CudfReadParquet(cudf, py::str(dimension_path), dimension_columns);
+			}
+			auto fact = CudfReadParquet(cudf, py::str(fact_path), fact_columns);
+			CudaSynchronizeIfAvailable();
+			read_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - read_start).count();
+
+			auto join_start = std::chrono::steady_clock::now();
+			auto joined = fact.attr("merge")(cached_dim, py::arg("on") = join_key, py::arg("how") = "inner");
+			CudaSynchronizeIfAvailable();
+			join_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - join_start).count();
+
+			auto group_start = std::chrono::steady_clock::now();
+			py::object sums;
+			py::object counts;
+			py::object row_counts;
+			CudfAggregateJoined(joined, group_column, payload_columns, assume_payload_all_valid, sums, counts, row_counts);
+			CudaSynchronizeIfAvailable();
+			group_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - group_start).count();
+			AppendNonEmptyCudfFrame(sum_frames, sums);
+			AppendNonEmptyCudfFrame(count_frames, counts);
+			AppendNonEmptyCudfFrame(row_count_frames, row_counts);
+		}
+	}
+
+	auto merge_start = std::chrono::steady_clock::now();
+	auto total_sums = CudfCombineFrames(cudf, sum_frames, group_column, payload_columns, false);
+	auto total_counts = CudfCombineFrames(cudf, count_frames, group_column, payload_columns, false);
+	auto total_row_counts = CudfCombineFrames(cudf, row_count_frames, group_column, payload_columns, true);
+	CudaSynchronizeIfAvailable();
+	uint64_t row_count = 0;
+	if (py::len(total_row_counts) > 0) {
+		row_count = CudfScalarToUInt64(total_row_counts.attr("__getitem__")("row_count").attr("sum")());
+	}
+	merge_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - merge_start).count();
+
+	auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+	py::dict result;
+	result["row_count"] = py::int_(row_count);
+	result["input_file_count"] = py::int_(fact_paths.size());
+	result["query_time"] = py::float_(elapsed);
+	result["scan_decode_engine"] = "cudf/libcudf";
+	result["sums"] = total_sums;
+	result["counts"] = total_counts;
+	result["row_counts"] = total_row_counts;
+
+	py::dict stage_times;
+	stage_times["gpu_read_time"] = py::float_(read_seconds);
+	stage_times["gpu_join_time"] = py::float_(join_seconds);
+	stage_times["gpu_groupby_time"] = py::float_(group_seconds);
+	stage_times["gpu_merge_time"] = py::float_(merge_seconds);
+	result["stage_times"] = stage_times;
+
+	py::list payloads;
+	for (auto &payload_column : payload_columns) {
+		payloads.append(payload_column);
+	}
+	result["payload_columns"] = payloads;
+	return result;
+}
+
 static void ReadPipelineRawBatches(DuckDB &db, const vector<string> &fact_paths, const string &payload_column,
                                    const string &join_key, const string &group_column, const string &dimension_file,
                                    BlockingQueue<PipelineRawBatch> &raw_queue, std::exception_ptr &error_out,
@@ -4435,6 +4661,11 @@ void RegisterDBSGPUFused(py::module_ &m) {
 	      py::arg("payload_columns") = py::make_tuple("qicps"), py::arg("join_key") = "grid",
 	      py::arg("group_column") = "lats", py::arg("dimension_file") = "grid.parquet", py::arg("lib_path") = "",
 	      py::arg("mode") = "device");
+	m.def("dbs_gpu_cudf_lat_multi", &DBSGPUCudfLatMulti, py::arg("fact_paths"),
+	      py::arg("payload_columns") = py::make_tuple("qicps"), py::arg("join_key") = "grid",
+	      py::arg("group_column") = "lats", py::arg("dimension_file") = "grid.parquet",
+	      py::arg("read_mode") = "per-file", py::arg("reuse_dimension_mapping") = false,
+	      py::arg("assume_payload_all_valid") = false);
 }
 
 } // namespace duckdb
