@@ -61,7 +61,8 @@ def make_counts_from_row_counts(row_counts, group_column, payload_columns):
 
 def aggregate_joined(joined, group_column, payload_columns, assume_payload_all_valid):
     grouped = joined.groupby(group_column)
-    row_counts = grouped.size().reset_index(name="row_count")
+    row_counts = grouped.size().reset_index()
+    row_counts = row_counts.rename(columns={row_counts.columns[-1]: "row_count"})
     sums = grouped[payload_columns].sum().reset_index()
     if assume_payload_all_valid:
         counts = make_counts_from_row_counts(row_counts, group_column, payload_columns)
