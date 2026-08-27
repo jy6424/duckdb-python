@@ -1222,6 +1222,7 @@ struct DirectMappedDecodedEvent {
 	idx_t chunk_row_base = 0;
 	idx_t output_row = 0;
 	idx_t column_count = 0;
+	idx_t row_count = 0;
 };
 
 struct MultiPipelineOutputBatch {
@@ -1269,6 +1270,7 @@ struct MultiPipelineStageTimers {
 	double direct_output_chunk_time = 0;
 	double direct_finish_chunk_time = 0;
 	double direct_flush_time = 0;
+	double direct_decode_materialize_time = 0;
 	double gpu_pop_time = 0;
 	double gpu_work_time = 0;
 	double gpu_push_time = 0;
@@ -1284,6 +1286,8 @@ struct MultiPipelineStageTimers {
 	uint64_t merged_batches = 0;
 	uint64_t dimension_mapping_reads = 0;
 	uint64_t dimension_mapping_reuses = 0;
+	uint64_t direct_decode_queue_depth = 0;
+	uint64_t pipeline_slots = 0;
 };
 
 static double ElapsedSeconds(std::chrono::steady_clock::time_point start) {
@@ -2527,9 +2531,12 @@ static void MakeDirectMappedParquetOutputChunk(DataChunk &result, DirectMultiPip
 	result.SetCapacity(STANDARD_VECTOR_SIZE);
 }
 
-static void FinishDirectMappedDecodedChunk(DirectMultiPipelineBuffer &buffer, DataChunk &chunk, idx_t chunk_row_base,
-                                           idx_t output_row, idx_t column_count) {
-	auto count = chunk.size();
+static void FinishDirectMappedDecodedChunk(DirectMultiPipelineBuffer &buffer, DataChunk *chunk, idx_t chunk_row_base,
+                                           idx_t output_row, idx_t column_count, idx_t row_count) {
+	auto count = row_count;
+	if (chunk) {
+		count = chunk->size();
+	}
 	for (idx_t row = 0; row < count; row++) {
 		buffer.join_keys[output_row + row] = RowOrderJoinKey(*buffer.mapping, chunk_row_base + row);
 	}
@@ -2537,8 +2544,11 @@ static void FinishDirectMappedDecodedChunk(DirectMultiPipelineBuffer &buffer, Da
 		if (AssumePayloadAllValid()) {
 			continue;
 		}
+		if (!chunk) {
+			throw InternalException("direct parquet decode validity requires a materialized chunk");
+		}
 		auto validity_out = buffer.validity + column * buffer.value_stride + output_row;
-		auto &validity = FlatVector::Validity(chunk.data[column]);
+		auto &validity = FlatVector::Validity(chunk->data[column]);
 		if (validity.AllValid()) {
 			std::memset(validity_out, 1, count);
 		} else {
@@ -2605,12 +2615,12 @@ static void RunDirectMappedDecodedEmitWorker(BlockingQueue<DirectMappedDecodedEv
 				                              prepare_push_elapsed, direct_flush_elapsed);
 				continue;
 			}
-			if (!event.chunk || event.chunk->size() == 0) {
+			if (event.row_count == 0) {
 				continue;
 			}
 			auto work_start = std::chrono::steady_clock::now();
-			FinishDirectMappedDecodedChunk(*event.buffer, *event.chunk, event.chunk_row_base, event.output_row,
-			                               event.column_count);
+			FinishDirectMappedDecodedChunk(*event.buffer, event.chunk.get(), event.chunk_row_base, event.output_row,
+			                               event.column_count, event.row_count);
 			auto finish_chunk_elapsed = ElapsedSeconds(work_start);
 			direct_finish_chunk_elapsed += finish_chunk_elapsed;
 		}
@@ -2657,21 +2667,17 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 	double direct_output_chunk_elapsed = 0;
 	double direct_finish_chunk_elapsed = 0;
 	double direct_flush_elapsed = 0;
+	double direct_decode_materialize_elapsed = 0;
 	uint64_t file_count = 0;
 	uint64_t row_count = 0;
 	uint64_t fetch_calls = 0;
 	uint64_t finished_fetches = 0;
-	BlockingQueue<DirectMappedDecodedEvent> decoded_queue(8);
-	std::thread emit_thread;
+	std::unique_ptr<BlockingQueue<DirectMappedDecodedEvent>> decoded_queue;
+	std::unique_ptr<std::thread> emit_thread;
 	bool emit_thread_started = false;
 	double reader_stage_elapsed = 0;
+	idx_t decoded_queue_depth = 0;
 	try {
-		emit_thread = std::thread(RunDirectMappedDecodedEmitWorker, std::ref(decoded_queue), std::ref(input_queue),
-		                          std::ref(free_slots), std::ref(batch_count), std::ref(prepare_stage_elapsed),
-		                          std::ref(prepare_pop_elapsed), std::ref(prepare_push_elapsed),
-		                          std::ref(direct_finish_chunk_elapsed),
-		                          std::ref(direct_flush_elapsed), std::ref(error_out), std::ref(error_lock));
-		emit_thread_started = true;
 		if (!InferGridFromRowOrder()) {
 			throw InvalidInputException("direct parquet decode requires row-order grid inference");
 		}
@@ -2681,6 +2687,18 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 			throw InvalidInputException(
 			    "direct parquet decode requires DUCKDB_GPU_PIPELINE_BATCH_ROWS >= STANDARD_VECTOR_SIZE and chunks > 0");
 		}
+		decoded_queue_depth =
+		    ReadEnvIdx("DUCKDB_GPU_PIPELINE_DECODE_QUEUE_DEPTH", AssumePayloadAllValid() ? 64 : 8);
+		if (decoded_queue_depth == 0) {
+			decoded_queue_depth = 1;
+		}
+		decoded_queue = make_uniq<BlockingQueue<DirectMappedDecodedEvent>>(decoded_queue_depth);
+		emit_thread = make_uniq<std::thread>(
+		    RunDirectMappedDecodedEmitWorker, std::ref(*decoded_queue), std::ref(input_queue), std::ref(free_slots),
+		    std::ref(batch_count), std::ref(prepare_stage_elapsed), std::ref(prepare_pop_elapsed),
+		    std::ref(prepare_push_elapsed), std::ref(direct_finish_chunk_elapsed), std::ref(direct_flush_elapsed),
+		    std::ref(error_out), std::ref(error_lock));
+		emit_thread_started = true;
 
 		auto connection_start = std::chrono::steady_clock::now();
 		Connection connection(db);
@@ -2743,7 +2761,7 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 				event.type = DirectMappedDecodedEventType::FLUSH;
 				event.buffer = current;
 				auto push_start = std::chrono::steady_clock::now();
-				decoded_queue.Push(std::move(event));
+				decoded_queue->Push(std::move(event));
 				push_elapsed += ElapsedSeconds(push_start);
 				current.reset();
 				reserved_rows = 0;
@@ -2790,16 +2808,20 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 					continue;
 				}
 				fetch_nonempty_elapsed += fetch_call_elapsed;
+				direct_decode_materialize_elapsed += fetch_call_elapsed;
 				auto result_size = result->size();
 				DirectMappedDecodedEvent event;
 				event.type = DirectMappedDecodedEventType::CHUNK;
 				event.buffer = current;
-				event.chunk = std::move(result);
+				if (!AssumePayloadAllValid()) {
+					event.chunk = std::move(result);
+				}
 				event.chunk_row_base = fact_row_base;
 				event.output_row = output_row;
 				event.column_count = payload_columns.size();
+				event.row_count = result_size;
 				auto push_start = std::chrono::steady_clock::now();
-				decoded_queue.Push(std::move(event));
+				decoded_queue->Push(std::move(event));
 				push_elapsed += ElapsedSeconds(push_start);
 				fact_row_base += result_size;
 				reserved_rows += result_size;
@@ -2819,9 +2841,11 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 		}
 	}
 	reader_stage_elapsed = ElapsedSeconds(stage_start);
-	decoded_queue.Close();
-	if (emit_thread_started && emit_thread.joinable()) {
-		emit_thread.join();
+	if (decoded_queue) {
+		decoded_queue->Close();
+	}
+	if (emit_thread_started && emit_thread && emit_thread->joinable()) {
+		emit_thread->join();
 	}
 	prepare_work_elapsed += direct_finish_chunk_elapsed;
 	if (timers) {
@@ -2853,9 +2877,12 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 		timers->direct_output_chunk_time += direct_output_chunk_elapsed;
 		timers->direct_finish_chunk_time += direct_finish_chunk_elapsed;
 		timers->direct_flush_time += direct_flush_elapsed;
+		timers->direct_decode_materialize_time += direct_decode_materialize_elapsed;
 		timers->prepared_batches += batch_count;
 		timers->dimension_mapping_reads += mapping_reads;
 		timers->dimension_mapping_reuses += mapping_reuses;
+		timers->direct_decode_queue_depth = std::max<uint64_t>(
+		    timers->direct_decode_queue_depth, static_cast<uint64_t>(decoded_queue_depth));
 	}
 }
 
@@ -3997,18 +4024,22 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		std::mutex worker_error_lock;
 
 		if (pipeline_direct_mode) {
-			constexpr idx_t PIPELINE_SLOTS = 2;
+			auto pipeline_slots = ReadEnvIdx("DUCKDB_GPU_PIPELINE_SLOTS", 2);
+			if (pipeline_slots < 2) {
+				pipeline_slots = 2;
+			}
+			pipeline_slots = MinValue<idx_t>(pipeline_slots, 16);
 			auto direct_pipeline = LoadFusedLatAggMultiDirectPipeline(lib_path, pipeline_device_direct_mode);
 			void *handle =
-			    direct_pipeline.create(static_cast<uint32_t>(PIPELINE_SLOTS), pipeline_device_direct_mode ? 0 : 1);
+			    direct_pipeline.create(static_cast<uint32_t>(pipeline_slots), pipeline_device_direct_mode ? 0 : 1);
 			if (!handle) {
 				throw InvalidInputException("GPU fused direct multi pipeline create failed");
 			}
 
 			BlockingQueue<MultiPipelineChunkBatch> chunk_queue(8);
-			BlockingQueue<DirectMultiPipelineInputBatch> input_queue(PIPELINE_SLOTS);
-			BlockingQueue<idx_t> free_slots(PIPELINE_SLOTS);
-			for (idx_t slot = 0; slot < PIPELINE_SLOTS; slot++) {
+			BlockingQueue<DirectMultiPipelineInputBatch> input_queue(pipeline_slots);
+			BlockingQueue<idx_t> free_slots(pipeline_slots);
+			for (idx_t slot = 0; slot < pipeline_slots; slot++) {
 				free_slots.Push(slot);
 			}
 			BlockingQueue<string> file_queue(0);
@@ -4061,7 +4092,7 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 				    std::ref(input_queue), std::ref(free_slots), column_count, std::ref(worker_error),
 				    std::ref(worker_error_lock), &stage_timers, pipeline_device_direct_mode);
 			}
-			std::thread gpu_thread(RunDirectMultiPipelineGPUWorker, direct_pipeline, handle, PIPELINE_SLOTS,
+			std::thread gpu_thread(RunDirectMultiPipelineGPUWorker, direct_pipeline, handle, pipeline_slots,
 			                       std::ref(input_queue), std::ref(output_queue), std::ref(free_slots),
 			                       column_count, std::ref(worker_error), std::ref(worker_error_lock),
 			                       &stage_timers);
@@ -4092,6 +4123,7 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 				if (worker_error) {
 					std::rethrow_exception(worker_error);
 				}
+				stage_timers.pipeline_slots = static_cast<uint64_t>(pipeline_slots);
 			} catch (...) {
 				chunk_queue.Close();
 				input_queue.Close();
@@ -4302,6 +4334,7 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		stage_times["direct_output_chunk_time"] = py::float_(stage_timers.direct_output_chunk_time);
 		stage_times["direct_finish_chunk_time"] = py::float_(stage_timers.direct_finish_chunk_time);
 		stage_times["direct_flush_time"] = py::float_(stage_timers.direct_flush_time);
+		stage_times["direct_decode_materialize_time"] = py::float_(stage_timers.direct_decode_materialize_time);
 		stage_times["gpu_pop_time"] = py::float_(stage_timers.gpu_pop_time);
 		stage_times["gpu_work_time"] = py::float_(stage_timers.gpu_work_time);
 		stage_times["gpu_push_time"] = py::float_(stage_timers.gpu_push_time);
@@ -4317,6 +4350,8 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		stage_times["merged_batches"] = py::int_(stage_timers.merged_batches);
 		stage_times["dimension_mapping_reads"] = py::int_(stage_timers.dimension_mapping_reads);
 		stage_times["dimension_mapping_reuses"] = py::int_(stage_timers.dimension_mapping_reuses);
+		stage_times["direct_decode_queue_depth"] = py::int_(stage_timers.direct_decode_queue_depth);
+		stage_times["pipeline_slots"] = py::int_(stage_timers.pipeline_slots);
 	}
 	DuckDBDBSParquetReaderMetricsSnapshot parquet_metrics;
 	duckdb_dbs_parquet_reader_metrics_snapshot(&parquet_metrics);

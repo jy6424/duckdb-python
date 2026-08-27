@@ -421,6 +421,7 @@ def main():
                 "direct_output_chunk_time",
                 "direct_finish_chunk_time",
                 "direct_flush_time",
+                "direct_decode_materialize_time",
             )
         ):
             print(
@@ -430,6 +431,11 @@ def main():
                     float(stage.get("direct_output_chunk_time", 0.0)),
                     float(stage.get("direct_finish_chunk_time", 0.0)),
                     float(stage.get("direct_flush_time", 0.0)),
+                )
+            )
+            print(
+                "[direct decode/materialize] {:.6f}s".format(
+                    float(stage.get("direct_decode_materialize_time", 0.0))
                 )
             )
         print(
@@ -451,6 +457,10 @@ def main():
                 int(stage.get("merged_batches", 0)),
             )
         )
+        if int(stage.get("direct_decode_queue_depth", 0)) > 0:
+            print("[direct decode queue] depth={}".format(int(stage.get("direct_decode_queue_depth", 0))))
+        if int(stage.get("pipeline_slots", 0)) > 0:
+            print("[pipeline slots] {}".format(int(stage.get("pipeline_slots", 0))))
         print(
             "[dimension mapping] reads={} reuses={}".format(
                 int(stage.get("dimension_mapping_reads", 0)),
