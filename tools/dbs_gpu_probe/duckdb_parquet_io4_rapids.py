@@ -102,6 +102,18 @@ def parse_args():
         help="file byte read method used by --split-file-io",
     )
     parser.add_argument(
+        "--file-io-sqpoll",
+        action="store_true",
+        default=os.environ.get("CUDF_FILE_IO_SQPOLL", "0") == "1",
+        help="enable IORING_SETUP_SQPOLL for --file-io-method io_uring",
+    )
+    parser.add_argument(
+        "--file-io-sqpoll-idle-ms",
+        type=int,
+        default=int(os.environ.get("CUDF_FILE_IO_SQPOLL_IDLE_MS", "2000")),
+        help="SQPOLL kernel thread idle timeout in milliseconds",
+    )
+    parser.add_argument(
         "--io-queue-depth",
         type=int,
         default=int(os.environ.get("CUDF_IO_QUEUE_DEPTH", "1")),
@@ -409,18 +421,30 @@ class IOVec(ctypes.Structure):
 class SimpleIoUring(object):
     SYS_IO_URING_SETUP = 425
     SYS_IO_URING_ENTER = 426
+    SYS_IO_URING_REGISTER = 427
     IORING_OFF_SQ_RING = 0
     IORING_OFF_CQ_RING = 0x8000000
     IORING_OFF_SQES = 0x10000000
     IORING_ENTER_GETEVENTS = 1
+    IORING_ENTER_SQ_WAKEUP = 2
+    IORING_SETUP_SQPOLL = 2
+    IORING_SQ_NEED_WAKEUP = 1
     IORING_OP_READV = 1
+    IORING_REGISTER_FILES = 2
+    IORING_UNREGISTER_FILES = 3
+    IOSQE_FIXED_FILE = 1
 
-    def __init__(self, entries):
+    def __init__(self, entries, sqpoll=False, sqpoll_idle_ms=2000):
         if not hasattr(os, "uname") or os.uname().sysname != "Linux":
             raise OSError("io_uring is only available on Linux")
         self.libc = ctypes.CDLL(None, use_errno=True)
         self.entries = max(1, int(entries))
+        self.sqpoll = bool(sqpoll)
+        self.fixed_files_registered = False
         self.params = IoUringParams()
+        if self.sqpoll:
+            self.params.flags |= self.IORING_SETUP_SQPOLL
+            self.params.sq_thread_idle = max(1, int(sqpoll_idle_ms))
         fd = self.libc.syscall(self.SYS_IO_URING_SETUP, self.entries, ctypes.byref(self.params))
         if fd < 0:
             err = ctypes.get_errno()
@@ -459,6 +483,7 @@ class SimpleIoUring(object):
         self.sq_head = ctypes.c_uint32.from_buffer(self.sq_ring, self.params.sq_off.head)
         self.sq_tail = ctypes.c_uint32.from_buffer(self.sq_ring, self.params.sq_off.tail)
         self.sq_mask = ctypes.c_uint32.from_buffer(self.sq_ring, self.params.sq_off.ring_mask)
+        self.sq_flags = ctypes.c_uint32.from_buffer(self.sq_ring, self.params.sq_off.flags)
         self.sq_array = (ctypes.c_uint32 * self.params.sq_entries).from_buffer(
             self.sq_ring,
             self.params.sq_off.array,
@@ -472,7 +497,23 @@ class SimpleIoUring(object):
         )
         self.sqes = (IoUringSqe * self.params.sq_entries).from_buffer(self.sqes_map, 0)
 
-    def submit_readv(self, fd, iovec, size, user_data):
+    def register_files(self, fds):
+        if not fds:
+            return
+        fd_array = (ctypes.c_int * len(fds))(*fds)
+        result = self.libc.syscall(
+            self.SYS_IO_URING_REGISTER,
+            self.ring_fd,
+            self.IORING_REGISTER_FILES,
+            ctypes.byref(fd_array),
+            len(fds),
+        )
+        if result < 0:
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err))
+        self.fixed_files_registered = True
+
+    def submit_readv(self, fd, iovec, size, user_data, fixed_file=False):
         head = self.sq_head.value
         tail = self.sq_tail.value
         if tail - head >= self.params.sq_entries:
@@ -482,12 +523,31 @@ class SimpleIoUring(object):
         ctypes.memset(ctypes.addressof(sqe), 0, ctypes.sizeof(IoUringSqe))
         sqe.opcode = self.IORING_OP_READV
         sqe.fd = int(fd)
+        if fixed_file:
+            sqe.flags |= self.IOSQE_FIXED_FILE
         sqe.off = 0
         sqe.addr = ctypes.addressof(iovec)
         sqe.len = 1
         sqe.user_data = int(user_data)
         self.sq_array[index] = index
         self.sq_tail.value = tail + 1
+
+    def wake_sqpoll_if_needed(self):
+        if not self.sqpoll:
+            return
+        if self.sq_flags.value & self.IORING_SQ_NEED_WAKEUP:
+            result = self.libc.syscall(
+                self.SYS_IO_URING_ENTER,
+                self.ring_fd,
+                0,
+                0,
+                self.IORING_ENTER_SQ_WAKEUP,
+                None,
+                0,
+            )
+            if result < 0:
+                err = ctypes.get_errno()
+                raise OSError(err, os.strerror(err))
 
     def enter(self, submit_count, wait_count):
         result = self.libc.syscall(
@@ -508,7 +568,11 @@ class SimpleIoUring(object):
         completed = {}
         submitted = count
         while len(completed) < count:
-            self.enter(submitted, 1)
+            if self.sqpoll:
+                self.wake_sqpoll_if_needed()
+                self.enter(0, 1)
+            else:
+                self.enter(submitted, 1)
             submitted = 0
             while self.cq_head.value != self.cq_tail.value:
                 head = self.cq_head.value
@@ -516,6 +580,20 @@ class SimpleIoUring(object):
                 completed[int(cqe.user_data)] = int(cqe.res)
                 self.cq_head.value = head + 1
         return completed
+
+    def close(self):
+        if getattr(self, "ring_fd", -1) >= 0:
+            if self.fixed_files_registered:
+                self.libc.syscall(
+                    self.SYS_IO_URING_REGISTER,
+                    self.ring_fd,
+                    self.IORING_UNREGISTER_FILES,
+                    None,
+                    0,
+                )
+                self.fixed_files_registered = False
+            os.close(self.ring_fd)
+            self.ring_fd = -1
 
 
 def read_file_bytes_blocking(paths):
@@ -529,23 +607,27 @@ def read_file_bytes_blocking(paths):
     return buffers, byte_count
 
 
-def read_file_bytes_io_uring(paths):
-    ring = SimpleIoUring(len(paths))
+def read_file_bytes_io_uring(paths, sqpoll=False, sqpoll_idle_ms=2000):
+    ring = SimpleIoUring(len(paths), sqpoll=sqpoll, sqpoll_idle_ms=sqpoll_idle_ms)
     fds = []
     raw_buffers = []
     iovecs = []
     sizes = []
     try:
-        for idx, path in enumerate(paths):
+        for path in paths:
             fd = os.open(path, os.O_RDONLY)
             fds.append(fd)
+        if sqpoll:
+            ring.register_files(fds)
+        for idx, fd in enumerate(fds):
             size = os.fstat(fd).st_size
             sizes.append(size)
             buffer = ctypes.create_string_buffer(size)
             iovec = IOVec(ctypes.cast(buffer, ctypes.c_void_p), size)
             raw_buffers.append(buffer)
             iovecs.append(iovec)
-            ring.submit_readv(fd, iovec, size, idx)
+            submit_fd = idx if sqpoll else fd
+            ring.submit_readv(submit_fd, iovec, size, idx, fixed_file=sqpoll)
         results = ring.collect(len(paths))
         for idx, size in enumerate(sizes):
             res = results.get(idx, -1)
@@ -557,6 +639,10 @@ def read_file_bytes_io_uring(paths):
         buffers = [raw_buffers[idx].raw for idx in range(len(raw_buffers))]
         return buffers, sum(sizes)
     finally:
+        try:
+            ring.close()
+        except Exception:
+            pass
         for fd in fds:
             try:
                 os.close(fd)
@@ -564,14 +650,14 @@ def read_file_bytes_io_uring(paths):
                 pass
 
 
-def timed_read_file_bytes(paths, method="read"):
+def timed_read_file_bytes(paths, method="read", sqpoll=False, sqpoll_idle_ms=2000):
     io_before = read_proc_io()
     timer_start = time.time()
     actual_method = method
     fallback_reason = ""
     if method == "io_uring":
         try:
-            buffers, byte_count = read_file_bytes_io_uring(paths)
+            buffers, byte_count = read_file_bytes_io_uring(paths, sqpoll=sqpoll, sqpoll_idle_ms=sqpoll_idle_ms)
         except Exception as exc:
             actual_method = "read-fallback"
             fallback_reason = str(exc)
@@ -583,7 +669,7 @@ def timed_read_file_bytes(paths, method="read"):
     return buffers, {
         "elapsed": elapsed,
         "file_bytes": byte_count,
-        "method": actual_method,
+        "method": actual_method + ("+sqpoll" if actual_method == "io_uring" and sqpoll else ""),
         "fallback_reason": fallback_reason,
         "rchar": io_diff(io_before, io_after, "rchar"),
         "read_bytes": io_diff(io_before, io_after, "read_bytes"),
@@ -881,12 +967,17 @@ def split_file_io_read_aggregate(
                 except queue.Empty:
                     break
 
-                buffers, io_profile = timed_read_file_bytes(batch_paths, method=args.file_io_method)
+                buffers, io_profile = timed_read_file_bytes(
+                    batch_paths,
+                    method=args.file_io_method,
+                    sqpoll=args.file_io_sqpoll,
+                    sqpoll_idle_ms=args.file_io_sqpoll_idle_ms,
+                )
                 add_counter("file_io_read", io_profile["elapsed"])
                 add_counter("fact_read_bytes", io_profile["read_bytes"])
                 add_counter("fact_rchar", io_profile["rchar"])
                 add_counter("fact_syscr", io_profile["syscr"])
-                if args.file_io_method == "io_uring" and io_profile["method"] != "io_uring":
+                if args.file_io_method == "io_uring" and not io_profile["method"].startswith("io_uring"):
                     add_counter("io_uring_fallbacks", 1)
                 raw_batches.put(("raw", batch_id, batch_paths, buffers, io_profile))
         except BaseException as exc:
@@ -1231,6 +1322,10 @@ def main():
     if args.split_file_io:
         print("[split file io]: on")
         print("[file io method]: {}".format(args.file_io_method))
+        if args.file_io_method == "io_uring":
+            print("[file io sqpoll]: {}".format("on" if args.file_io_sqpoll else "off"))
+            if args.file_io_sqpoll:
+                print("[file io sqpoll idle ms]: {}".format(args.file_io_sqpoll_idle_ms))
         print("[io queue depth]: {}".format(args.io_queue_depth))
         print("[decode threads]: {}".format(args.decode_threads))
     if args.assume_payload_all_valid:
