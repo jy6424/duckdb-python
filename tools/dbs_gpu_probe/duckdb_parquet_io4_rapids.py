@@ -27,6 +27,7 @@ def new_timers():
         "merge_groupby": 0.0,
         "row_count_sum": 0.0,
         "reader_wall": 0.0,
+        "rmm_setup": 0.0,
     }
 
 
@@ -66,9 +67,66 @@ def parse_args():
         default=None,
         help="number of Parquet files read by each cuDF reader task; defaults to 1 for per-file and ceil(files/threads) for glob",
     )
+    parser.add_argument(
+        "--rmm-pool",
+        action="store_true",
+        default=os.environ.get("CUDF_RMM_POOL", "0") == "1",
+        help="enable RMM pool allocator before importing cuDF",
+    )
+    parser.add_argument(
+        "--rmm-pool-size",
+        default=os.environ.get("CUDF_RMM_POOL_SIZE", "4GB"),
+        help="initial RMM pool size, e.g. 2GB, 4096MB, or 4294967296",
+    )
     parser.add_argument("--print-stage-times", action="store_true")
     parser.add_argument("--print-results", action="store_true")
     return parser.parse_args()
+
+
+def parse_byte_size(value):
+    text = str(value).strip().lower()
+    if not text:
+        raise ValueError("empty byte size")
+
+    units = [
+        ("gib", 1024 ** 3),
+        ("gb", 1024 ** 3),
+        ("mib", 1024 ** 2),
+        ("mb", 1024 ** 2),
+        ("kib", 1024),
+        ("kb", 1024),
+        ("b", 1),
+    ]
+    for suffix, multiplier in units:
+        if text.endswith(suffix):
+            return int(float(text[:-len(suffix)]) * multiplier)
+    return int(text)
+
+
+def configure_rmm_pool(args, timers):
+    if not args.rmm_pool:
+        return False, 0
+
+    timer_start = time.time()
+    pool_size = parse_byte_size(args.rmm_pool_size)
+    try:
+        import rmm
+
+        rmm.reinitialize(pool_allocator=True, initial_pool_size=pool_size)
+        try:
+            import cupy
+
+            allocator = getattr(rmm, "rmm_cupy_allocator", None)
+            if allocator is None:
+                allocator = rmm.allocators.cupy.rmm_cupy_allocator
+            cupy.cuda.set_allocator(allocator)
+        except Exception:
+            pass
+    except Exception as exc:
+        raise SystemExit("failed to initialize RMM pool allocator: {}".format(exc))
+    finally:
+        add_elapsed(timers, "rmm_setup", timer_start)
+    return True, pool_size
 
 
 def read_auto_payload_columns(parquet_path):
@@ -326,6 +384,8 @@ def combine_frames(cudf, frames, group_column, payload_columns, timers, is_row_c
 
 def main():
     args = parse_args()
+    detail_timers = new_timers()
+    rmm_pool_enabled, rmm_pool_size = configure_rmm_pool(args, detail_timers)
     try:
         import cudf
     except ImportError as exc:
@@ -339,7 +399,6 @@ def main():
     if not payload_columns:
         raise SystemExit("no payload columns specified")
 
-    detail_timers = new_timers()
     read_seconds = 0.0
     join_seconds = 0.0
     group_seconds = 0.0
@@ -466,6 +525,8 @@ def main():
     print("[read mode]: {}".format(args.read_mode))
     print("[scan/decode engine]: cudf/libcudf")
     print("[reader threads]: {}".format(max(1, min(args.reader_threads, len(parquet_paths)))))
+    if rmm_pool_enabled:
+        print("[rmm pool]: on size={} bytes".format(rmm_pool_size))
     if args.reader_threads > 1:
         batch_size = args.file_batch_size
         if batch_size is None:
@@ -486,7 +547,7 @@ def main():
             "[stage detail] dimension_read={:.6f}s fact_read={:.6f}s join={:.6f}s "
             "groupby_size={:.6f}s groupby_sum={:.6f}s groupby_count={:.6f}s "
             "count_from_rows={:.6f}s merge_concat={:.6f}s merge_groupby={:.6f}s "
-            "row_count_sum={:.6f}s reader_wall={:.6f}s".format(
+            "row_count_sum={:.6f}s reader_wall={:.6f}s rmm_setup={:.6f}s".format(
                 detail_timers["dimension_read"],
                 detail_timers["fact_read"],
                 detail_timers["join"],
@@ -498,6 +559,7 @@ def main():
                 detail_timers["merge_groupby"],
                 detail_timers["row_count_sum"],
                 detail_timers["reader_wall"],
+                detail_timers["rmm_setup"],
             )
         )
     if args.print_results:
