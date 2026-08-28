@@ -3,9 +3,11 @@
 from __future__ import print_function
 
 import argparse
+import ctypes
 import glob
 import io
 import math
+import mmap
 import os
 import queue
 import threading
@@ -41,6 +43,7 @@ def new_timers():
         "dimension_syscr": 0,
         "materialized_bytes": 0,
         "reader_queue_put": 0.0,
+        "io_uring_fallbacks": 0,
         "rmm_setup": 0.0,
     }
 
@@ -91,6 +94,12 @@ def parse_args():
         "--split-file-io",
         action="store_true",
         help="read Parquet file bytes in separate I/O workers before cuDF decode/materialization",
+    )
+    parser.add_argument(
+        "--file-io-method",
+        default=os.environ.get("CUDF_FILE_IO_METHOD", "read"),
+        choices=["read", "io_uring"],
+        help="file byte read method used by --split-file-io",
     )
     parser.add_argument(
         "--io-queue-depth",
@@ -322,9 +331,194 @@ def timed_read_parquet_gpu(cudf, source, columns, measure_materialized_bytes=Fal
     return frame, profile
 
 
-def timed_read_file_bytes(paths):
-    io_before = read_proc_io()
-    timer_start = time.time()
+class IoSqringOffsets(ctypes.Structure):
+    _fields_ = [
+        ("head", ctypes.c_uint32),
+        ("tail", ctypes.c_uint32),
+        ("ring_mask", ctypes.c_uint32),
+        ("ring_entries", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("dropped", ctypes.c_uint32),
+        ("array", ctypes.c_uint32),
+        ("resv1", ctypes.c_uint32),
+        ("user_addr", ctypes.c_uint64),
+    ]
+
+
+class IoCqringOffsets(ctypes.Structure):
+    _fields_ = [
+        ("head", ctypes.c_uint32),
+        ("tail", ctypes.c_uint32),
+        ("ring_mask", ctypes.c_uint32),
+        ("ring_entries", ctypes.c_uint32),
+        ("overflow", ctypes.c_uint32),
+        ("cqes", ctypes.c_uint32),
+        ("flags", ctypes.c_uint64),
+        ("resv1", ctypes.c_uint64),
+    ]
+
+
+class IoUringParams(ctypes.Structure):
+    _fields_ = [
+        ("sq_entries", ctypes.c_uint32),
+        ("cq_entries", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("sq_thread_cpu", ctypes.c_uint32),
+        ("sq_thread_idle", ctypes.c_uint32),
+        ("features", ctypes.c_uint32),
+        ("wq_fd", ctypes.c_uint32),
+        ("resv", ctypes.c_uint32 * 3),
+        ("sq_off", IoSqringOffsets),
+        ("cq_off", IoCqringOffsets),
+    ]
+
+
+class IoUringSqe(ctypes.Structure):
+    _fields_ = [
+        ("opcode", ctypes.c_uint8),
+        ("flags", ctypes.c_uint8),
+        ("ioprio", ctypes.c_uint16),
+        ("fd", ctypes.c_int32),
+        ("off", ctypes.c_uint64),
+        ("addr", ctypes.c_uint64),
+        ("len", ctypes.c_uint32),
+        ("rw_flags", ctypes.c_uint32),
+        ("user_data", ctypes.c_uint64),
+        ("buf_index", ctypes.c_uint16),
+        ("personality", ctypes.c_uint16),
+        ("splice_fd_in", ctypes.c_int32),
+        ("pad2", ctypes.c_uint64 * 2),
+    ]
+
+
+class IoUringCqe(ctypes.Structure):
+    _fields_ = [
+        ("user_data", ctypes.c_uint64),
+        ("res", ctypes.c_int32),
+        ("flags", ctypes.c_uint32),
+    ]
+
+
+class IOVec(ctypes.Structure):
+    _fields_ = [
+        ("iov_base", ctypes.c_void_p),
+        ("iov_len", ctypes.c_size_t),
+    ]
+
+
+class SimpleIoUring(object):
+    SYS_IO_URING_SETUP = 425
+    SYS_IO_URING_ENTER = 426
+    IORING_OFF_SQ_RING = 0
+    IORING_OFF_CQ_RING = 0x8000000
+    IORING_OFF_SQES = 0x10000000
+    IORING_ENTER_GETEVENTS = 1
+    IORING_OP_READV = 1
+
+    def __init__(self, entries):
+        if not hasattr(os, "uname") or os.uname().sysname != "Linux":
+            raise OSError("io_uring is only available on Linux")
+        self.libc = ctypes.CDLL(None, use_errno=True)
+        self.entries = max(1, int(entries))
+        self.params = IoUringParams()
+        fd = self.libc.syscall(self.SYS_IO_URING_SETUP, self.entries, ctypes.byref(self.params))
+        if fd < 0:
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err))
+        self.ring_fd = int(fd)
+        self.sq_ring = None
+        self.cq_ring = None
+        self.sqes_map = None
+        self._map_rings()
+
+    def _map_rings(self):
+        sq_ring_size = self.params.sq_off.array + self.params.sq_entries * ctypes.sizeof(ctypes.c_uint32)
+        cq_ring_size = self.params.cq_off.cqes + self.params.cq_entries * ctypes.sizeof(IoUringCqe)
+        sqes_size = self.params.sq_entries * ctypes.sizeof(IoUringSqe)
+        self.sq_ring = mmap.mmap(
+            self.ring_fd,
+            sq_ring_size,
+            flags=mmap.MAP_SHARED,
+            prot=mmap.PROT_READ | mmap.PROT_WRITE,
+            offset=self.IORING_OFF_SQ_RING,
+        )
+        self.cq_ring = mmap.mmap(
+            self.ring_fd,
+            cq_ring_size,
+            flags=mmap.MAP_SHARED,
+            prot=mmap.PROT_READ | mmap.PROT_WRITE,
+            offset=self.IORING_OFF_CQ_RING,
+        )
+        self.sqes_map = mmap.mmap(
+            self.ring_fd,
+            sqes_size,
+            flags=mmap.MAP_SHARED,
+            prot=mmap.PROT_READ | mmap.PROT_WRITE,
+            offset=self.IORING_OFF_SQES,
+        )
+        self.sq_head = ctypes.c_uint32.from_buffer(self.sq_ring, self.params.sq_off.head)
+        self.sq_tail = ctypes.c_uint32.from_buffer(self.sq_ring, self.params.sq_off.tail)
+        self.sq_mask = ctypes.c_uint32.from_buffer(self.sq_ring, self.params.sq_off.ring_mask)
+        self.sq_array = (ctypes.c_uint32 * self.params.sq_entries).from_buffer(
+            self.sq_ring,
+            self.params.sq_off.array,
+        )
+        self.cq_head = ctypes.c_uint32.from_buffer(self.cq_ring, self.params.cq_off.head)
+        self.cq_tail = ctypes.c_uint32.from_buffer(self.cq_ring, self.params.cq_off.tail)
+        self.cq_mask = ctypes.c_uint32.from_buffer(self.cq_ring, self.params.cq_off.ring_mask)
+        self.cqes = (IoUringCqe * self.params.cq_entries).from_buffer(
+            self.cq_ring,
+            self.params.cq_off.cqes,
+        )
+        self.sqes = (IoUringSqe * self.params.sq_entries).from_buffer(self.sqes_map, 0)
+
+    def submit_readv(self, fd, iovec, size, user_data):
+        head = self.sq_head.value
+        tail = self.sq_tail.value
+        if tail - head >= self.params.sq_entries:
+            raise RuntimeError("io_uring submission queue is full")
+        index = tail & self.sq_mask.value
+        sqe = self.sqes[index]
+        ctypes.memset(ctypes.addressof(sqe), 0, ctypes.sizeof(IoUringSqe))
+        sqe.opcode = self.IORING_OP_READV
+        sqe.fd = int(fd)
+        sqe.off = 0
+        sqe.addr = ctypes.addressof(iovec)
+        sqe.len = 1
+        sqe.user_data = int(user_data)
+        self.sq_array[index] = index
+        self.sq_tail.value = tail + 1
+
+    def enter(self, submit_count, wait_count):
+        result = self.libc.syscall(
+            self.SYS_IO_URING_ENTER,
+            self.ring_fd,
+            int(submit_count),
+            int(wait_count),
+            self.IORING_ENTER_GETEVENTS,
+            None,
+            0,
+        )
+        if result < 0:
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err))
+        return int(result)
+
+    def collect(self, count):
+        completed = {}
+        submitted = count
+        while len(completed) < count:
+            self.enter(submitted, 1)
+            submitted = 0
+            while self.cq_head.value != self.cq_tail.value:
+                head = self.cq_head.value
+                cqe = self.cqes[head & self.cq_mask.value]
+                completed[int(cqe.user_data)] = int(cqe.res)
+                self.cq_head.value = head + 1
+        return completed
+
+
+def read_file_bytes_blocking(paths):
     buffers = []
     byte_count = 0
     for path in paths:
@@ -332,11 +526,65 @@ def timed_read_file_bytes(paths):
             data = handle.read()
         byte_count += len(data)
         buffers.append(data)
+    return buffers, byte_count
+
+
+def read_file_bytes_io_uring(paths):
+    ring = SimpleIoUring(len(paths))
+    fds = []
+    raw_buffers = []
+    iovecs = []
+    sizes = []
+    try:
+        for idx, path in enumerate(paths):
+            fd = os.open(path, os.O_RDONLY)
+            fds.append(fd)
+            size = os.fstat(fd).st_size
+            sizes.append(size)
+            buffer = ctypes.create_string_buffer(size)
+            iovec = IOVec(ctypes.cast(buffer, ctypes.c_void_p), size)
+            raw_buffers.append(buffer)
+            iovecs.append(iovec)
+            ring.submit_readv(fd, iovec, size, idx)
+        results = ring.collect(len(paths))
+        for idx, size in enumerate(sizes):
+            res = results.get(idx, -1)
+            if res < 0:
+                errno_value = -res
+                raise OSError(errno_value, os.strerror(errno_value))
+            if res != size:
+                raise OSError("short io_uring read for {}: {} of {}".format(paths[idx], res, size))
+        buffers = [raw_buffers[idx].raw for idx in range(len(raw_buffers))]
+        return buffers, sum(sizes)
+    finally:
+        for fd in fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def timed_read_file_bytes(paths, method="read"):
+    io_before = read_proc_io()
+    timer_start = time.time()
+    actual_method = method
+    fallback_reason = ""
+    if method == "io_uring":
+        try:
+            buffers, byte_count = read_file_bytes_io_uring(paths)
+        except Exception as exc:
+            actual_method = "read-fallback"
+            fallback_reason = str(exc)
+            buffers, byte_count = read_file_bytes_blocking(paths)
+    else:
+        buffers, byte_count = read_file_bytes_blocking(paths)
     elapsed = time.time() - timer_start
     io_after = read_proc_io()
     return buffers, {
         "elapsed": elapsed,
         "file_bytes": byte_count,
+        "method": actual_method,
+        "fallback_reason": fallback_reason,
         "rchar": io_diff(io_before, io_after, "rchar"),
         "read_bytes": io_diff(io_before, io_after, "read_bytes"),
         "syscr": io_diff(io_before, io_after, "syscr"),
@@ -505,6 +753,8 @@ def threaded_read_aggregate(
             "read": fact_profile["elapsed"],
             "file_io": 0.0,
             "decode": fact_profile["elapsed"],
+            "io_method": "cudf",
+            "io_fallback_reason": "",
             "rows": fact_profile["rows"],
             "rchar": fact_profile["rchar"],
             "read_bytes": fact_profile["read_bytes"],
@@ -631,11 +881,13 @@ def split_file_io_read_aggregate(
                 except queue.Empty:
                     break
 
-                buffers, io_profile = timed_read_file_bytes(batch_paths)
+                buffers, io_profile = timed_read_file_bytes(batch_paths, method=args.file_io_method)
                 add_counter("file_io_read", io_profile["elapsed"])
                 add_counter("fact_read_bytes", io_profile["read_bytes"])
                 add_counter("fact_rchar", io_profile["rchar"])
                 add_counter("fact_syscr", io_profile["syscr"])
+                if args.file_io_method == "io_uring" and io_profile["method"] != "io_uring":
+                    add_counter("io_uring_fallbacks", 1)
                 raw_batches.put(("raw", batch_id, batch_paths, buffers, io_profile))
         except BaseException as exc:
             decoded_batches.put(("error", exc))
@@ -666,6 +918,8 @@ def split_file_io_read_aggregate(
                     "read": io_profile["elapsed"] + decode_profile["elapsed"],
                     "file_io": io_profile["elapsed"],
                     "decode": decode_profile["elapsed"],
+                    "io_method": io_profile["method"],
+                    "io_fallback_reason": io_profile["fallback_reason"],
                     "rows": decode_profile["rows"],
                     "rchar": io_profile["rchar"],
                     "read_bytes": io_profile["read_bytes"],
@@ -894,6 +1148,8 @@ def main():
             "read": fact_profile["elapsed"],
             "file_io": 0.0,
             "decode": fact_profile["elapsed"],
+            "io_method": "cudf",
+            "io_fallback_reason": "",
             "rows": fact_profile["rows"],
             "rchar": fact_profile["rchar"],
             "read_bytes": fact_profile["read_bytes"],
@@ -974,6 +1230,7 @@ def main():
         print("[pipeline queue depth]: {}".format(args.pipeline_queue_depth))
     if args.split_file_io:
         print("[split file io]: on")
+        print("[file io method]: {}".format(args.file_io_method))
         print("[io queue depth]: {}".format(args.io_queue_depth))
         print("[decode threads]: {}".format(args.decode_threads))
     if args.assume_payload_all_valid:
@@ -993,7 +1250,7 @@ def main():
             "count_from_rows={:.6f}s merge_concat={:.6f}s merge_groupby={:.6f}s "
             "row_count_sum={:.6f}s reader_wall={:.6f}s aggregate_wall={:.6f}s "
             "file_io_read={:.6f}s file_io_wall={:.6f}s decode_materialize={:.6f}s "
-            "decode_wall={:.6f}s rmm_setup={:.6f}s".format(
+            "decode_wall={:.6f}s io_uring_fallbacks={} rmm_setup={:.6f}s".format(
                 detail_timers["dimension_read"],
                 detail_timers["fact_read"],
                 detail_timers["join"],
@@ -1010,6 +1267,7 @@ def main():
                 detail_timers["file_io_wall"],
                 detail_timers["decode_materialize"],
                 detail_timers["decode_wall"],
+                detail_timers["io_uring_fallbacks"],
                 detail_timers["rmm_setup"],
             )
         )
@@ -1044,10 +1302,13 @@ def main():
         for profile in sorted(batch_profiles, key=lambda item: item["batch_id"]):
             print(
                 "batch={batch_id} files={files} rows={rows} read={read:.6f}s "
-                "file_io={file_io:.6f}s decode={decode:.6f}s join={join:.6f}s "
+                "file_io={file_io:.6f}s decode={decode:.6f}s io_method={io_method} "
+                "join={join:.6f}s "
                 "groupby={groupby:.6f}s read_bytes={read_bytes} rchar={rchar} "
                 "syscr={syscr} materialized_bytes={materialized_bytes}".format(**profile)
             )
+            if profile.get("io_fallback_reason"):
+                print("  fallback_reason={}".format(profile["io_fallback_reason"]))
     if args.print_results:
         print("\n[Results]")
         merged = total_sums.merge(total_counts, on=args.group_column, suffixes=("_sum", "_count"))
