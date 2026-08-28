@@ -4,6 +4,7 @@ from __future__ import print_function
 
 import argparse
 import glob
+import io
 import math
 import os
 import queue
@@ -28,6 +29,10 @@ def new_timers():
         "row_count_sum": 0.0,
         "reader_wall": 0.0,
         "aggregate_wall": 0.0,
+        "file_io_read": 0.0,
+        "file_io_wall": 0.0,
+        "decode_materialize": 0.0,
+        "decode_wall": 0.0,
         "fact_rchar": 0,
         "fact_read_bytes": 0,
         "fact_syscr": 0,
@@ -81,6 +86,23 @@ def parse_args():
         type=int,
         default=int(os.environ.get("CUDF_PIPELINE_QUEUE_DEPTH", "1")),
         help="number of decoded cuDF fact batches allowed to wait between read and aggregate stages",
+    )
+    parser.add_argument(
+        "--split-file-io",
+        action="store_true",
+        help="read Parquet file bytes in separate I/O workers before cuDF decode/materialization",
+    )
+    parser.add_argument(
+        "--io-queue-depth",
+        type=int,
+        default=int(os.environ.get("CUDF_IO_QUEUE_DEPTH", "1")),
+        help="number of raw Parquet file-byte batches allowed to wait before decode",
+    )
+    parser.add_argument(
+        "--decode-threads",
+        type=int,
+        default=int(os.environ.get("CUDF_DECODE_THREADS", "1")),
+        help="number of cuDF decode/materialize workers used with --split-file-io",
     )
     parser.add_argument(
         "--rmm-pool",
@@ -300,6 +322,44 @@ def timed_read_parquet_gpu(cudf, source, columns, measure_materialized_bytes=Fal
     return frame, profile
 
 
+def timed_read_file_bytes(paths):
+    io_before = read_proc_io()
+    timer_start = time.time()
+    buffers = []
+    byte_count = 0
+    for path in paths:
+        with open(path, "rb") as handle:
+            data = handle.read()
+        byte_count += len(data)
+        buffers.append(data)
+    elapsed = time.time() - timer_start
+    io_after = read_proc_io()
+    return buffers, {
+        "elapsed": elapsed,
+        "file_bytes": byte_count,
+        "rchar": io_diff(io_before, io_after, "rchar"),
+        "read_bytes": io_diff(io_before, io_after, "read_bytes"),
+        "syscr": io_diff(io_before, io_after, "syscr"),
+    }
+
+
+def timed_decode_parquet_bytes(cudf, buffers, columns, measure_materialized_bytes=False):
+    sources = [io.BytesIO(data) for data in buffers]
+    source = sources[0] if len(sources) == 1 else sources
+    timer_start = time.time()
+    frame = read_parquet_gpu(cudf, source, columns=columns)
+    cuda_synchronize()
+    elapsed = time.time() - timer_start
+    profile = {
+        "elapsed": elapsed,
+        "rows": len(frame),
+        "materialized_bytes": 0,
+    }
+    if measure_materialized_bytes:
+        profile["materialized_bytes"] = dataframe_nbytes(frame)
+    return frame, profile
+
+
 def make_file_batches(paths, batch_size):
     return [paths[idx:idx + batch_size] for idx in range(0, len(paths), batch_size)]
 
@@ -443,6 +503,8 @@ def threaded_read_aggregate(
             "batch_id": batch_id,
             "files": len(batch_paths),
             "read": fact_profile["elapsed"],
+            "file_io": 0.0,
+            "decode": fact_profile["elapsed"],
             "rows": fact_profile["rows"],
             "rchar": fact_profile["rchar"],
             "read_bytes": fact_profile["read_bytes"],
@@ -509,6 +571,211 @@ def threaded_read_aggregate(
     return read_seconds, join_seconds, group_seconds, row_count
 
 
+def split_file_io_read_aggregate(
+    cudf,
+    args,
+    parquet_paths,
+    payload_columns,
+    detail_timers,
+    sum_frames,
+    count_frames,
+    row_count_frames,
+    batch_profiles,
+):
+    io_threads = max(1, min(args.reader_threads, len(parquet_paths)))
+    decode_threads = max(1, args.decode_threads)
+    file_batch_size = resolve_file_batch_size(args, io_threads, len(parquet_paths))
+    io_queue_depth = max(1, args.io_queue_depth)
+    pipeline_queue_depth = max(1, args.pipeline_queue_depth)
+
+    fact_columns = payload_columns if args.infer_grid_from_row_order else [args.join_key] + payload_columns
+    dimension_columns = [args.group_column] if args.infer_grid_from_row_order else [args.join_key, args.group_column]
+    need_counts = args.print_results
+    need_row_counts = args.print_results
+    measure_materialized_bytes = args.print_stage_times or args.print_batch_times
+
+    shared_dim = None
+    if args.reuse_dimension_mapping or args.infer_grid_from_row_order:
+        dimension_path = resolve_dimension_path(parquet_paths[0], args.dimension_file)
+        shared_dim, dim_profile = timed_read_parquet_gpu(
+            cudf,
+            dimension_path,
+            columns=dimension_columns,
+            measure_materialized_bytes=measure_materialized_bytes,
+        )
+        detail_timers["dimension_read"] += dim_profile["elapsed"]
+        detail_timers["dimension_rchar"] += dim_profile["rchar"]
+        detail_timers["dimension_read_bytes"] += dim_profile["read_bytes"]
+        detail_timers["dimension_syscr"] += dim_profile["syscr"]
+
+    tasks = queue.Queue()
+    for batch_id, batch_paths in enumerate(make_file_batches(parquet_paths, file_batch_size)):
+        tasks.put((batch_id, batch_paths))
+
+    raw_batches = queue.Queue(maxsize=io_queue_depth)
+    decoded_batches = queue.Queue(maxsize=pipeline_queue_depth)
+    io_wall_times = []
+    decode_wall_times = []
+    timer_lock = threading.Lock()
+
+    def add_counter(name, value):
+        with timer_lock:
+            detail_timers[name] += value
+
+    def io_worker():
+        worker_start = time.time()
+        try:
+            while True:
+                try:
+                    batch_id, batch_paths = tasks.get_nowait()
+                except queue.Empty:
+                    break
+
+                buffers, io_profile = timed_read_file_bytes(batch_paths)
+                add_counter("file_io_read", io_profile["elapsed"])
+                add_counter("fact_read_bytes", io_profile["read_bytes"])
+                add_counter("fact_rchar", io_profile["rchar"])
+                add_counter("fact_syscr", io_profile["syscr"])
+                raw_batches.put(("raw", batch_id, batch_paths, buffers, io_profile))
+        except BaseException as exc:
+            decoded_batches.put(("error", exc))
+        finally:
+            io_wall_times.append(time.time() - worker_start)
+
+    def decode_worker():
+        worker_start = time.time()
+        try:
+            while True:
+                item = raw_batches.get()
+                if item[0] == "done":
+                    break
+                _, batch_id, batch_paths, buffers, io_profile = item
+
+                fact, decode_profile = timed_decode_parquet_bytes(
+                    cudf,
+                    buffers,
+                    columns=fact_columns,
+                    measure_materialized_bytes=measure_materialized_bytes,
+                )
+                add_counter("decode_materialize", decode_profile["elapsed"])
+                add_counter("fact_read", decode_profile["elapsed"])
+                add_counter("materialized_bytes", decode_profile["materialized_bytes"])
+                batch_profile = {
+                    "batch_id": batch_id,
+                    "files": len(batch_paths),
+                    "read": io_profile["elapsed"] + decode_profile["elapsed"],
+                    "file_io": io_profile["elapsed"],
+                    "decode": decode_profile["elapsed"],
+                    "rows": decode_profile["rows"],
+                    "rchar": io_profile["rchar"],
+                    "read_bytes": io_profile["read_bytes"],
+                    "syscr": io_profile["syscr"],
+                    "materialized_bytes": decode_profile["materialized_bytes"],
+                    "join": 0.0,
+                    "groupby": 0.0,
+                }
+                del buffers
+                decoded_batches.put(("batch", batch_id, batch_paths, fact, batch_profile))
+        except BaseException as exc:
+            decoded_batches.put(("error", exc))
+        finally:
+            decode_wall_times.append(time.time() - worker_start)
+            decoded_batches.put(("done",))
+
+    def finish_io_workers():
+        for worker in io_workers:
+            worker.join()
+        for _ in range(decode_threads):
+            raw_batches.put(("done",))
+
+    io_workers = [threading.Thread(target=io_worker) for _ in range(io_threads)]
+    decode_workers = [threading.Thread(target=decode_worker) for _ in range(decode_threads)]
+    for worker in io_workers:
+        worker.start()
+    for worker in decode_workers:
+        worker.start()
+    finisher = threading.Thread(target=finish_io_workers)
+    finisher.start()
+
+    done_decoders = 0
+    join_seconds = 0.0
+    group_seconds = 0.0
+    row_count = 0
+
+    while done_decoders < decode_threads:
+        item = decoded_batches.get()
+        item_type = item[0]
+        if item_type == "done":
+            done_decoders += 1
+            continue
+        if item_type == "error":
+            finisher.join()
+            for worker in decode_workers:
+                worker.join()
+            raise item[1]
+
+        _, _, batch_paths, fact, batch_profile = item
+
+        if shared_dim is None:
+            dimension_path = resolve_dimension_path(batch_paths[0], args.dimension_file)
+            dim, dim_profile = timed_read_parquet_gpu(
+                cudf,
+                dimension_path,
+                columns=dimension_columns,
+                measure_materialized_bytes=measure_materialized_bytes,
+            )
+            detail_timers["dimension_read"] += dim_profile["elapsed"]
+            detail_timers["dimension_rchar"] += dim_profile["rchar"]
+            detail_timers["dimension_read_bytes"] += dim_profile["read_bytes"]
+            detail_timers["dimension_syscr"] += dim_profile["syscr"]
+        else:
+            dim = shared_dim
+
+        join_start = time.time()
+        if args.infer_grid_from_row_order:
+            joined = attach_group_from_row_order(cudf, fact, dim, args.group_column)
+        else:
+            joined = fact.merge(dim, on=args.join_key, how="inner")
+        cuda_synchronize()
+        join_elapsed = time.time() - join_start
+        join_seconds += join_elapsed
+        detail_timers["join"] += join_elapsed
+        batch_profile["join"] = join_elapsed
+        row_count += len(joined)
+
+        group_start = time.time()
+        sums, counts, row_counts = aggregate_joined(
+            joined,
+            args.group_column,
+            payload_columns,
+            args.assume_payload_all_valid,
+            detail_timers,
+            need_counts=need_counts,
+            need_row_counts=need_row_counts,
+        )
+        cuda_synchronize()
+        group_elapsed = time.time() - group_start
+        group_seconds += group_elapsed
+        detail_timers["aggregate_wall"] += group_elapsed
+        batch_profile["groupby"] = group_elapsed
+        append_frame(sum_frames, sums)
+        append_frame(count_frames, counts)
+        append_frame(row_count_frames, row_counts)
+        batch_profiles.append(batch_profile)
+        del fact
+        del joined
+
+    finisher.join()
+    for worker in decode_workers:
+        worker.join()
+
+    detail_timers["file_io_wall"] = max(io_wall_times) if io_wall_times else 0.0
+    detail_timers["decode_wall"] = max(decode_wall_times) if decode_wall_times else 0.0
+    detail_timers["reader_wall"] = detail_timers["file_io_wall"]
+    read_seconds = detail_timers["dimension_read"] + max(detail_timers["file_io_wall"], detail_timers["decode_wall"])
+    return read_seconds, join_seconds, group_seconds, row_count
+
+
 def combine_frames(cudf, frames, group_column, payload_columns, timers, is_row_count=False):
     if not frames:
         columns = [group_column, "row_count"] if is_row_count else [group_column] + payload_columns
@@ -561,8 +828,27 @@ def main():
         raise SystemExit("--reader-threads must be positive")
     if args.pipeline_queue_depth <= 0:
         raise SystemExit("--pipeline-queue-depth must be positive")
+    if args.io_queue_depth <= 0:
+        raise SystemExit("--io-queue-depth must be positive")
+    if args.decode_threads <= 0:
+        raise SystemExit("--decode-threads must be positive")
 
-    if args.read_mode == "per-file":
+    if args.split_file_io and args.read_mode != "per-file":
+        raise SystemExit("--split-file-io requires --read-mode per-file")
+
+    if args.split_file_io:
+        read_seconds, join_seconds, group_seconds, row_count = split_file_io_read_aggregate(
+            cudf,
+            args,
+            parquet_paths,
+            payload_columns,
+            detail_timers,
+            sum_frames,
+            count_frames,
+            row_count_frames,
+            batch_profiles,
+        )
+    elif args.read_mode == "per-file":
         read_seconds, join_seconds, group_seconds, row_count = threaded_read_aggregate(
             cudf,
             args,
@@ -606,6 +892,8 @@ def main():
             "batch_id": 0,
             "files": len(parquet_paths),
             "read": fact_profile["elapsed"],
+            "file_io": 0.0,
+            "decode": fact_profile["elapsed"],
             "rows": fact_profile["rows"],
             "rchar": fact_profile["rchar"],
             "read_bytes": fact_profile["read_bytes"],
@@ -684,6 +972,10 @@ def main():
         batch_size = resolve_file_batch_size(args, max(1, min(args.reader_threads, len(parquet_paths))), len(parquet_paths))
         print("[file batch size]: {}".format(batch_size))
         print("[pipeline queue depth]: {}".format(args.pipeline_queue_depth))
+    if args.split_file_io:
+        print("[split file io]: on")
+        print("[io queue depth]: {}".format(args.io_queue_depth))
+        print("[decode threads]: {}".format(args.decode_threads))
     if args.assume_payload_all_valid:
         print("[assume payload all valid]: on")
     if args.infer_grid_from_row_order:
@@ -699,7 +991,9 @@ def main():
             "[stage detail] dimension_read={:.6f}s fact_read={:.6f}s join={:.6f}s "
             "groupby_size={:.6f}s groupby_sum={:.6f}s groupby_count={:.6f}s "
             "count_from_rows={:.6f}s merge_concat={:.6f}s merge_groupby={:.6f}s "
-            "row_count_sum={:.6f}s reader_wall={:.6f}s aggregate_wall={:.6f}s rmm_setup={:.6f}s".format(
+            "row_count_sum={:.6f}s reader_wall={:.6f}s aggregate_wall={:.6f}s "
+            "file_io_read={:.6f}s file_io_wall={:.6f}s decode_materialize={:.6f}s "
+            "decode_wall={:.6f}s rmm_setup={:.6f}s".format(
                 detail_timers["dimension_read"],
                 detail_timers["fact_read"],
                 detail_timers["join"],
@@ -712,6 +1006,10 @@ def main():
                 detail_timers["row_count_sum"],
                 detail_timers["reader_wall"],
                 detail_timers["aggregate_wall"],
+                detail_timers["file_io_read"],
+                detail_timers["file_io_wall"],
+                detail_timers["decode_materialize"],
+                detail_timers["decode_wall"],
                 detail_timers["rmm_setup"],
             )
         )
@@ -719,6 +1017,7 @@ def main():
             read_mib = float(detail_timers["fact_read_bytes"]) / (1024.0 * 1024.0)
             rchar_mib = float(detail_timers["fact_rchar"]) / (1024.0 * 1024.0)
             materialized_mib = float(detail_timers["materialized_bytes"]) / (1024.0 * 1024.0)
+            read_rate_seconds = detail_timers["file_io_read"] or detail_timers["fact_read"]
             print(
                 "[read io] fact_read_bytes={} ({:.2f} MiB) fact_rchar={} ({:.2f} MiB) "
                 "fact_syscr={} materialized_bytes={} ({:.2f} MiB) storage_read_rate={:.2f} MiB/s".format(
@@ -729,7 +1028,7 @@ def main():
                     detail_timers["fact_syscr"],
                     detail_timers["materialized_bytes"],
                     materialized_mib,
-                    read_mib / detail_timers["fact_read"],
+                    read_mib / read_rate_seconds,
                 )
             )
         if detail_timers["dimension_read"] > 0:
@@ -745,8 +1044,9 @@ def main():
         for profile in sorted(batch_profiles, key=lambda item: item["batch_id"]):
             print(
                 "batch={batch_id} files={files} rows={rows} read={read:.6f}s "
-                "join={join:.6f}s groupby={groupby:.6f}s read_bytes={read_bytes} "
-                "rchar={rchar} syscr={syscr} materialized_bytes={materialized_bytes}".format(**profile)
+                "file_io={file_io:.6f}s decode={decode:.6f}s join={join:.6f}s "
+                "groupby={groupby:.6f}s read_bytes={read_bytes} rchar={rchar} "
+                "syscr={syscr} materialized_bytes={materialized_bytes}".format(**profile)
             )
     if args.print_results:
         print("\n[Results]")
