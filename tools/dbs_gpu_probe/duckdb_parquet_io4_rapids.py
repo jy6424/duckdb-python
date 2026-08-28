@@ -1332,7 +1332,7 @@ def main():
         print("[assume payload all valid]: on")
     if args.infer_grid_from_row_order:
         print("[grid inference]: row-order")
-    print("[payload columns]: {}".format(",".join(payload_columns)))
+    print("[variable count]: {}".format(len(payload_columns)))
     if args.print_stage_times:
         print(
             "[stage work] gpu_read={:.6f}s gpu_join={:.6f}s gpu_groupby={:.6f}s gpu_merge={:.6f}s".format(
