@@ -27,6 +27,7 @@ def new_timers():
         "merge_groupby": 0.0,
         "row_count_sum": 0.0,
         "reader_wall": 0.0,
+        "aggregate_wall": 0.0,
         "rmm_setup": 0.0,
     }
 
@@ -65,12 +66,18 @@ def parse_args():
         "--file-batch-size",
         type=int,
         default=None,
-        help="number of Parquet files read by each cuDF reader task; defaults to 1 for per-file and ceil(files/threads) for glob",
+        help="number of Parquet files read by each cuDF reader task",
+    )
+    parser.add_argument(
+        "--pipeline-queue-depth",
+        type=int,
+        default=int(os.environ.get("CUDF_PIPELINE_QUEUE_DEPTH", "1")),
+        help="number of decoded cuDF fact batches allowed to wait between read and aggregate stages",
     )
     parser.add_argument(
         "--rmm-pool",
         action="store_true",
-        default=os.environ.get("CUDF_RMM_POOL", "0") == "1",
+        default=False,
         help="enable RMM pool allocator before importing cuDF",
     )
     parser.add_argument(
@@ -162,18 +169,32 @@ def make_counts_from_row_counts(row_counts, group_column, payload_columns):
     return counts
 
 
-def aggregate_joined(joined, group_column, payload_columns, assume_payload_all_valid, timers):
+def aggregate_joined(
+    joined,
+    group_column,
+    payload_columns,
+    assume_payload_all_valid,
+    timers,
+    need_counts=True,
+    need_row_counts=True,
+):
     grouped = joined.groupby(group_column)
-    timer_start = time.time()
-    row_counts = grouped.size().reset_index()
-    row_counts = row_counts.rename(columns={row_counts.columns[-1]: "row_count"})
-    cuda_synchronize()
-    add_elapsed(timers, "groupby_size", timer_start)
+    row_counts = None
+    if need_row_counts or (need_counts and assume_payload_all_valid):
+        timer_start = time.time()
+        row_counts = grouped.size().reset_index()
+        row_counts = row_counts.rename(columns={row_counts.columns[-1]: "row_count"})
+        cuda_synchronize()
+        add_elapsed(timers, "groupby_size", timer_start)
 
     timer_start = time.time()
     sums = grouped[payload_columns].sum().reset_index()
     cuda_synchronize()
     add_elapsed(timers, "groupby_sum", timer_start)
+
+    counts = None
+    if not need_counts:
+        return sums, counts, row_counts
 
     if assume_payload_all_valid:
         timer_start = time.time()
@@ -223,6 +244,16 @@ def default_file_batch_size(read_mode, reader_threads, file_count):
     return 1
 
 
+def resolve_file_batch_size(args, reader_threads, file_count):
+    if args.file_batch_size is not None:
+        file_batch_size = args.file_batch_size
+    else:
+        file_batch_size = default_file_batch_size(args.read_mode, reader_threads, file_count)
+    if file_batch_size <= 0:
+        raise ValueError("--file-batch-size must be positive")
+    return file_batch_size
+
+
 def attach_group_from_row_order(cudf, fact, dim, group_column):
     dim_rows = len(dim)
     fact_rows = len(fact)
@@ -260,14 +291,13 @@ def threaded_read_aggregate(
     row_count_frames,
 ):
     reader_threads = max(1, min(args.reader_threads, len(parquet_paths)))
-    file_batch_size = args.file_batch_size
-    if file_batch_size is None:
-        file_batch_size = default_file_batch_size(args.read_mode, reader_threads, len(parquet_paths))
-    if file_batch_size <= 0:
-        raise ValueError("--file-batch-size must be positive")
+    file_batch_size = resolve_file_batch_size(args, reader_threads, len(parquet_paths))
+    queue_depth = max(1, args.pipeline_queue_depth)
 
     fact_columns = payload_columns if args.infer_grid_from_row_order else [args.join_key] + payload_columns
     dimension_columns = [args.group_column] if args.infer_grid_from_row_order else [args.join_key, args.group_column]
+    need_counts = args.print_results
+    need_row_counts = args.print_results
 
     shared_dim = None
     if args.reuse_dimension_mapping or args.infer_grid_from_row_order:
@@ -281,7 +311,7 @@ def threaded_read_aggregate(
     for batch_id, batch_paths in enumerate(make_file_batches(parquet_paths, file_batch_size)):
         tasks.put((batch_id, batch_paths))
 
-    results = queue.Queue(maxsize=reader_threads * 2)
+    results = queue.Queue(maxsize=queue_depth)
     worker_wall_times = []
 
     def reader_worker():
@@ -312,6 +342,7 @@ def threaded_read_aggregate(
     read_seconds = 0.0
     join_seconds = 0.0
     group_seconds = 0.0
+    row_count = 0
 
     while done_workers < reader_threads:
         item = results.get()
@@ -344,23 +375,34 @@ def threaded_read_aggregate(
         cuda_synchronize()
         join_seconds += time.time() - join_start
         add_elapsed(detail_timers, "join", join_start)
+        row_count += len(joined)
 
         group_start = time.time()
         sums, counts, row_counts = aggregate_joined(
-            joined, args.group_column, payload_columns, args.assume_payload_all_valid, detail_timers
+            joined,
+            args.group_column,
+            payload_columns,
+            args.assume_payload_all_valid,
+            detail_timers,
+            need_counts=need_counts,
+            need_row_counts=need_row_counts,
         )
         cuda_synchronize()
-        group_seconds += time.time() - group_start
+        group_elapsed = time.time() - group_start
+        group_seconds += group_elapsed
+        detail_timers["aggregate_wall"] += group_elapsed
         append_frame(sum_frames, sums)
         append_frame(count_frames, counts)
         append_frame(row_count_frames, row_counts)
+        del fact
+        del joined
 
     for worker in workers:
         worker.join()
 
     detail_timers["reader_wall"] = max(worker_wall_times) if worker_wall_times else 0.0
     read_seconds = detail_timers["dimension_read"] + detail_timers["reader_wall"]
-    return read_seconds, join_seconds, group_seconds
+    return read_seconds, join_seconds, group_seconds, row_count
 
 
 def combine_frames(cudf, frames, group_column, payload_columns, timers, is_row_count=False):
@@ -403,6 +445,7 @@ def main():
     join_seconds = 0.0
     group_seconds = 0.0
     merge_seconds = 0.0
+    row_count = 0
 
     start = time.time()
     sum_frames = []
@@ -411,9 +454,11 @@ def main():
 
     if args.reader_threads <= 0:
         raise SystemExit("--reader-threads must be positive")
+    if args.pipeline_queue_depth <= 0:
+        raise SystemExit("--pipeline-queue-depth must be positive")
 
-    if args.reader_threads > 1:
-        read_seconds, join_seconds, group_seconds = threaded_read_aggregate(
+    if args.read_mode == "per-file":
+        read_seconds, join_seconds, group_seconds, row_count = threaded_read_aggregate(
             cudf,
             args,
             parquet_paths,
@@ -451,69 +496,41 @@ def main():
             cuda_synchronize()
             join_seconds += time.time() - join_start
             add_elapsed(detail_timers, "join", join_start)
+        row_count = len(joined)
 
         group_start = time.time()
         sums, counts, row_counts = aggregate_joined(
-            joined, args.group_column, payload_columns, args.assume_payload_all_valid, detail_timers
+            joined,
+            args.group_column,
+            payload_columns,
+            args.assume_payload_all_valid,
+            detail_timers,
+            need_counts=args.print_results,
+            need_row_counts=args.print_results,
         )
         cuda_synchronize()
-        group_seconds += time.time() - group_start
+        group_elapsed = time.time() - group_start
+        group_seconds += group_elapsed
+        detail_timers["aggregate_wall"] += group_elapsed
         append_frame(sum_frames, sums)
         append_frame(count_frames, counts)
         append_frame(row_count_frames, row_counts)
-    else:
-        cached_dim = None
-        for fact_path in parquet_paths:
-            dimension_path = resolve_dimension_path(fact_path, args.dimension_file)
-            read_start = time.time()
-            if cached_dim is None or not args.reuse_dimension_mapping:
-                timer_start = time.time()
-                dimension_columns = (
-                    [args.group_column] if args.infer_grid_from_row_order else [args.join_key, args.group_column]
-                )
-                cached_dim = read_parquet_gpu(cudf, dimension_path, columns=dimension_columns)
-                cuda_synchronize()
-                add_elapsed(detail_timers, "dimension_read", timer_start)
-            dim = cached_dim
-            timer_start = time.time()
-            fact_columns = payload_columns if args.infer_grid_from_row_order else [args.join_key] + payload_columns
-            fact = read_parquet_gpu(cudf, fact_path, columns=fact_columns)
-            cuda_synchronize()
-            add_elapsed(detail_timers, "fact_read", timer_start)
-            read_seconds += time.time() - read_start
-
-            if args.infer_grid_from_row_order:
-                join_start = time.time()
-                joined = attach_group_from_row_order(cudf, fact, dim, args.group_column)
-                cuda_synchronize()
-                join_seconds += time.time() - join_start
-                add_elapsed(detail_timers, "join", join_start)
-            else:
-                join_start = time.time()
-                joined = fact.merge(dim, on=args.join_key, how="inner")
-                cuda_synchronize()
-                join_seconds += time.time() - join_start
-                add_elapsed(detail_timers, "join", join_start)
-
-            group_start = time.time()
-            sums, counts, row_counts = aggregate_joined(
-                joined, args.group_column, payload_columns, args.assume_payload_all_valid, detail_timers
-            )
-            cuda_synchronize()
-            group_seconds += time.time() - group_start
-            append_frame(sum_frames, sums)
-            append_frame(count_frames, counts)
-            append_frame(row_count_frames, row_counts)
+        del fact
+        del joined
 
     merge_start = time.time()
     total_sums = combine_frames(cudf, sum_frames, args.group_column, payload_columns, detail_timers)
-    total_counts = combine_frames(cudf, count_frames, args.group_column, payload_columns, detail_timers)
-    total_row_counts = combine_frames(cudf, row_count_frames, args.group_column, payload_columns, detail_timers, True)
+    total_counts = None
+    total_row_counts = None
+    if args.print_results:
+        total_counts = combine_frames(cudf, count_frames, args.group_column, payload_columns, detail_timers)
+        total_row_counts = combine_frames(cudf, row_count_frames, args.group_column, payload_columns, detail_timers, True)
     cuda_synchronize()
-    timer_start = time.time()
-    row_count = int(total_row_counts["row_count"].sum()) if len(total_row_counts) else 0
-    cuda_synchronize()
-    add_elapsed(detail_timers, "row_count_sum", timer_start)
+    if args.print_results:
+        timer_start = time.time()
+        row_count = int(total_row_counts["row_count"].sum()) if len(total_row_counts) else 0
+        cuda_synchronize()
+        add_elapsed(detail_timers, "row_count_sum", timer_start)
     # Keep final aggregate columns alive until after the last GPU operation has completed.
     _ = (total_sums, total_counts)
     merge_seconds += time.time() - merge_start
@@ -527,11 +544,10 @@ def main():
     print("[reader threads]: {}".format(max(1, min(args.reader_threads, len(parquet_paths)))))
     if rmm_pool_enabled:
         print("[rmm pool]: on size={} bytes".format(rmm_pool_size))
-    if args.reader_threads > 1:
-        batch_size = args.file_batch_size
-        if batch_size is None:
-            batch_size = default_file_batch_size(args.read_mode, args.reader_threads, len(parquet_paths))
+    if args.read_mode == "per-file":
+        batch_size = resolve_file_batch_size(args, max(1, min(args.reader_threads, len(parquet_paths))), len(parquet_paths))
         print("[file batch size]: {}".format(batch_size))
+        print("[pipeline queue depth]: {}".format(args.pipeline_queue_depth))
     if args.assume_payload_all_valid:
         print("[assume payload all valid]: on")
     if args.infer_grid_from_row_order:
@@ -547,7 +563,7 @@ def main():
             "[stage detail] dimension_read={:.6f}s fact_read={:.6f}s join={:.6f}s "
             "groupby_size={:.6f}s groupby_sum={:.6f}s groupby_count={:.6f}s "
             "count_from_rows={:.6f}s merge_concat={:.6f}s merge_groupby={:.6f}s "
-            "row_count_sum={:.6f}s reader_wall={:.6f}s rmm_setup={:.6f}s".format(
+            "row_count_sum={:.6f}s reader_wall={:.6f}s aggregate_wall={:.6f}s rmm_setup={:.6f}s".format(
                 detail_timers["dimension_read"],
                 detail_timers["fact_read"],
                 detail_timers["join"],
@@ -559,6 +575,7 @@ def main():
                 detail_timers["merge_groupby"],
                 detail_timers["row_count_sum"],
                 detail_timers["reader_wall"],
+                detail_timers["aggregate_wall"],
                 detail_timers["rmm_setup"],
             )
         )
