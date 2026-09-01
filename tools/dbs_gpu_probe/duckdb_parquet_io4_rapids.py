@@ -31,6 +31,7 @@ def new_timers():
         "row_count_sum": 0.0,
         "reader_wall": 0.0,
         "aggregate_wall": 0.0,
+        "aggregate_stage_wall": 0.0,
         "file_io_read": 0.0,
         "file_io_wall": 0.0,
         "decode_materialize": 0.0,
@@ -52,6 +53,16 @@ def add_elapsed(timers, name, start):
     timers[name] += time.time() - start
 
 
+def parse_bool01(value):
+    if isinstance(value, bool):
+        return value
+    if str(value) == "1":
+        return True
+    if str(value) == "0":
+        return False
+    raise argparse.ArgumentTypeError("expected 0 or 1")
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("base_dir")
@@ -60,13 +71,28 @@ def parse_args():
     parser.add_argument("--group-column", default="lats")
     parser.add_argument("--dimension-file", default="grid.parquet")
     parser.add_argument("--read-mode", default="per-file", choices=["per-file", "glob"])
-    parser.add_argument("--reuse-dimension-mapping", action="store_true")
+    parser.add_argument(
+        "--reuse-dimension-mapping",
+        type=parse_bool01,
+        nargs="?",
+        const=True,
+        default=True,
+    )
     parser.add_argument(
         "--infer-grid-from-row-order",
-        action="store_true",
+        type=parse_bool01,
+        nargs="?",
+        const=True,
+        default=True,
         help="skip fact grid reads and join by repeating the dimension group column in fact row order",
     )
-    parser.add_argument("--assume-payload-all-valid", action="store_true")
+    parser.add_argument(
+        "--assume-payload-all-valid",
+        type=parse_bool01,
+        nargs="?",
+        const=True,
+        default=True,
+    )
     parser.add_argument(
         "--reader-threads",
         type=int,
@@ -92,7 +118,10 @@ def parse_args():
     )
     parser.add_argument(
         "--split-file-io",
-        action="store_true",
+        type=parse_bool01,
+        nargs="?",
+        const=True,
+        default=True,
         help="read Parquet file bytes in separate I/O workers before cuDF decode/materialization",
     )
     parser.add_argument(
@@ -126,6 +155,18 @@ def parse_args():
         help="number of cuDF decode/materialize workers used with --split-file-io",
     )
     parser.add_argument(
+        "--aggregate-threads",
+        type=int,
+        default=int(os.environ.get("CUDF_AGGREGATE_THREADS", "1")),
+        help="number of aggregate workers used with --split-file-io",
+    )
+    parser.add_argument(
+        "--aggregate-queue-depth",
+        type=int,
+        default=int(os.environ.get("CUDF_AGGREGATE_QUEUE_DEPTH", "2")),
+        help="number of partial aggregate results allowed to wait before final merge",
+    )
+    parser.add_argument(
         "--rmm-pool",
         action="store_true",
         default=False,
@@ -136,8 +177,8 @@ def parse_args():
         default=os.environ.get("CUDF_RMM_POOL_SIZE", "4GB"),
         help="initial RMM pool size, e.g. 2GB, 4096MB, or 4294967296",
     )
-    parser.add_argument("--print-stage-times", action="store_true")
-    parser.add_argument("--print-batch-times", action="store_true")
+    parser.add_argument("--print-stage-times", type=parse_bool01, nargs="?", const=True, default=True)
+    parser.add_argument("--print-batch-times", type=parse_bool01, nargs="?", const=True, default=True)
     parser.add_argument("--print-results", action="store_true")
     return parser.parse_args()
 
@@ -920,9 +961,11 @@ def split_file_io_read_aggregate(
 ):
     io_threads = max(1, min(args.reader_threads, len(parquet_paths)))
     decode_threads = max(1, args.decode_threads)
+    aggregate_threads = max(1, args.aggregate_threads)
     file_batch_size = resolve_file_batch_size(args, io_threads, len(parquet_paths))
     io_queue_depth = max(1, args.io_queue_depth)
     pipeline_queue_depth = max(1, args.pipeline_queue_depth)
+    aggregate_queue_depth = max(1, args.aggregate_queue_depth)
 
     fact_columns = payload_columns if args.infer_grid_from_row_order else [args.join_key] + payload_columns
     dimension_columns = [args.group_column] if args.infer_grid_from_row_order else [args.join_key, args.group_column]
@@ -950,8 +993,10 @@ def split_file_io_read_aggregate(
 
     raw_batches = queue.Queue(maxsize=io_queue_depth)
     decoded_batches = queue.Queue(maxsize=pipeline_queue_depth)
+    partial_batches = queue.Queue(maxsize=aggregate_queue_depth)
     io_wall_times = []
     decode_wall_times = []
+    aggregate_wall_times = []
     timer_lock = threading.Lock()
 
     def add_counter(name, value):
@@ -1025,7 +1070,79 @@ def split_file_io_read_aggregate(
             decoded_batches.put(("error", exc))
         finally:
             decode_wall_times.append(time.time() - worker_start)
-            decoded_batches.put(("done",))
+
+    def aggregate_worker():
+        worker_start = time.time()
+        try:
+            while True:
+                item = decoded_batches.get()
+                item_type = item[0]
+                if item_type == "done":
+                    break
+                if item_type == "error":
+                    partial_batches.put(("error", item[1]))
+                    break
+
+                _, batch_id, batch_paths, fact, batch_profile = item
+
+                if shared_dim is None:
+                    dimension_path = resolve_dimension_path(batch_paths[0], args.dimension_file)
+                    dim, dim_profile = timed_read_parquet_gpu(
+                        cudf,
+                        dimension_path,
+                        columns=dimension_columns,
+                        measure_materialized_bytes=measure_materialized_bytes,
+                    )
+                    add_counter("dimension_read", dim_profile["elapsed"])
+                    add_counter("dimension_rchar", dim_profile["rchar"])
+                    add_counter("dimension_read_bytes", dim_profile["read_bytes"])
+                    add_counter("dimension_syscr", dim_profile["syscr"])
+                else:
+                    dim = shared_dim
+
+                join_start = time.time()
+                if args.infer_grid_from_row_order:
+                    joined = attach_group_from_row_order(cudf, fact, dim, args.group_column)
+                else:
+                    joined = fact.merge(dim, on=args.join_key, how="inner")
+                cuda_synchronize()
+                join_elapsed = time.time() - join_start
+                add_counter("join", join_elapsed)
+                batch_profile["join"] = join_elapsed
+                batch_row_count = len(joined)
+
+                group_start = time.time()
+                aggregate_timers = new_timers()
+                sums, counts, row_counts = aggregate_joined(
+                    joined,
+                    args.group_column,
+                    payload_columns,
+                    args.assume_payload_all_valid,
+                    aggregate_timers,
+                    need_counts=need_counts,
+                    need_row_counts=need_row_counts,
+                )
+                cuda_synchronize()
+                group_elapsed = time.time() - group_start
+                for timer_name in [
+                    "groupby_size",
+                    "groupby_sum",
+                    "groupby_count",
+                    "count_from_rows",
+                ]:
+                    add_counter(timer_name, aggregate_timers[timer_name])
+                add_counter("aggregate_wall", group_elapsed)
+                batch_profile["groupby"] = group_elapsed
+                partial_batches.put(
+                    ("partial", batch_id, batch_profile, sums, counts, row_counts, batch_row_count)
+                )
+                del fact
+                del joined
+        except BaseException as exc:
+            partial_batches.put(("error", exc))
+        finally:
+            aggregate_wall_times.append(time.time() - worker_start)
+            partial_batches.put(("done",))
 
     def finish_io_workers():
         for worker in io_workers:
@@ -1033,92 +1150,60 @@ def split_file_io_read_aggregate(
         for _ in range(decode_threads):
             raw_batches.put(("done",))
 
+    def finish_decode_workers():
+        for worker in decode_workers:
+            worker.join()
+        for _ in range(aggregate_threads):
+            decoded_batches.put(("done",))
+
     io_workers = [threading.Thread(target=io_worker) for _ in range(io_threads)]
     decode_workers = [threading.Thread(target=decode_worker) for _ in range(decode_threads)]
+    aggregate_workers = [threading.Thread(target=aggregate_worker) for _ in range(aggregate_threads)]
     for worker in io_workers:
         worker.start()
     for worker in decode_workers:
         worker.start()
-    finisher = threading.Thread(target=finish_io_workers)
-    finisher.start()
+    for worker in aggregate_workers:
+        worker.start()
+    io_finisher = threading.Thread(target=finish_io_workers)
+    decode_finisher = threading.Thread(target=finish_decode_workers)
+    io_finisher.start()
+    decode_finisher.start()
 
-    done_decoders = 0
-    join_seconds = 0.0
-    group_seconds = 0.0
+    done_aggregators = 0
     row_count = 0
 
-    while done_decoders < decode_threads:
-        item = decoded_batches.get()
+    while done_aggregators < aggregate_threads:
+        item = partial_batches.get()
         item_type = item[0]
         if item_type == "done":
-            done_decoders += 1
+            done_aggregators += 1
             continue
         if item_type == "error":
-            finisher.join()
-            for worker in decode_workers:
+            io_finisher.join()
+            decode_finisher.join()
+            for worker in aggregate_workers:
                 worker.join()
             raise item[1]
 
-        _, _, batch_paths, fact, batch_profile = item
-
-        if shared_dim is None:
-            dimension_path = resolve_dimension_path(batch_paths[0], args.dimension_file)
-            dim, dim_profile = timed_read_parquet_gpu(
-                cudf,
-                dimension_path,
-                columns=dimension_columns,
-                measure_materialized_bytes=measure_materialized_bytes,
-            )
-            detail_timers["dimension_read"] += dim_profile["elapsed"]
-            detail_timers["dimension_rchar"] += dim_profile["rchar"]
-            detail_timers["dimension_read_bytes"] += dim_profile["read_bytes"]
-            detail_timers["dimension_syscr"] += dim_profile["syscr"]
-        else:
-            dim = shared_dim
-
-        join_start = time.time()
-        if args.infer_grid_from_row_order:
-            joined = attach_group_from_row_order(cudf, fact, dim, args.group_column)
-        else:
-            joined = fact.merge(dim, on=args.join_key, how="inner")
-        cuda_synchronize()
-        join_elapsed = time.time() - join_start
-        join_seconds += join_elapsed
-        detail_timers["join"] += join_elapsed
-        batch_profile["join"] = join_elapsed
-        row_count += len(joined)
-
-        group_start = time.time()
-        sums, counts, row_counts = aggregate_joined(
-            joined,
-            args.group_column,
-            payload_columns,
-            args.assume_payload_all_valid,
-            detail_timers,
-            need_counts=need_counts,
-            need_row_counts=need_row_counts,
-        )
-        cuda_synchronize()
-        group_elapsed = time.time() - group_start
-        group_seconds += group_elapsed
-        detail_timers["aggregate_wall"] += group_elapsed
-        batch_profile["groupby"] = group_elapsed
+        _, _, batch_profile, sums, counts, row_counts, batch_row_count = item
         append_frame(sum_frames, sums)
         append_frame(count_frames, counts)
         append_frame(row_count_frames, row_counts)
         batch_profiles.append(batch_profile)
-        del fact
-        del joined
+        row_count += batch_row_count
 
-    finisher.join()
-    for worker in decode_workers:
+    io_finisher.join()
+    decode_finisher.join()
+    for worker in aggregate_workers:
         worker.join()
 
     detail_timers["file_io_wall"] = max(io_wall_times) if io_wall_times else 0.0
     detail_timers["decode_wall"] = max(decode_wall_times) if decode_wall_times else 0.0
+    detail_timers["aggregate_stage_wall"] = max(aggregate_wall_times) if aggregate_wall_times else 0.0
     detail_timers["reader_wall"] = detail_timers["file_io_wall"]
     read_seconds = detail_timers["dimension_read"] + max(detail_timers["file_io_wall"], detail_timers["decode_wall"])
-    return read_seconds, join_seconds, group_seconds, row_count
+    return read_seconds, detail_timers["join"], detail_timers["aggregate_wall"], row_count
 
 
 def combine_frames(cudf, frames, group_column, payload_columns, timers, is_row_count=False):
@@ -1177,6 +1262,10 @@ def main():
         raise SystemExit("--io-queue-depth must be positive")
     if args.decode_threads <= 0:
         raise SystemExit("--decode-threads must be positive")
+    if args.aggregate_threads <= 0:
+        raise SystemExit("--aggregate-threads must be positive")
+    if args.aggregate_queue_depth <= 0:
+        raise SystemExit("--aggregate-queue-depth must be positive")
 
     if args.split_file_io and args.read_mode != "per-file":
         raise SystemExit("--split-file-io requires --read-mode per-file")
@@ -1328,6 +1417,8 @@ def main():
                 print("[file io sqpoll idle ms]: {}".format(args.file_io_sqpoll_idle_ms))
         print("[io queue depth]: {}".format(args.io_queue_depth))
         print("[decode threads]: {}".format(args.decode_threads))
+        print("[aggregate threads]: {}".format(args.aggregate_threads))
+        print("[aggregate queue depth]: {}".format(args.aggregate_queue_depth))
     if args.assume_payload_all_valid:
         print("[assume payload all valid]: on")
     if args.infer_grid_from_row_order:
@@ -1345,7 +1436,8 @@ def main():
             "count_from_rows={:.6f}s merge_concat={:.6f}s merge_groupby={:.6f}s "
             "row_count_sum={:.6f}s reader_wall={:.6f}s aggregate_wall={:.6f}s "
             "file_io_read={:.6f}s file_io_wall={:.6f}s decode_materialize={:.6f}s "
-            "decode_wall={:.6f}s io_uring_fallbacks={} rmm_setup={:.6f}s".format(
+            "decode_wall={:.6f}s aggregate_stage_wall={:.6f}s "
+            "io_uring_fallbacks={} rmm_setup={:.6f}s".format(
                 detail_timers["dimension_read"],
                 detail_timers["fact_read"],
                 detail_timers["join"],
@@ -1362,6 +1454,7 @@ def main():
                 detail_timers["file_io_wall"],
                 detail_timers["decode_materialize"],
                 detail_timers["decode_wall"],
+                detail_timers["aggregate_stage_wall"],
                 detail_timers["io_uring_fallbacks"],
                 detail_timers["rmm_setup"],
             )
