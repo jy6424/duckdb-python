@@ -142,7 +142,7 @@ def parse_args():
     parser.add_argument(
         "--file-io-method",
         default=os.environ.get("CUDF_FILE_IO_METHOD", "read"),
-        choices=["read", "readinto", "mmap", "io_uring"],
+        choices=["path", "read", "readinto", "mmap", "io_uring"],
         help="file byte read method used by --split-file-io",
     )
     parser.add_argument(
@@ -560,6 +560,49 @@ def build_row_order_reduce_plan(dim, group_column):
     }
 
 
+_ROW_ORDER_REDUCE_KERNEL = None
+
+
+def row_order_reduce_kernel():
+    global _ROW_ORDER_REDUCE_KERNEL
+    if _ROW_ORDER_REDUCE_KERNEL is not None:
+        return _ROW_ORDER_REDUCE_KERNEL
+
+    import cupy
+
+    code = r'''
+    extern "C" __global__
+    void row_order_reduce_many(
+        const unsigned long long *column_ptrs,
+        const int *group_ids,
+        double *out,
+        long long dim_rows,
+        long long repeats,
+        int num_cols,
+        int group_count,
+        long long total
+    ) {
+        long long idx = blockDim.x * (long long)blockIdx.x + threadIdx.x;
+        long long stride = blockDim.x * (long long)gridDim.x;
+        for (; idx < total; idx += stride) {
+            long long grid_idx = idx / num_cols;
+            int col = (int)(idx - grid_idx * num_cols);
+            const double *values = (const double *)column_ptrs[col];
+            double sum = 0.0;
+            for (long long rep = 0; rep < repeats; rep++) {
+                sum += values[rep * dim_rows + grid_idx];
+            }
+            int group_id = group_ids[grid_idx];
+            if (group_id >= 0 && group_id < group_count) {
+                atomicAdd(out + ((long long)col * group_count + group_id), sum);
+            }
+        }
+    }
+    '''
+    _ROW_ORDER_REDUCE_KERNEL = cupy.RawKernel(code, "row_order_reduce_many")
+    return _ROW_ORDER_REDUCE_KERNEL
+
+
 def aggregate_row_order_reduce(
     cudf,
     fact,
@@ -587,16 +630,36 @@ def aggregate_row_order_reduce(
     repeats = fact_rows // dim_rows
     group_ids = reduce_plan["group_ids"]
     group_count = reduce_plan["group_count"]
-    result_columns = {group_column: reduce_plan["group_values"]}
-
+    arrays = []
     for payload_column in payload_columns:
         values = series_to_cupy(fact[payload_column])
-        per_grid_sum = values.reshape((repeats, dim_rows)).sum(axis=0)
-        result_columns[payload_column] = cupy.bincount(
+        if values.dtype != cupy.float64:
+            values = values.astype(cupy.float64)
+        arrays.append(values)
+
+    column_ptrs = cupy.asarray([int(values.data.ptr) for values in arrays], dtype=cupy.uint64)
+    out = cupy.zeros((len(payload_columns), group_count), dtype=cupy.float64)
+    total = dim_rows * len(payload_columns)
+    block_size = 256
+    grid_size = min(65535, max(1, int((total + block_size - 1) // block_size)))
+    row_order_reduce_kernel()(
+        (grid_size,),
+        (block_size,),
+        (
+            column_ptrs,
             group_ids,
-            weights=per_grid_sum,
-            minlength=group_count,
-        )
+            out,
+            dim_rows,
+            repeats,
+            len(payload_columns),
+            group_count,
+            total,
+        ),
+    )
+
+    result_columns = {group_column: reduce_plan["group_values"]}
+    for column_idx, payload_column in enumerate(payload_columns):
+        result_columns[payload_column] = out[column_idx]
 
     sums = cudf.DataFrame(result_columns)
     row_counts = None
@@ -1510,12 +1573,24 @@ def split_file_io_read_aggregate(
                 if not batch_paths:
                     break
 
-                buffers, io_profile = timed_read_file_bytes(
-                    batch_paths,
-                    method=args.file_io_method,
-                    sqpoll=args.file_io_sqpoll,
-                    sqpoll_idle_ms=args.file_io_sqpoll_idle_ms,
-                )
+                if args.file_io_method == "path":
+                    buffers = None
+                    io_profile = {
+                        "elapsed": 0.0,
+                        "file_bytes": 0,
+                        "method": "path",
+                        "fallback_reason": "",
+                        "rchar": 0,
+                        "read_bytes": 0,
+                        "syscr": 0,
+                    }
+                else:
+                    buffers, io_profile = timed_read_file_bytes(
+                        batch_paths,
+                        method=args.file_io_method,
+                        sqpoll=args.file_io_sqpoll,
+                        sqpoll_idle_ms=args.file_io_sqpoll_idle_ms,
+                    )
                 add_counter("file_io_read", io_profile["elapsed"])
                 add_counter("fact_read_bytes", io_profile["read_bytes"])
                 add_counter("fact_rchar", io_profile["rchar"])
@@ -1537,13 +1612,23 @@ def split_file_io_read_aggregate(
                     break
                 _, batch_id, batch_paths, buffers, io_profile, prefetch_profile = item
 
-                fact, decode_profile = timed_decode_parquet_bytes(
-                    cudf,
-                    buffers,
-                    columns=fact_columns,
-                    measure_materialized_bytes=measure_materialized_bytes,
-                    decode_source=args.decode_source,
-                )
+                if io_profile["method"] == "path":
+                    source = batch_paths[0] if len(batch_paths) == 1 else batch_paths
+                    fact, decode_profile = timed_read_parquet_gpu(
+                        cudf,
+                        source,
+                        columns=fact_columns,
+                        measure_materialized_bytes=measure_materialized_bytes,
+                    )
+                    decode_profile["decode_source"] = "path"
+                else:
+                    fact, decode_profile = timed_decode_parquet_bytes(
+                        cudf,
+                        buffers,
+                        columns=fact_columns,
+                        measure_materialized_bytes=measure_materialized_bytes,
+                        decode_source=args.decode_source,
+                    )
                 add_counter("decode_materialize", decode_profile["elapsed"])
                 add_counter("fact_read", decode_profile["elapsed"])
                 add_counter("materialized_bytes", decode_profile["materialized_bytes"])
@@ -1571,7 +1656,8 @@ def split_file_io_read_aggregate(
                     "join": 0.0,
                     "groupby": 0.0,
                 }
-                del buffers
+                if buffers is not None:
+                    del buffers
                 decoded_batches.put(("batch", batch_id, batch_paths, fact, batch_profile))
         except BaseException as exc:
             decoded_batches.put(("error", exc))
