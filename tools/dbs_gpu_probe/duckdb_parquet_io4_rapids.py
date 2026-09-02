@@ -14,6 +14,11 @@ import threading
 import time
 
 
+POSIX_FADV_WILLNEED = 3
+DEFAULT_PREFETCH_MERGE_GAP = 1024 * 1024
+DEFAULT_PREFETCH_EXTRA_BYTES = 64 * 1024
+
+
 EXCLUDED_AUTO_COLUMNS = set(["grid", "time", "levs"])
 
 
@@ -29,6 +34,7 @@ def new_timers():
         "merge_concat": 0.0,
         "merge_groupby": 0.0,
         "row_count_sum": 0.0,
+        "row_order_reduce": 0.0,
         "reader_wall": 0.0,
         "aggregate_wall": 0.0,
         "aggregate_stage_wall": 0.0,
@@ -45,6 +51,15 @@ def new_timers():
         "materialized_bytes": 0,
         "reader_queue_put": 0.0,
         "io_uring_fallbacks": 0,
+        "parquet_prefetch": 0.0,
+        "parquet_prefetch_wall": 0.0,
+        "parquet_prefetch_bytes": 0,
+        "parquet_prefetch_ranges": 0,
+        "parquet_prefetch_files": 0,
+        "parquet_prefetch_rchar": 0,
+        "parquet_prefetch_read_bytes": 0,
+        "parquet_prefetch_syscr": 0,
+        "parquet_prefetch_fallbacks": 0,
         "rmm_setup": 0.0,
     }
 
@@ -127,8 +142,14 @@ def parse_args():
     parser.add_argument(
         "--file-io-method",
         default=os.environ.get("CUDF_FILE_IO_METHOD", "read"),
-        choices=["read", "io_uring"],
+        choices=["read", "readinto", "mmap", "io_uring"],
         help="file byte read method used by --split-file-io",
+    )
+    parser.add_argument(
+        "--decode-source",
+        default=os.environ.get("CUDF_DECODE_SOURCE", "pyarrow-buffer"),
+        choices=["pyarrow-buffer", "bytesio"],
+        help="in-memory source wrapper passed to cudf.read_parquet",
     )
     parser.add_argument(
         "--file-io-sqpoll",
@@ -167,6 +188,50 @@ def parse_args():
         help="number of partial aggregate results allowed to wait before final merge",
     )
     parser.add_argument(
+        "--aggregate-strategy",
+        default=os.environ.get("CUDF_AGGREGATE_STRATEGY", "auto"),
+        choices=["auto", "cudf-groupby", "row-order-reduce"],
+        help="aggregation implementation; row-order-reduce requires inferred grid order and all-valid payloads",
+    )
+    parser.add_argument(
+        "--parquet-column-prefetch",
+        type=parse_bool01,
+        nargs="?",
+        const=True,
+        default=os.environ.get("CUDF_PARQUET_COLUMN_PREFETCH", "1") == "1",
+        help="prefetch selected Parquet column chunk byte ranges before file I/O/decode",
+    )
+    parser.add_argument(
+        "--parquet-prefetch-method",
+        default=os.environ.get("CUDF_PARQUET_PREFETCH_METHOD", "fadvise"),
+        choices=["fadvise", "read"],
+        help="method used by --parquet-column-prefetch",
+    )
+    parser.add_argument(
+        "--parquet-prefetch-workers",
+        type=int,
+        default=int(os.environ.get("CUDF_PARQUET_PREFETCH_WORKERS", "1")),
+        help="number of Parquet column range prefetch workers",
+    )
+    parser.add_argument(
+        "--parquet-prefetch-queue-depth",
+        type=int,
+        default=int(os.environ.get("CUDF_PARQUET_PREFETCH_QUEUE_DEPTH", "2")),
+        help="number of prefetched file batches allowed to wait before file I/O",
+    )
+    parser.add_argument(
+        "--parquet-prefetch-merge-gap",
+        type=int,
+        default=int(os.environ.get("CUDF_PARQUET_PREFETCH_MERGE_GAP", str(DEFAULT_PREFETCH_MERGE_GAP))),
+        help="merge adjacent Parquet byte ranges separated by at most this many bytes",
+    )
+    parser.add_argument(
+        "--parquet-prefetch-extra-bytes",
+        type=int,
+        default=int(os.environ.get("CUDF_PARQUET_PREFETCH_EXTRA_BYTES", str(DEFAULT_PREFETCH_EXTRA_BYTES))),
+        help="extra bytes added after each Parquet column chunk range to cover trailing page data",
+    )
+    parser.add_argument(
         "--rmm-pool",
         action="store_true",
         default=False,
@@ -203,6 +268,164 @@ def add_io_diff(timers, prefix, before, after):
     timers[prefix + "_rchar"] += io_diff(before, after, "rchar")
     timers[prefix + "_read_bytes"] += io_diff(before, after, "read_bytes")
     timers[prefix + "_syscr"] += io_diff(before, after, "syscr")
+
+
+def merge_byte_ranges(ranges, max_gap):
+    if not ranges:
+        return []
+    ranges = sorted((int(start), int(end)) for start, end in ranges if end > start)
+    if not ranges:
+        return []
+    merged = [ranges[0]]
+    for start, end in ranges[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end + max(0, int(max_gap)):
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def parquet_column_chunk_ranges(path, columns, merge_gap=DEFAULT_PREFETCH_MERGE_GAP,
+                                extra_bytes=DEFAULT_PREFETCH_EXTRA_BYTES):
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError("pyarrow is required for Parquet column prefetch: {}".format(exc))
+
+    wanted = set(columns)
+    parquet_file = pq.ParquetFile(path)
+    metadata = parquet_file.metadata
+    file_size = os.path.getsize(path)
+    ranges = []
+
+    for row_group_idx in range(metadata.num_row_groups):
+        row_group = metadata.row_group(row_group_idx)
+        for column_idx in range(row_group.num_columns):
+            column = row_group.column(column_idx)
+            name = column.path_in_schema
+            if name not in wanted:
+                continue
+
+            offsets = []
+            for attr in ["dictionary_page_offset", "data_page_offset", "file_offset"]:
+                value = getattr(column, attr, None)
+                if value is not None and value > 0:
+                    offsets.append(int(value))
+            if not offsets:
+                continue
+            start = min(offsets)
+            compressed_size = int(getattr(column, "total_compressed_size", 0) or 0)
+            if compressed_size <= 0:
+                continue
+            end = min(file_size, start + compressed_size + max(0, int(extra_bytes)))
+            ranges.append((start, end))
+
+    return merge_byte_ranges(ranges, merge_gap)
+
+
+def posix_fadvise_willneed(fd, offset, length):
+    if length <= 0:
+        return
+    if hasattr(os, "posix_fadvise"):
+        os.posix_fadvise(fd, offset, length, POSIX_FADV_WILLNEED)
+        return
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    result = libc.posix_fadvise(
+        ctypes.c_int(fd),
+        ctypes.c_int64(offset),
+        ctypes.c_int64(length),
+        ctypes.c_int(POSIX_FADV_WILLNEED),
+    )
+    if result != 0:
+        raise OSError(result, os.strerror(result))
+
+
+def prefetch_file_ranges(path, ranges, method="fadvise"):
+    if not ranges:
+        return 0
+
+    fd = os.open(path, os.O_RDONLY)
+    prefetched = 0
+    try:
+        if method == "read":
+            for start, end in ranges:
+                remaining = end - start
+                offset = start
+                while remaining > 0:
+                    chunk_size = min(1024 * 1024, remaining)
+                    data = os.pread(fd, chunk_size, offset)
+                    if not data:
+                        break
+                    got = len(data)
+                    prefetched += got
+                    offset += got
+                    remaining -= got
+        else:
+            for start, end in ranges:
+                length = end - start
+                posix_fadvise_willneed(fd, start, length)
+                prefetched += length
+    finally:
+        os.close(fd)
+    return prefetched
+
+
+def timed_prefetch_parquet_columns(paths, columns, args):
+    io_before = read_proc_io()
+    timer_start = time.time()
+    ranges_count = 0
+    files_count = 0
+    bytes_count = 0
+    fallback_count = 0
+    fallback_reason = ""
+
+    for path in paths:
+        try:
+            ranges = parquet_column_chunk_ranges(
+                path,
+                columns,
+                merge_gap=args.parquet_prefetch_merge_gap,
+                extra_bytes=args.parquet_prefetch_extra_bytes,
+            )
+            if ranges:
+                files_count += 1
+                ranges_count += len(ranges)
+                bytes_count += prefetch_file_ranges(path, ranges, method=args.parquet_prefetch_method)
+        except Exception as exc:
+            fallback_count += 1
+            fallback_reason = str(exc)
+
+    elapsed = time.time() - timer_start
+    io_after = read_proc_io()
+    return {
+        "elapsed": elapsed,
+        "files": files_count,
+        "ranges": ranges_count,
+        "bytes": bytes_count,
+        "method": args.parquet_prefetch_method,
+        "fallbacks": fallback_count,
+        "fallback_reason": fallback_reason,
+        "rchar": io_diff(io_before, io_after, "rchar"),
+        "read_bytes": io_diff(io_before, io_after, "read_bytes"),
+        "syscr": io_diff(io_before, io_after, "syscr"),
+    }
+
+
+def empty_prefetch_profile():
+    return {
+        "elapsed": 0.0,
+        "files": 0,
+        "ranges": 0,
+        "bytes": 0,
+        "method": "off",
+        "fallbacks": 0,
+        "fallback_reason": "",
+        "rchar": 0,
+        "read_bytes": 0,
+        "syscr": 0,
+    }
 
 
 def dataframe_nbytes(frame):
@@ -297,6 +520,103 @@ def make_counts_from_row_counts(row_counts, group_column, payload_columns):
     for payload_column in payload_columns:
         counts[payload_column] = row_counts["row_count"]
     return counts
+
+
+def should_use_row_order_reduce(args):
+    if args.aggregate_strategy == "cudf-groupby":
+        return False
+    if args.aggregate_strategy == "row-order-reduce":
+        if not args.infer_grid_from_row_order:
+            raise ValueError("--aggregate-strategy row-order-reduce requires --infer-grid-from-row-order")
+        if not args.assume_payload_all_valid:
+            raise ValueError("--aggregate-strategy row-order-reduce requires --assume-payload-all-valid")
+        return True
+    return args.infer_grid_from_row_order and args.assume_payload_all_valid
+
+
+def series_to_cupy(series):
+    import cupy
+
+    try:
+        return series.to_cupy()
+    except Exception:
+        pass
+    values = getattr(series, "values", None)
+    if values is not None:
+        return cupy.asarray(values)
+    return cupy.asarray(series)
+
+
+def build_row_order_reduce_plan(dim, group_column):
+    import cupy
+
+    group_values = series_to_cupy(dim[group_column])
+    unique_groups, inverse = cupy.unique(group_values, return_inverse=True)
+    return {
+        "group_values": unique_groups,
+        "group_ids": inverse.astype(cupy.int32, copy=False),
+        "group_count": int(unique_groups.size),
+        "dim_rows": len(dim),
+    }
+
+
+def aggregate_row_order_reduce(
+    cudf,
+    fact,
+    group_column,
+    payload_columns,
+    reduce_plan,
+    timers,
+    need_counts=True,
+    need_row_counts=True,
+):
+    import cupy
+
+    dim_rows = reduce_plan["dim_rows"]
+    fact_rows = len(fact)
+    if dim_rows <= 0:
+        raise ValueError("dimension file has no rows")
+    if fact_rows % dim_rows != 0:
+        raise ValueError(
+            "cannot row-order reduce: fact rows {} is not a multiple of dimension rows {}".format(
+                fact_rows, dim_rows
+            )
+        )
+
+    timer_start = time.time()
+    repeats = fact_rows // dim_rows
+    group_ids = reduce_plan["group_ids"]
+    group_count = reduce_plan["group_count"]
+    result_columns = {group_column: reduce_plan["group_values"]}
+
+    for payload_column in payload_columns:
+        values = series_to_cupy(fact[payload_column])
+        per_grid_sum = values.reshape((repeats, dim_rows)).sum(axis=0)
+        result_columns[payload_column] = cupy.bincount(
+            group_ids,
+            weights=per_grid_sum,
+            minlength=group_count,
+        )
+
+    sums = cudf.DataFrame(result_columns)
+    row_counts = None
+    counts = None
+    if need_row_counts or need_counts:
+        row_count_values = cupy.bincount(group_ids, minlength=group_count) * repeats
+        row_counts = cudf.DataFrame(
+            {
+                group_column: reduce_plan["group_values"],
+                "row_count": row_count_values,
+            }
+        )
+    if need_counts:
+        counts = make_counts_from_row_counts(row_counts, group_column, payload_columns)
+
+    cuda_synchronize()
+    elapsed = time.time() - timer_start
+    timers["row_order_reduce"] += elapsed
+    timers["groupby_sum"] += elapsed
+    return sums, counts, row_counts
 
 
 def aggregate_joined(
@@ -648,6 +968,51 @@ def read_file_bytes_blocking(paths):
     return buffers, byte_count
 
 
+def read_file_bytes_readinto(paths):
+    buffers = []
+    byte_count = 0
+    for path in paths:
+        size = os.path.getsize(path)
+        data = bytearray(size)
+        view = memoryview(data)
+        offset = 0
+        with open(path, "rb", buffering=0) as handle:
+            while offset < size:
+                nread = handle.readinto(view[offset:])
+                if not nread:
+                    break
+                offset += nread
+        if offset != size:
+            raise OSError("short readinto for {}: {} of {}".format(path, offset, size))
+        byte_count += size
+        buffers.append(data)
+    return buffers, byte_count
+
+
+def read_file_mmaps(paths):
+    buffers = []
+    byte_count = 0
+    for path in paths:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            size = os.fstat(fd).st_size
+            if size == 0:
+                data = b""
+            else:
+                data = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
+                madvise = getattr(data, "madvise", None)
+                if madvise is not None and hasattr(mmap, "MADV_WILLNEED"):
+                    try:
+                        madvise(mmap.MADV_WILLNEED)
+                    except (OSError, ValueError):
+                        pass
+            byte_count += size
+            buffers.append(data)
+        finally:
+            os.close(fd)
+    return buffers, byte_count
+
+
 def read_file_bytes_io_uring(paths, sqpoll=False, sqpoll_idle_ms=2000):
     ring = SimpleIoUring(len(paths), sqpoll=sqpoll, sqpoll_idle_ms=sqpoll_idle_ms)
     fds = []
@@ -703,6 +1068,10 @@ def timed_read_file_bytes(paths, method="read", sqpoll=False, sqpoll_idle_ms=200
             actual_method = "read-fallback"
             fallback_reason = str(exc)
             buffers, byte_count = read_file_bytes_blocking(paths)
+    elif method == "readinto":
+        buffers, byte_count = read_file_bytes_readinto(paths)
+    elif method == "mmap":
+        buffers, byte_count = read_file_mmaps(paths)
     else:
         buffers, byte_count = read_file_bytes_blocking(paths)
     elapsed = time.time() - timer_start
@@ -718,17 +1087,61 @@ def timed_read_file_bytes(paths, method="read", sqpoll=False, sqpoll_idle_ms=200
     }
 
 
-def timed_decode_parquet_bytes(cudf, buffers, columns, measure_materialized_bytes=False):
-    sources = [io.BytesIO(data) for data in buffers]
+def close_decode_buffers(buffers):
+    for buffer in buffers:
+        close = getattr(buffer, "close", None)
+        if close is not None:
+            try:
+                close()
+            except (BufferError, OSError, ValueError):
+                pass
+
+
+def make_decode_sources(buffers, decode_source):
+    if decode_source == "pyarrow-buffer":
+        try:
+            import pyarrow as pa
+
+            return [pa.BufferReader(buffer) for buffer in buffers], "pyarrow-buffer"
+        except Exception:
+            pass
+    return [io.BytesIO(buffer) for buffer in buffers], "bytesio"
+
+
+def timed_decode_parquet_bytes(
+    cudf,
+    buffers,
+    columns,
+    measure_materialized_bytes=False,
+    decode_source="pyarrow-buffer",
+):
+    io_before = read_proc_io()
+    sources, actual_decode_source = make_decode_sources(buffers, decode_source)
     source = sources[0] if len(sources) == 1 else sources
     timer_start = time.time()
-    frame = read_parquet_gpu(cudf, source, columns=columns)
+    try:
+        frame = read_parquet_gpu(cudf, source, columns=columns)
+    except Exception:
+        if actual_decode_source != "pyarrow-buffer":
+            raise
+        del sources
+        sources, actual_decode_source = make_decode_sources(buffers, "bytesio")
+        actual_decode_source = "bytesio-fallback"
+        source = sources[0] if len(sources) == 1 else sources
+        frame = read_parquet_gpu(cudf, source, columns=columns)
     cuda_synchronize()
     elapsed = time.time() - timer_start
+    io_after = read_proc_io()
+    del sources
+    close_decode_buffers(buffers)
     profile = {
         "elapsed": elapsed,
         "rows": len(frame),
         "materialized_bytes": 0,
+        "decode_source": actual_decode_source,
+        "rchar": io_diff(io_before, io_after, "rchar"),
+        "read_bytes": io_diff(io_before, io_after, "read_bytes"),
+        "syscr": io_diff(io_before, io_after, "syscr"),
     }
     if measure_materialized_bytes:
         profile["materialized_bytes"] = dataframe_nbytes(frame)
@@ -800,8 +1213,10 @@ def threaded_read_aggregate(
     dimension_columns = [args.group_column] if args.infer_grid_from_row_order else [args.join_key, args.group_column]
     need_counts = args.print_results
     need_row_counts = args.print_results
+    use_row_order_reduce = should_use_row_order_reduce(args)
 
     shared_dim = None
+    shared_reduce_plan = None
     if args.reuse_dimension_mapping or args.infer_grid_from_row_order:
         dimension_path = resolve_dimension_path(parquet_paths[0], args.dimension_file)
         shared_dim, dim_profile = timed_read_parquet_gpu(
@@ -814,6 +1229,8 @@ def threaded_read_aggregate(
         detail_timers["dimension_rchar"] += dim_profile["rchar"]
         detail_timers["dimension_read_bytes"] += dim_profile["read_bytes"]
         detail_timers["dimension_syscr"] += dim_profile["syscr"]
+        if use_row_order_reduce:
+            shared_reduce_plan = build_row_order_reduce_plan(shared_dim, args.group_column)
 
     tasks = queue.Queue()
     for batch_id, batch_paths in enumerate(make_file_batches(parquet_paths, file_batch_size)):
@@ -878,9 +1295,14 @@ def threaded_read_aggregate(
             "batch_id": batch_id,
             "files": len(batch_paths),
             "read": fact_profile["elapsed"],
+            "prefetch": 0.0,
+            "prefetch_bytes": 0,
+            "prefetch_ranges": 0,
+            "prefetch_method": "off",
             "file_io": 0.0,
             "decode": fact_profile["elapsed"],
             "io_method": "cudf",
+            "decode_source": "path",
             "io_fallback_reason": "",
             "rows": fact_profile["rows"],
             "rchar": fact_profile["rchar"],
@@ -906,30 +1328,52 @@ def threaded_read_aggregate(
         else:
             dim = shared_dim
 
-        join_start = time.time()
-        if args.infer_grid_from_row_order:
-            joined = attach_group_from_row_order(cudf, fact, dim, args.group_column)
+        if use_row_order_reduce:
+            join_elapsed = 0.0
+            batch_row_count = len(fact)
+            reduce_plan = shared_reduce_plan
+            if reduce_plan is None:
+                reduce_plan = build_row_order_reduce_plan(dim, args.group_column)
+            group_start = time.time()
+            sums, counts, row_counts = aggregate_row_order_reduce(
+                cudf,
+                fact,
+                args.group_column,
+                payload_columns,
+                reduce_plan,
+                detail_timers,
+                need_counts=need_counts,
+                need_row_counts=need_row_counts,
+            )
+            cuda_synchronize()
+            group_elapsed = time.time() - group_start
         else:
-            joined = fact.merge(dim, on=args.join_key, how="inner")
-        cuda_synchronize()
-        join_elapsed = time.time() - join_start
+            join_start = time.time()
+            if args.infer_grid_from_row_order:
+                joined = attach_group_from_row_order(cudf, fact, dim, args.group_column)
+            else:
+                joined = fact.merge(dim, on=args.join_key, how="inner")
+            cuda_synchronize()
+            join_elapsed = time.time() - join_start
+            batch_row_count = len(joined)
+
+            group_start = time.time()
+            sums, counts, row_counts = aggregate_joined(
+                joined,
+                args.group_column,
+                payload_columns,
+                args.assume_payload_all_valid,
+                detail_timers,
+                need_counts=need_counts,
+                need_row_counts=need_row_counts,
+            )
+            cuda_synchronize()
+            group_elapsed = time.time() - group_start
+            del joined
         join_seconds += join_elapsed
         detail_timers["join"] += join_elapsed
         batch_profile["join"] = join_elapsed
-        row_count += len(joined)
-
-        group_start = time.time()
-        sums, counts, row_counts = aggregate_joined(
-            joined,
-            args.group_column,
-            payload_columns,
-            args.assume_payload_all_valid,
-            detail_timers,
-            need_counts=need_counts,
-            need_row_counts=need_row_counts,
-        )
-        cuda_synchronize()
-        group_elapsed = time.time() - group_start
+        row_count += batch_row_count
         group_seconds += group_elapsed
         detail_timers["aggregate_wall"] += group_elapsed
         batch_profile["groupby"] = group_elapsed
@@ -938,7 +1382,6 @@ def threaded_read_aggregate(
         append_frame(row_count_frames, row_counts)
         batch_profiles.append(batch_profile)
         del fact
-        del joined
 
     for worker in workers:
         worker.join()
@@ -963,7 +1406,9 @@ def split_file_io_read_aggregate(
     decode_threads = max(1, args.decode_threads)
     aggregate_threads = max(1, args.aggregate_threads)
     file_batch_size = resolve_file_batch_size(args, io_threads, len(parquet_paths))
+    prefetch_threads = max(1, min(args.parquet_prefetch_workers, len(parquet_paths)))
     io_queue_depth = max(1, args.io_queue_depth)
+    prefetch_queue_depth = max(1, args.parquet_prefetch_queue_depth)
     pipeline_queue_depth = max(1, args.pipeline_queue_depth)
     aggregate_queue_depth = max(1, args.aggregate_queue_depth)
 
@@ -972,10 +1417,22 @@ def split_file_io_read_aggregate(
     need_counts = args.print_results
     need_row_counts = args.print_results
     measure_materialized_bytes = args.print_stage_times or args.print_batch_times
+    use_row_order_reduce = should_use_row_order_reduce(args)
 
     shared_dim = None
+    shared_reduce_plan = None
     if args.reuse_dimension_mapping or args.infer_grid_from_row_order:
         dimension_path = resolve_dimension_path(parquet_paths[0], args.dimension_file)
+        if args.parquet_column_prefetch:
+            prefetch_profile = timed_prefetch_parquet_columns([dimension_path], dimension_columns, args)
+            detail_timers["parquet_prefetch"] += prefetch_profile["elapsed"]
+            detail_timers["parquet_prefetch_bytes"] += prefetch_profile["bytes"]
+            detail_timers["parquet_prefetch_ranges"] += prefetch_profile["ranges"]
+            detail_timers["parquet_prefetch_files"] += prefetch_profile["files"]
+            detail_timers["parquet_prefetch_rchar"] += prefetch_profile["rchar"]
+            detail_timers["parquet_prefetch_read_bytes"] += prefetch_profile["read_bytes"]
+            detail_timers["parquet_prefetch_syscr"] += prefetch_profile["syscr"]
+            detail_timers["parquet_prefetch_fallbacks"] += prefetch_profile["fallbacks"]
         shared_dim, dim_profile = timed_read_parquet_gpu(
             cudf,
             dimension_path,
@@ -986,14 +1443,18 @@ def split_file_io_read_aggregate(
         detail_timers["dimension_rchar"] += dim_profile["rchar"]
         detail_timers["dimension_read_bytes"] += dim_profile["read_bytes"]
         detail_timers["dimension_syscr"] += dim_profile["syscr"]
+        if use_row_order_reduce:
+            shared_reduce_plan = build_row_order_reduce_plan(shared_dim, args.group_column)
 
     tasks = queue.Queue()
     for batch_id, batch_paths in enumerate(make_file_batches(parquet_paths, file_batch_size)):
         tasks.put((batch_id, batch_paths))
 
+    prefetched_batches = queue.Queue(maxsize=prefetch_queue_depth)
     raw_batches = queue.Queue(maxsize=io_queue_depth)
     decoded_batches = queue.Queue(maxsize=pipeline_queue_depth)
     partial_batches = queue.Queue(maxsize=aggregate_queue_depth)
+    prefetch_wall_times = []
     io_wall_times = []
     decode_wall_times = []
     aggregate_wall_times = []
@@ -1003,13 +1464,50 @@ def split_file_io_read_aggregate(
         with timer_lock:
             detail_timers[name] += value
 
-    def io_worker():
+    def prefetch_worker():
         worker_start = time.time()
         try:
             while True:
                 try:
                     batch_id, batch_paths = tasks.get_nowait()
                 except queue.Empty:
+                    break
+
+                prefetch_profile = timed_prefetch_parquet_columns(batch_paths, fact_columns, args)
+                add_counter("parquet_prefetch", prefetch_profile["elapsed"])
+                add_counter("parquet_prefetch_bytes", prefetch_profile["bytes"])
+                add_counter("parquet_prefetch_ranges", prefetch_profile["ranges"])
+                add_counter("parquet_prefetch_files", prefetch_profile["files"])
+                add_counter("parquet_prefetch_rchar", prefetch_profile["rchar"])
+                add_counter("parquet_prefetch_read_bytes", prefetch_profile["read_bytes"])
+                add_counter("parquet_prefetch_syscr", prefetch_profile["syscr"])
+                add_counter("parquet_prefetch_fallbacks", prefetch_profile["fallbacks"])
+                prefetched_batches.put(("batch", batch_id, batch_paths, prefetch_profile))
+        except BaseException as exc:
+            prefetched_batches.put(("error", exc))
+        finally:
+            prefetch_wall_times.append(time.time() - worker_start)
+
+    def io_worker():
+        worker_start = time.time()
+        try:
+            while True:
+                if args.parquet_column_prefetch:
+                    item = prefetched_batches.get()
+                    if item[0] == "done":
+                        break
+                    if item[0] == "error":
+                        decoded_batches.put(("error", item[1]))
+                        break
+                    _, batch_id, batch_paths, prefetch_profile = item
+                else:
+                    try:
+                        batch_id, batch_paths = tasks.get_nowait()
+                    except queue.Empty:
+                        break
+                    prefetch_profile = empty_prefetch_profile()
+
+                if not batch_paths:
                     break
 
                 buffers, io_profile = timed_read_file_bytes(
@@ -1024,7 +1522,7 @@ def split_file_io_read_aggregate(
                 add_counter("fact_syscr", io_profile["syscr"])
                 if args.file_io_method == "io_uring" and not io_profile["method"].startswith("io_uring"):
                     add_counter("io_uring_fallbacks", 1)
-                raw_batches.put(("raw", batch_id, batch_paths, buffers, io_profile))
+                raw_batches.put(("raw", batch_id, batch_paths, buffers, io_profile, prefetch_profile))
         except BaseException as exc:
             decoded_batches.put(("error", exc))
         finally:
@@ -1037,29 +1535,38 @@ def split_file_io_read_aggregate(
                 item = raw_batches.get()
                 if item[0] == "done":
                     break
-                _, batch_id, batch_paths, buffers, io_profile = item
+                _, batch_id, batch_paths, buffers, io_profile, prefetch_profile = item
 
                 fact, decode_profile = timed_decode_parquet_bytes(
                     cudf,
                     buffers,
                     columns=fact_columns,
                     measure_materialized_bytes=measure_materialized_bytes,
+                    decode_source=args.decode_source,
                 )
                 add_counter("decode_materialize", decode_profile["elapsed"])
                 add_counter("fact_read", decode_profile["elapsed"])
                 add_counter("materialized_bytes", decode_profile["materialized_bytes"])
+                add_counter("fact_read_bytes", decode_profile["read_bytes"])
+                add_counter("fact_rchar", decode_profile["rchar"])
+                add_counter("fact_syscr", decode_profile["syscr"])
                 batch_profile = {
                     "batch_id": batch_id,
                     "files": len(batch_paths),
                     "read": io_profile["elapsed"] + decode_profile["elapsed"],
+                    "prefetch": prefetch_profile["elapsed"],
+                    "prefetch_bytes": prefetch_profile["bytes"],
+                    "prefetch_ranges": prefetch_profile["ranges"],
+                    "prefetch_method": prefetch_profile["method"],
                     "file_io": io_profile["elapsed"],
                     "decode": decode_profile["elapsed"],
                     "io_method": io_profile["method"],
+                    "decode_source": decode_profile["decode_source"],
                     "io_fallback_reason": io_profile["fallback_reason"],
                     "rows": decode_profile["rows"],
-                    "rchar": io_profile["rchar"],
-                    "read_bytes": io_profile["read_bytes"],
-                    "syscr": io_profile["syscr"],
+                    "rchar": io_profile["rchar"] + decode_profile["rchar"],
+                    "read_bytes": io_profile["read_bytes"] + decode_profile["read_bytes"],
+                    "syscr": io_profile["syscr"] + decode_profile["syscr"],
                     "materialized_bytes": decode_profile["materialized_bytes"],
                     "join": 0.0,
                     "groupby": 0.0,
@@ -1100,35 +1607,58 @@ def split_file_io_read_aggregate(
                 else:
                     dim = shared_dim
 
-                join_start = time.time()
-                if args.infer_grid_from_row_order:
-                    joined = attach_group_from_row_order(cudf, fact, dim, args.group_column)
+                if use_row_order_reduce:
+                    join_elapsed = 0.0
+                    batch_row_count = len(fact)
+                    reduce_plan = shared_reduce_plan
+                    if reduce_plan is None:
+                        reduce_plan = build_row_order_reduce_plan(dim, args.group_column)
+                    group_start = time.time()
+                    aggregate_timers = new_timers()
+                    sums, counts, row_counts = aggregate_row_order_reduce(
+                        cudf,
+                        fact,
+                        args.group_column,
+                        payload_columns,
+                        reduce_plan,
+                        aggregate_timers,
+                        need_counts=need_counts,
+                        need_row_counts=need_row_counts,
+                    )
+                    cuda_synchronize()
+                    group_elapsed = time.time() - group_start
                 else:
-                    joined = fact.merge(dim, on=args.join_key, how="inner")
-                cuda_synchronize()
-                join_elapsed = time.time() - join_start
+                    join_start = time.time()
+                    if args.infer_grid_from_row_order:
+                        joined = attach_group_from_row_order(cudf, fact, dim, args.group_column)
+                    else:
+                        joined = fact.merge(dim, on=args.join_key, how="inner")
+                    cuda_synchronize()
+                    join_elapsed = time.time() - join_start
+                    batch_row_count = len(joined)
+
+                    group_start = time.time()
+                    aggregate_timers = new_timers()
+                    sums, counts, row_counts = aggregate_joined(
+                        joined,
+                        args.group_column,
+                        payload_columns,
+                        args.assume_payload_all_valid,
+                        aggregate_timers,
+                        need_counts=need_counts,
+                        need_row_counts=need_row_counts,
+                    )
+                    cuda_synchronize()
+                    group_elapsed = time.time() - group_start
+                    del joined
                 add_counter("join", join_elapsed)
                 batch_profile["join"] = join_elapsed
-                batch_row_count = len(joined)
-
-                group_start = time.time()
-                aggregate_timers = new_timers()
-                sums, counts, row_counts = aggregate_joined(
-                    joined,
-                    args.group_column,
-                    payload_columns,
-                    args.assume_payload_all_valid,
-                    aggregate_timers,
-                    need_counts=need_counts,
-                    need_row_counts=need_row_counts,
-                )
-                cuda_synchronize()
-                group_elapsed = time.time() - group_start
                 for timer_name in [
                     "groupby_size",
                     "groupby_sum",
                     "groupby_count",
                     "count_from_rows",
+                    "row_order_reduce",
                 ]:
                     add_counter(timer_name, aggregate_timers[timer_name])
                 add_counter("aggregate_wall", group_elapsed)
@@ -1137,7 +1667,6 @@ def split_file_io_read_aggregate(
                     ("partial", batch_id, batch_profile, sums, counts, row_counts, batch_row_count)
                 )
                 del fact
-                del joined
         except BaseException as exc:
             partial_batches.put(("error", exc))
         finally:
@@ -1150,21 +1679,36 @@ def split_file_io_read_aggregate(
         for _ in range(decode_threads):
             raw_batches.put(("done",))
 
+    def finish_prefetch_workers():
+        for worker in prefetch_workers:
+            worker.join()
+        for _ in range(io_threads):
+            prefetched_batches.put(("done",))
+
     def finish_decode_workers():
         for worker in decode_workers:
             worker.join()
         for _ in range(aggregate_threads):
             decoded_batches.put(("done",))
 
+    prefetch_workers = []
+    if args.parquet_column_prefetch:
+        prefetch_workers = [threading.Thread(target=prefetch_worker) for _ in range(prefetch_threads)]
     io_workers = [threading.Thread(target=io_worker) for _ in range(io_threads)]
     decode_workers = [threading.Thread(target=decode_worker) for _ in range(decode_threads)]
     aggregate_workers = [threading.Thread(target=aggregate_worker) for _ in range(aggregate_threads)]
+    for worker in prefetch_workers:
+        worker.start()
     for worker in io_workers:
         worker.start()
     for worker in decode_workers:
         worker.start()
     for worker in aggregate_workers:
         worker.start()
+    prefetch_finisher = None
+    if args.parquet_column_prefetch:
+        prefetch_finisher = threading.Thread(target=finish_prefetch_workers)
+        prefetch_finisher.start()
     io_finisher = threading.Thread(target=finish_io_workers)
     decode_finisher = threading.Thread(target=finish_decode_workers)
     io_finisher.start()
@@ -1180,6 +1724,8 @@ def split_file_io_read_aggregate(
             done_aggregators += 1
             continue
         if item_type == "error":
+            if prefetch_finisher is not None:
+                prefetch_finisher.join()
             io_finisher.join()
             decode_finisher.join()
             for worker in aggregate_workers:
@@ -1193,11 +1739,14 @@ def split_file_io_read_aggregate(
         batch_profiles.append(batch_profile)
         row_count += batch_row_count
 
+    if prefetch_finisher is not None:
+        prefetch_finisher.join()
     io_finisher.join()
     decode_finisher.join()
     for worker in aggregate_workers:
         worker.join()
 
+    detail_timers["parquet_prefetch_wall"] = max(prefetch_wall_times) if prefetch_wall_times else 0.0
     detail_timers["file_io_wall"] = max(io_wall_times) if io_wall_times else 0.0
     detail_timers["decode_wall"] = max(decode_wall_times) if decode_wall_times else 0.0
     detail_timers["aggregate_stage_wall"] = max(aggregate_wall_times) if aggregate_wall_times else 0.0
@@ -1210,6 +1759,8 @@ def combine_frames(cudf, frames, group_column, payload_columns, timers, is_row_c
     if not frames:
         columns = [group_column, "row_count"] if is_row_count else [group_column] + payload_columns
         return cudf.DataFrame({column: [] for column in columns})
+    if len(frames) == 1:
+        return frames[0]
     timer_start = time.time()
     combined = cudf.concat(frames, ignore_index=True)
     cuda_synchronize()
@@ -1266,6 +1817,16 @@ def main():
         raise SystemExit("--aggregate-threads must be positive")
     if args.aggregate_queue_depth <= 0:
         raise SystemExit("--aggregate-queue-depth must be positive")
+    if args.parquet_prefetch_workers <= 0:
+        raise SystemExit("--parquet-prefetch-workers must be positive")
+    if args.parquet_prefetch_queue_depth <= 0:
+        raise SystemExit("--parquet-prefetch-queue-depth must be positive")
+    if args.parquet_prefetch_merge_gap < 0:
+        raise SystemExit("--parquet-prefetch-merge-gap must be non-negative")
+    if args.parquet_prefetch_extra_bytes < 0:
+        raise SystemExit("--parquet-prefetch-extra-bytes must be non-negative")
+
+    use_row_order_reduce = should_use_row_order_reduce(args)
 
     if args.split_file_io and args.read_mode != "per-file":
         raise SystemExit("--split-file-io requires --read-mode per-file")
@@ -1326,9 +1887,14 @@ def main():
             "batch_id": 0,
             "files": len(parquet_paths),
             "read": fact_profile["elapsed"],
+            "prefetch": 0.0,
+            "prefetch_bytes": 0,
+            "prefetch_ranges": 0,
+            "prefetch_method": "off",
             "file_io": 0.0,
             "decode": fact_profile["elapsed"],
             "io_method": "cudf",
+            "decode_source": "path",
             "io_fallback_reason": "",
             "rows": fact_profile["rows"],
             "rchar": fact_profile["rchar"],
@@ -1339,35 +1905,49 @@ def main():
             "groupby": 0.0,
         }
 
-        if args.infer_grid_from_row_order:
-            join_start = time.time()
-            joined = attach_group_from_row_order(cudf, fact, dim, args.group_column)
+        if use_row_order_reduce:
+            join_elapsed = 0.0
+            row_count = len(fact)
+            reduce_plan = build_row_order_reduce_plan(dim, args.group_column)
+            group_start = time.time()
+            sums, counts, row_counts = aggregate_row_order_reduce(
+                cudf,
+                fact,
+                args.group_column,
+                payload_columns,
+                reduce_plan,
+                detail_timers,
+                need_counts=args.print_results,
+                need_row_counts=args.print_results,
+            )
             cuda_synchronize()
-            join_elapsed = time.time() - join_start
-            join_seconds += join_elapsed
-            detail_timers["join"] += join_elapsed
+            group_elapsed = time.time() - group_start
         else:
             join_start = time.time()
-            joined = fact.merge(dim, on=args.join_key, how="inner")
+            if args.infer_grid_from_row_order:
+                joined = attach_group_from_row_order(cudf, fact, dim, args.group_column)
+            else:
+                joined = fact.merge(dim, on=args.join_key, how="inner")
             cuda_synchronize()
             join_elapsed = time.time() - join_start
-            join_seconds += join_elapsed
-            detail_timers["join"] += join_elapsed
-        batch_profile["join"] = join_elapsed
-        row_count = len(joined)
+            row_count = len(joined)
 
-        group_start = time.time()
-        sums, counts, row_counts = aggregate_joined(
-            joined,
-            args.group_column,
-            payload_columns,
-            args.assume_payload_all_valid,
-            detail_timers,
-            need_counts=args.print_results,
-            need_row_counts=args.print_results,
-        )
-        cuda_synchronize()
-        group_elapsed = time.time() - group_start
+            group_start = time.time()
+            sums, counts, row_counts = aggregate_joined(
+                joined,
+                args.group_column,
+                payload_columns,
+                args.assume_payload_all_valid,
+                detail_timers,
+                need_counts=args.print_results,
+                need_row_counts=args.print_results,
+            )
+            cuda_synchronize()
+            group_elapsed = time.time() - group_start
+            del joined
+        join_seconds += join_elapsed
+        detail_timers["join"] += join_elapsed
+        batch_profile["join"] = join_elapsed
         group_seconds += group_elapsed
         detail_timers["aggregate_wall"] += group_elapsed
         batch_profile["groupby"] = group_elapsed
@@ -1376,7 +1956,6 @@ def main():
         append_frame(row_count_frames, row_counts)
         batch_profiles.append(batch_profile)
         del fact
-        del joined
 
     merge_start = time.time()
     total_sums = combine_frames(cudf, sum_frames, args.group_column, payload_columns, detail_timers)
@@ -1411,6 +1990,7 @@ def main():
     if args.split_file_io:
         print("[split file io]: on")
         print("[file io method]: {}".format(args.file_io_method))
+        print("[decode source]: {}".format(args.decode_source))
         if args.file_io_method == "io_uring":
             print("[file io sqpoll]: {}".format("on" if args.file_io_sqpoll else "off"))
             if args.file_io_sqpoll:
@@ -1419,10 +1999,18 @@ def main():
         print("[decode threads]: {}".format(args.decode_threads))
         print("[aggregate threads]: {}".format(args.aggregate_threads))
         print("[aggregate queue depth]: {}".format(args.aggregate_queue_depth))
+        print("[parquet column prefetch]: {}".format("on" if args.parquet_column_prefetch else "off"))
+        if args.parquet_column_prefetch:
+            print("[parquet prefetch method]: {}".format(args.parquet_prefetch_method))
+            print("[parquet prefetch workers]: {}".format(args.parquet_prefetch_workers))
+            print("[parquet prefetch queue depth]: {}".format(args.parquet_prefetch_queue_depth))
+            print("[parquet prefetch merge gap]: {}".format(args.parquet_prefetch_merge_gap))
+            print("[parquet prefetch extra bytes]: {}".format(args.parquet_prefetch_extra_bytes))
     if args.assume_payload_all_valid:
         print("[assume payload all valid]: on")
     if args.infer_grid_from_row_order:
         print("[grid inference]: row-order")
+    print("[aggregate strategy]: {}".format("row-order-reduce" if use_row_order_reduce else "cudf-groupby"))
     print("[variable count]: {}".format(len(payload_columns)))
     if args.print_stage_times:
         print(
@@ -1433,11 +2021,13 @@ def main():
         print(
             "[stage detail] dimension_read={:.6f}s fact_read={:.6f}s join={:.6f}s "
             "groupby_size={:.6f}s groupby_sum={:.6f}s groupby_count={:.6f}s "
-            "count_from_rows={:.6f}s merge_concat={:.6f}s merge_groupby={:.6f}s "
+            "count_from_rows={:.6f}s row_order_reduce={:.6f}s "
+            "merge_concat={:.6f}s merge_groupby={:.6f}s "
             "row_count_sum={:.6f}s reader_wall={:.6f}s aggregate_wall={:.6f}s "
             "file_io_read={:.6f}s file_io_wall={:.6f}s decode_materialize={:.6f}s "
             "decode_wall={:.6f}s aggregate_stage_wall={:.6f}s "
-            "io_uring_fallbacks={} rmm_setup={:.6f}s".format(
+            "parquet_prefetch={:.6f}s parquet_prefetch_wall={:.6f}s "
+            "io_uring_fallbacks={} parquet_prefetch_fallbacks={} rmm_setup={:.6f}s".format(
                 detail_timers["dimension_read"],
                 detail_timers["fact_read"],
                 detail_timers["join"],
@@ -1445,6 +2035,7 @@ def main():
                 detail_timers["groupby_sum"],
                 detail_timers["groupby_count"],
                 detail_timers["count_from_rows"],
+                detail_timers["row_order_reduce"],
                 detail_timers["merge_concat"],
                 detail_timers["merge_groupby"],
                 detail_timers["row_count_sum"],
@@ -1455,15 +2046,38 @@ def main():
                 detail_timers["decode_materialize"],
                 detail_timers["decode_wall"],
                 detail_timers["aggregate_stage_wall"],
+                detail_timers["parquet_prefetch"],
+                detail_timers["parquet_prefetch_wall"],
                 detail_timers["io_uring_fallbacks"],
+                detail_timers["parquet_prefetch_fallbacks"],
                 detail_timers["rmm_setup"],
             )
         )
+        if detail_timers["parquet_prefetch"] > 0:
+            prefetch_mib = float(detail_timers["parquet_prefetch_bytes"]) / (1024.0 * 1024.0)
+            prefetch_read_mib = float(detail_timers["parquet_prefetch_read_bytes"]) / (1024.0 * 1024.0)
+            prefetch_rchar_mib = float(detail_timers["parquet_prefetch_rchar"]) / (1024.0 * 1024.0)
+            print(
+                "[parquet prefetch] files={} ranges={} bytes={} ({:.2f} MiB) "
+                "read_bytes={} ({:.2f} MiB) rchar={} ({:.2f} MiB) syscr={}".format(
+                    detail_timers["parquet_prefetch_files"],
+                    detail_timers["parquet_prefetch_ranges"],
+                    detail_timers["parquet_prefetch_bytes"],
+                    prefetch_mib,
+                    detail_timers["parquet_prefetch_read_bytes"],
+                    prefetch_read_mib,
+                    detail_timers["parquet_prefetch_rchar"],
+                    prefetch_rchar_mib,
+                    detail_timers["parquet_prefetch_syscr"],
+                )
+            )
         if detail_timers["fact_read"] > 0:
             read_mib = float(detail_timers["fact_read_bytes"]) / (1024.0 * 1024.0)
             rchar_mib = float(detail_timers["fact_rchar"]) / (1024.0 * 1024.0)
             materialized_mib = float(detail_timers["materialized_bytes"]) / (1024.0 * 1024.0)
             read_rate_seconds = detail_timers["file_io_read"] or detail_timers["fact_read"]
+            if args.split_file_io and args.file_io_method == "mmap":
+                read_rate_seconds = detail_timers["file_io_read"] + detail_timers["decode_materialize"]
             print(
                 "[read io] fact_read_bytes={} ({:.2f} MiB) fact_rchar={} ({:.2f} MiB) "
                 "fact_syscr={} materialized_bytes={} ({:.2f} MiB) storage_read_rate={:.2f} MiB/s".format(
@@ -1490,7 +2104,10 @@ def main():
         for profile in sorted(batch_profiles, key=lambda item: item["batch_id"]):
             print(
                 "batch={batch_id} files={files} rows={rows} read={read:.6f}s "
+                "prefetch={prefetch:.6f}s prefetch_ranges={prefetch_ranges} "
+                "prefetch_bytes={prefetch_bytes} prefetch_method={prefetch_method} "
                 "file_io={file_io:.6f}s decode={decode:.6f}s io_method={io_method} "
+                "decode_source={decode_source} "
                 "join={join:.6f}s "
                 "groupby={groupby:.6f}s read_bytes={read_bytes} rchar={rchar} "
                 "syscr={syscr} materialized_bytes={materialized_bytes}".format(**profile)
