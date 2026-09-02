@@ -310,6 +310,44 @@ __global__ void DuckDBGpuFusedLatAggMultiStridedKernel(
 	                             row_count_out, row);
 }
 
+__global__ void DuckDBGpuFusedLatAggMultiRowOrderKernel(
+    const double *values, const uint8_t *value_validity, uint64_t column_count, uint64_t value_stride,
+    uint64_t count, uint64_t row_base, int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group,
+    uint64_t build_size, uint64_t group_count, double *sum_out, unsigned long long *count_out,
+    unsigned long long *row_count_out) {
+	const auto row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	if (row >= count || build_size == 0) {
+		return;
+	}
+
+	const auto grid = static_cast<int64_t>((row_base + row) % build_size);
+	if (grid < grid_min || grid > grid_max) {
+		return;
+	}
+
+	const auto build_idx = static_cast<uint64_t>(grid - grid_min);
+	if (build_idx >= build_size) {
+		return;
+	}
+
+	const auto group_i32 = grid_to_group[build_idx];
+	if (group_i32 < 0) {
+		return;
+	}
+
+	const auto group = static_cast<uint64_t>(group_i32);
+	atomicAdd(&row_count_out[group], 1ULL);
+
+	for (uint64_t column = 0; column < column_count; column++) {
+		const auto input_idx = column * value_stride + row;
+		if (!value_validity || value_validity[input_idx] != 0) {
+			const auto output_idx = column * group_count + group;
+			AtomicAddDouble(&sum_out[output_idx], values[input_idx]);
+			atomicAdd(&count_out[output_idx], 1ULL);
+		}
+	}
+}
+
 int CheckCuda(cudaError_t status, const char *step) {
 	if (status == cudaSuccess) {
 		return 0;
@@ -1992,6 +2030,59 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_prepare_input_i64_double(
 	return 0;
 }
 
+extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_prepare_row_order_input_i64_double(
+    void *handle, uint32_t slot_idx, uint64_t capacity, uint64_t column_count, double **values_out,
+    uint8_t **value_validity_out) {
+	if (!handle || !values_out || !value_validity_out || capacity == 0 || column_count == 0) {
+		return 1;
+	}
+
+	auto state = reinterpret_cast<FusedLatAggPipelineState *>(handle);
+	if (slot_idx >= state->slot_count) {
+		return 1;
+	}
+	auto &slot = state->slots[slot_idx];
+	if (slot.EnsureStream()) {
+		return 1;
+	}
+	if (slot.IsDevice()) {
+		return 1;
+	}
+
+	const auto value_bytes = column_count * capacity * sizeof(double);
+	const auto validity_bytes = column_count * capacity * sizeof(uint8_t);
+	const bool assume_all_valid = AssumePayloadAllValid();
+
+	int error = 0;
+	if (slot.IsMapped()) {
+		error |= slot.mapped_values.Ensure(value_bytes, "resize mapped row-order direct multi pipeline values");
+		if (!assume_all_valid) {
+			error |= slot.mapped_value_validity.Ensure(validity_bytes,
+			                                           "resize mapped row-order direct multi pipeline validity");
+		}
+		if (error) {
+			return 1;
+		}
+		*values_out = slot.mapped_values.HostAs<double>();
+		*value_validity_out = assume_all_valid ? nullptr : slot.mapped_value_validity.HostAs<uint8_t>();
+	} else {
+		error |= slot.managed_values.Ensure(value_bytes, "resize managed row-order direct multi pipeline values");
+		if (!assume_all_valid) {
+			error |= slot.managed_value_validity.Ensure(validity_bytes,
+			                                            "resize managed row-order direct multi pipeline validity");
+		}
+		if (error) {
+			return 1;
+		}
+		*values_out = slot.managed_values.As<double>();
+		*value_validity_out = assume_all_valid ? nullptr : slot.managed_value_validity.As<uint8_t>();
+	}
+
+	slot.column_count = column_count;
+	slot.value_stride = capacity;
+	return 0;
+}
+
 extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_prepare_device_input_i64_double(
     void *handle, uint32_t slot_idx, uint64_t capacity, uint64_t column_count) {
 	if (!handle || capacity == 0 || column_count == 0) {
@@ -2205,6 +2296,59 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_submit_prepared_i64_doubl
 	    d_grid_to_group, slot.build_size, slot.group_count, slot.sums.As<double>(),
 	    slot.counts.As<unsigned long long>(), slot.row_counts.As<unsigned long long>());
 	if (CheckCuda(cudaGetLastError(), "launch prepared direct multi pipeline fused lat aggregate kernel")) {
+		return 1;
+	}
+
+	slot.count += count;
+	slot.column_count = column_count;
+	slot.value_stride = value_stride;
+	slot.active = true;
+	return 0;
+}
+
+extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_submit_prepared_row_order_i64_double(
+    void *handle, uint32_t slot_idx, uint64_t count, uint64_t column_count, uint64_t value_stride,
+    uint64_t row_base) {
+	if (!handle || count == 0 || column_count == 0 || value_stride < count) {
+		return 1;
+	}
+
+	auto state = reinterpret_cast<FusedLatAggPipelineState *>(handle);
+	if (slot_idx >= state->slot_count) {
+		return 1;
+	}
+	auto &slot = state->slots[slot_idx];
+	if (slot.EnsureStream()) {
+		return 1;
+	}
+	if (slot.group_count == 0 || slot.build_size == 0) {
+		return 1;
+	}
+
+	double *d_values = nullptr;
+	uint8_t *d_value_validity = nullptr;
+	int32_t *d_grid_to_group = nullptr;
+	if (slot.IsMapped()) {
+		d_values = slot.mapped_values.DeviceAs<double>();
+		d_value_validity = AssumePayloadAllValid() ? nullptr : slot.mapped_value_validity.DeviceAs<uint8_t>();
+		d_grid_to_group = slot.mapped_grid_to_group.DeviceAs<int32_t>();
+	} else if (slot.IsManaged()) {
+		d_values = slot.managed_values.As<double>();
+		d_value_validity = AssumePayloadAllValid() ? nullptr : slot.managed_value_validity.As<uint8_t>();
+		d_grid_to_group = slot.managed_grid_to_group.As<int32_t>();
+	} else {
+		d_values = slot.values.As<double>();
+		d_value_validity = AssumePayloadAllValid() ? nullptr : slot.value_validity.As<uint8_t>();
+		d_grid_to_group = slot.grid_to_group.As<int32_t>();
+	}
+
+	constexpr int THREADS_PER_BLOCK = 256;
+	const auto blocks = static_cast<unsigned int>((count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+	DuckDBGpuFusedLatAggMultiRowOrderKernel<<<blocks, THREADS_PER_BLOCK, 0, slot.stream>>>(
+	    d_values, d_value_validity, column_count, value_stride, count, row_base, slot.grid_min, slot.grid_max,
+	    d_grid_to_group, slot.build_size, slot.group_count, slot.sums.As<double>(),
+	    slot.counts.As<unsigned long long>(), slot.row_counts.As<unsigned long long>());
+	if (CheckCuda(cudaGetLastError(), "launch row-order prepared direct multi pipeline fused lat aggregate kernel")) {
 		return 1;
 	}
 

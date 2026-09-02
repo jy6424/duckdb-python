@@ -94,6 +94,9 @@ using FusedLatAggPipelineDestroyFunc = void (*)(void *handle);
 using FusedLatAggMultiPipelinePrepareInputFunc = int (*)(void *handle, uint32_t slot_idx, uint64_t capacity,
                                                          uint64_t column_count, int64_t **grids_out,
                                                          double **values_out, uint8_t **value_validity_out);
+using FusedLatAggMultiPipelinePrepareRowOrderInputFunc = int (*)(void *handle, uint32_t slot_idx, uint64_t capacity,
+                                                                 uint64_t column_count, double **values_out,
+                                                                 uint8_t **value_validity_out);
 using FusedLatAggMultiPipelinePrepareDeviceInputFunc = int (*)(void *handle, uint32_t slot_idx, uint64_t capacity,
                                                                uint64_t column_count);
 using FusedLatAggMultiPipelineCopyGridsFunc = int (*)(void *handle, uint32_t slot_idx, uint64_t dst_offset,
@@ -108,6 +111,9 @@ using FusedLatAggMultiPipelineResetFunc = int (*)(void *handle, uint32_t slot_id
                                                   uint64_t column_count);
 using FusedLatAggMultiPipelineSubmitPreparedFunc = int (*)(void *handle, uint32_t slot_idx, uint64_t count,
                                                            uint64_t column_count, uint64_t value_stride);
+using FusedLatAggMultiPipelineSubmitPreparedRowOrderFunc = int (*)(void *handle, uint32_t slot_idx, uint64_t count,
+                                                                   uint64_t column_count, uint64_t value_stride,
+                                                                   uint64_t row_base);
 using FusedLatAggMultiPipelineWaitFunc = int (*)(void *handle, uint32_t slot_idx, double *sum_out,
                                                  uint64_t *count_out, uint64_t *row_count_out);
 
@@ -126,11 +132,13 @@ struct FusedLatAggPipelineFuncs {
 struct FusedLatAggMultiDirectPipelineFuncs {
 	FusedLatAggPipelineCreateFunc create = nullptr;
 	FusedLatAggMultiPipelinePrepareInputFunc prepare_input = nullptr;
+	FusedLatAggMultiPipelinePrepareRowOrderInputFunc prepare_row_order_input = nullptr;
 	FusedLatAggMultiPipelinePrepareDeviceInputFunc prepare_device_input = nullptr;
 	FusedLatAggMultiPipelineCopyGridsFunc copy_grids = nullptr;
 	FusedLatAggMultiPipelineCopyValuesFunc copy_values = nullptr;
 	FusedLatAggMultiPipelineResetFunc reset = nullptr;
 	FusedLatAggMultiPipelineSubmitPreparedFunc submit_prepared = nullptr;
+	FusedLatAggMultiPipelineSubmitPreparedRowOrderFunc submit_prepared_row_order = nullptr;
 	FusedLatAggPipelineSyncSlotFunc sync_slot = nullptr;
 	FusedLatAggMultiPipelineWaitFunc wait = nullptr;
 	FusedLatAggPipelineDestroyFunc destroy = nullptr;
@@ -496,6 +504,8 @@ static FusedLatAggMultiDirectPipelineFuncs LoadFusedLatAggMultiDirectPipeline(co
 	    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_create"));
 	funcs.prepare_input = reinterpret_cast<FusedLatAggMultiPipelinePrepareInputFunc>(
 	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_prepare_input_i64_double"));
+	funcs.prepare_row_order_input = reinterpret_cast<FusedLatAggMultiPipelinePrepareRowOrderInputFunc>(
+	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_prepare_row_order_input_i64_double"));
 	funcs.prepare_device_input = reinterpret_cast<FusedLatAggMultiPipelinePrepareDeviceInputFunc>(
 	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_prepare_device_input_i64_double"));
 	funcs.copy_grids = reinterpret_cast<FusedLatAggMultiPipelineCopyGridsFunc>(
@@ -506,6 +516,8 @@ static FusedLatAggMultiDirectPipelineFuncs LoadFusedLatAggMultiDirectPipeline(co
 	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_reset_i64_double"));
 	funcs.submit_prepared = reinterpret_cast<FusedLatAggMultiPipelineSubmitPreparedFunc>(
 	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_submit_prepared_i64_double"));
+	funcs.submit_prepared_row_order = reinterpret_cast<FusedLatAggMultiPipelineSubmitPreparedRowOrderFunc>(
+	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_submit_prepared_row_order_i64_double"));
 	funcs.sync_slot =
 	    reinterpret_cast<FusedLatAggPipelineSyncSlotFunc>(dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_sync_slot"));
 	funcs.wait = reinterpret_cast<FusedLatAggMultiPipelineWaitFunc>(
@@ -1194,6 +1206,7 @@ struct DirectMultiPipelineInputBatch {
 	std::shared_ptr<GroupMapping> mapping;
 	idx_t slot = 0;
 	idx_t row_count = 0;
+	idx_t row_base = 0;
 	idx_t value_stride = 0;
 	idx_t column_count = 0;
 };
@@ -1205,6 +1218,7 @@ struct DirectMultiPipelineBuffer {
 	std::shared_ptr<GroupMapping> mapping;
 	idx_t slot = 0;
 	idx_t row_count = 0;
+	idx_t row_base = 0;
 	idx_t chunks = 0;
 	idx_t value_stride = 0;
 	idx_t column_count = 0;
@@ -1617,7 +1631,19 @@ static void StartDirectMultiPipelineBuffer(FusedLatAggMultiDirectPipelineFuncs p
 	int64_t *join_keys = nullptr;
 	double *values = nullptr;
 	uint8_t *validity = nullptr;
-	if (device_direct) {
+	auto row_order_direct_submit = ReadEnvFlag("DUCKDB_GPU_ROW_ORDER_DIRECT_SUBMIT", false);
+	if (row_order_direct_submit) {
+		if (!pipeline.prepare_row_order_input) {
+			throw InvalidInputException("GPU helper library does not provide row-order direct input preparation");
+		}
+		auto rc = pipeline.prepare_row_order_input(handle, static_cast<uint32_t>(slot),
+		                                           static_cast<uint64_t>(target_batch_rows),
+		                                           static_cast<uint64_t>(column_count), &values, &validity);
+		if (rc != 0 || !values || (!validity && !AssumePayloadAllValid())) {
+			throw InvalidInputException("GPU fused row-order direct input preparation failed for '%s'",
+			                            chunk_batch.fact_path);
+		}
+	} else if (device_direct) {
 		auto rc = pipeline.prepare_device_input(handle, static_cast<uint32_t>(slot),
 		                                        static_cast<uint64_t>(target_batch_rows),
 		                                        static_cast<uint64_t>(column_count));
@@ -1640,6 +1666,7 @@ static void StartDirectMultiPipelineBuffer(FusedLatAggMultiDirectPipelineFuncs p
 	current.fact_path = chunk_batch.fact_path;
 	current.mapping = chunk_batch.mapping;
 	current.slot = slot;
+	current.row_base = chunk_batch.row_base;
 	current.value_stride = target_batch_rows;
 	current.column_count = column_count;
 	current.join_keys = join_keys;
@@ -2831,6 +2858,7 @@ static void FlushDirectMappedDecodedBatch(DirectMultiPipelineBuffer &current,
 	batch.mapping = current.mapping;
 	batch.slot = current.slot;
 	batch.row_count = current.row_count;
+	batch.row_base = current.row_base;
 	batch.value_stride = current.value_stride;
 	batch.column_count = current.column_count;
 	auto push_start = std::chrono::steady_clock::now();
@@ -2932,24 +2960,30 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 		if (!InferGridFromRowOrder()) {
 			throw InvalidInputException("direct parquet decode requires row-order grid inference");
 		}
+		auto row_order_direct_submit = ReadEnvFlag("DUCKDB_GPU_ROW_ORDER_DIRECT_SUBMIT", false);
+		if (row_order_direct_submit && !AssumePayloadAllValid()) {
+			throw InvalidInputException("row-order direct submit currently requires DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID=1");
+		}
 		auto target_batch_rows = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_ROWS", 65536);
 		auto target_batch_chunks = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_CHUNKS", 32);
 		if (target_batch_rows < STANDARD_VECTOR_SIZE || target_batch_chunks == 0) {
 			throw InvalidInputException(
 			    "direct parquet decode requires DUCKDB_GPU_PIPELINE_BATCH_ROWS >= STANDARD_VECTOR_SIZE and chunks > 0");
 		}
-		decoded_queue_depth =
-		    ReadEnvIdx("DUCKDB_GPU_PIPELINE_DECODE_QUEUE_DEPTH", AssumePayloadAllValid() ? 64 : 8);
-		if (decoded_queue_depth == 0) {
-			decoded_queue_depth = 1;
+		if (!row_order_direct_submit) {
+			decoded_queue_depth =
+			    ReadEnvIdx("DUCKDB_GPU_PIPELINE_DECODE_QUEUE_DEPTH", AssumePayloadAllValid() ? 64 : 8);
+			if (decoded_queue_depth == 0) {
+				decoded_queue_depth = 1;
+			}
+			decoded_queue = make_uniq<BlockingQueue<DirectMappedDecodedEvent>>(decoded_queue_depth);
+			emit_thread = make_uniq<std::thread>(
+			    RunDirectMappedDecodedEmitWorker, std::ref(*decoded_queue), std::ref(input_queue), std::ref(free_slots),
+			    std::ref(batch_count), std::ref(prepare_stage_elapsed), std::ref(prepare_pop_elapsed),
+			    std::ref(prepare_push_elapsed), std::ref(direct_finish_chunk_elapsed), std::ref(direct_flush_elapsed),
+			    std::ref(error_out), std::ref(error_lock));
+			emit_thread_started = true;
 		}
-		decoded_queue = make_uniq<BlockingQueue<DirectMappedDecodedEvent>>(decoded_queue_depth);
-		emit_thread = make_uniq<std::thread>(
-		    RunDirectMappedDecodedEmitWorker, std::ref(*decoded_queue), std::ref(input_queue), std::ref(free_slots),
-		    std::ref(batch_count), std::ref(prepare_stage_elapsed), std::ref(prepare_pop_elapsed),
-		    std::ref(prepare_push_elapsed), std::ref(direct_finish_chunk_elapsed), std::ref(direct_flush_elapsed),
-		    std::ref(error_out), std::ref(error_lock));
-		emit_thread_started = true;
 
 		auto connection_start = std::chrono::steady_clock::now();
 		Connection connection(db);
@@ -3008,12 +3042,33 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 				if (!current) {
 					return;
 				}
-				DirectMappedDecodedEvent event;
-				event.type = DirectMappedDecodedEventType::FLUSH;
-				event.buffer = current;
-				auto push_start = std::chrono::steady_clock::now();
-				decoded_queue->Push(std::move(event));
-				push_elapsed += ElapsedSeconds(push_start);
+				if (row_order_direct_submit) {
+					auto flush_start = std::chrono::steady_clock::now();
+					if (current->row_count == 0) {
+						free_slots.Push(current->slot);
+					} else {
+						DirectMultiPipelineInputBatch batch;
+						batch.fact_path = current->fact_path;
+						batch.mapping = current->mapping;
+						batch.slot = current->slot;
+						batch.row_count = current->row_count;
+						batch.row_base = current->row_base;
+						batch.value_stride = current->value_stride;
+						batch.column_count = current->column_count;
+						auto push_start = std::chrono::steady_clock::now();
+						input_queue.Push(std::move(batch));
+						push_elapsed += ElapsedSeconds(push_start);
+						batch_count++;
+					}
+					direct_flush_elapsed += ElapsedSeconds(flush_start);
+				} else {
+					DirectMappedDecodedEvent event;
+					event.type = DirectMappedDecodedEventType::FLUSH;
+					event.buffer = current;
+					auto push_start = std::chrono::steady_clock::now();
+					decoded_queue->Push(std::move(event));
+					push_elapsed += ElapsedSeconds(push_start);
+				}
 				current.reset();
 				reserved_rows = 0;
 				reserved_chunks = 0;
@@ -3026,6 +3081,7 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 					MultiPipelineChunkBatch start_batch;
 					start_batch.fact_path = fact_path;
 					start_batch.mapping = mapping;
+					start_batch.row_base = fact_row_base;
 					current = std::make_shared<DirectMultiPipelineBuffer>();
 					StartDirectMultiPipelineBuffer(pipeline, handle, free_slots, target_batch_rows,
 					                               payload_columns.size(), start_batch, *current, false);
@@ -3061,19 +3117,24 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 				fetch_nonempty_elapsed += fetch_call_elapsed;
 				direct_decode_materialize_elapsed += fetch_call_elapsed;
 				auto result_size = result->size();
-				DirectMappedDecodedEvent event;
-				event.type = DirectMappedDecodedEventType::CHUNK;
-				event.buffer = current;
-				if (!AssumePayloadAllValid()) {
-					event.chunk = std::move(result);
+				if (row_order_direct_submit) {
+					current->row_count += result_size;
+					current->chunks++;
+				} else {
+					DirectMappedDecodedEvent event;
+					event.type = DirectMappedDecodedEventType::CHUNK;
+					event.buffer = current;
+					if (!AssumePayloadAllValid()) {
+						event.chunk = std::move(result);
+					}
+					event.chunk_row_base = fact_row_base;
+					event.output_row = output_row;
+					event.column_count = payload_columns.size();
+					event.row_count = result_size;
+					auto push_start = std::chrono::steady_clock::now();
+					decoded_queue->Push(std::move(event));
+					push_elapsed += ElapsedSeconds(push_start);
 				}
-				event.chunk_row_base = fact_row_base;
-				event.output_row = output_row;
-				event.column_count = payload_columns.size();
-				event.row_count = result_size;
-				auto push_start = std::chrono::steady_clock::now();
-				decoded_queue->Push(std::move(event));
-				push_elapsed += ElapsedSeconds(push_start);
 				fact_row_base += result_size;
 				reserved_rows += result_size;
 				reserved_chunks++;
@@ -3255,6 +3316,7 @@ static void PrepareDirectMultiPipelineChunkBatches(FusedLatAggMultiDirectPipelin
 			batch.mapping = current.mapping;
 			batch.slot = current.slot;
 			batch.row_count = current.row_count;
+			batch.row_base = current.row_base;
 			batch.value_stride = current.value_stride;
 			batch.column_count = current.column_count;
 			auto push_start = std::chrono::steady_clock::now();
@@ -3745,6 +3807,15 @@ static void RunDirectMultiPipelineGPUWorker(FusedLatAggMultiDirectPipelineFuncs 
 	double work_elapsed = 0;
 	double push_elapsed = 0;
 	try {
+		auto row_order_direct_submit = ReadEnvFlag("DUCKDB_GPU_ROW_ORDER_DIRECT_SUBMIT", false);
+		if (row_order_direct_submit) {
+			if (!InferGridFromRowOrder()) {
+				throw InvalidInputException("row-order direct submit requires row-order grid inference");
+			}
+			if (!pipeline.submit_prepared_row_order) {
+				throw InvalidInputException("GPU helper library does not provide row-order direct submit support");
+			}
+		}
 		struct ActiveFile {
 			bool active = false;
 			string fact_path;
@@ -3816,10 +3887,19 @@ static void RunDirectMultiPipelineGPUWorker(FusedLatAggMultiDirectPipelineFuncs 
 			}
 
 			auto gpu_start = std::chrono::steady_clock::now();
-			auto rc = pipeline.submit_prepared(handle, static_cast<uint32_t>(batch.slot),
-			                                   static_cast<uint64_t>(batch.row_count),
-			                                   static_cast<uint64_t>(batch.column_count),
-			                                   static_cast<uint64_t>(batch.value_stride));
+			int rc = 0;
+			if (row_order_direct_submit) {
+				rc = pipeline.submit_prepared_row_order(handle, static_cast<uint32_t>(batch.slot),
+				                                        static_cast<uint64_t>(batch.row_count),
+				                                        static_cast<uint64_t>(batch.column_count),
+				                                        static_cast<uint64_t>(batch.value_stride),
+				                                        static_cast<uint64_t>(batch.row_base));
+			} else {
+				rc = pipeline.submit_prepared(handle, static_cast<uint32_t>(batch.slot),
+				                              static_cast<uint64_t>(batch.row_count),
+				                              static_cast<uint64_t>(batch.column_count),
+				                              static_cast<uint64_t>(batch.value_stride));
+			}
 			if (rc != 0) {
 				throw InvalidInputException("GPU fused direct multi pipeline prepared submit failed for '%s'",
 				                            batch.fact_path);
@@ -4301,6 +4381,11 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 			auto direct_parquet_decode =
 			    pipeline_mapped_direct_mode && InferGridFromRowOrder() &&
 			    ReadEnvFlag("DUCKDB_GPU_PARQUET_DIRECT_DECODE", false);
+			if (ReadEnvFlag("DUCKDB_GPU_ROW_ORDER_DIRECT_SUBMIT", false) && !direct_parquet_decode) {
+				throw InvalidInputException(
+				    "row-order direct submit requires pipeline-mapped-direct mode with direct parquet decode and "
+				    "row-order grid inference");
+			}
 			if (direct_parquet_decode) {
 				for (auto &fact_path : fact_paths) {
 					file_queue.Push(fact_path);

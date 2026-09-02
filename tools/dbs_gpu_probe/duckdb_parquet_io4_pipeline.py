@@ -105,6 +105,11 @@ def parse_args():
         help="decode Parquet DOUBLE payload columns directly into mapped GPU pipeline slot buffers",
     )
     parser.add_argument(
+        "--row-order-direct-submit",
+        action="store_true",
+        help="with direct parquet decode, derive grid ids in the GPU kernel and submit decoded values directly",
+    )
+    parser.add_argument(
         "--assume-payload-all-valid",
         action="store_true",
         help="treat payload DOUBLE columns as non-null and skip validity buffer generation/copy",
@@ -134,7 +139,7 @@ def parse_args():
         "--lib",
         default=os.environ.get(
             "DUCKDB_GPU_PROBE_LIB",
-            "/home/jiwan/duckdb-python-pipeline/tools/dbs_gpu_probe/libduckdb_gpu_probe.so",
+            os.path.join(os.path.dirname(__file__), "libduckdb_gpu_probe.so"),
         ),
     )
     parser.add_argument(
@@ -246,6 +251,12 @@ def main():
             raise SystemExit("--cudf-device must be non-negative")
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(args.cudf_device))
         os.environ["DUCKDB_GPU_CUDF_DEVICE"] = str(args.cudf_device)
+    if args.row_order_direct_submit:
+        if args.mode != "pipeline-mapped-direct":
+            raise SystemExit("--row-order-direct-submit requires --mode pipeline-mapped-direct")
+        args.parquet_direct_decode = True
+        args.assume_payload_all_valid = True
+        args.infer_grid_from_row_order = True
     if len(payload_columns) > 1 and args.mode in ("pipeline-managed", "pipeline-cpu"):
         raise SystemExit(
             "{} does not support --vars yet; use pipeline-device, pipeline-device-direct, pipeline-mapped, "
@@ -313,6 +324,11 @@ def main():
         os.environ["DUCKDB_PARQUET_PIPELINED_PAGE_READ_BYTES"] = str(args.parquet_pipelined_page_read_bytes)
     if args.parquet_direct_decode:
         os.environ["DUCKDB_GPU_PARQUET_DIRECT_DECODE"] = "1"
+    if args.row_order_direct_submit:
+        os.environ["DUCKDB_GPU_ROW_ORDER_DIRECT_SUBMIT"] = "1"
+        os.environ.setdefault("DUCKDB_GPU_PARQUET_DIRECT_DECODE", "1")
+        os.environ.setdefault("DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID", "1")
+        os.environ.setdefault("DUCKDB_GPU_INFER_GRID_FROM_ROW_ORDER", "1")
     if args.assume_payload_all_valid:
         os.environ["DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID"] = "1"
     if args.fetch_raw or (not args.regular_fetch and args.mode.startswith("pipeline-")):
@@ -405,6 +421,8 @@ def main():
         print("[parquet direct decode]: on")
         if args.mode == "pipeline-mapped-direct" and args.infer_grid_from_row_order:
             print("[direct decode emit split]: on")
+    if os.environ.get("DUCKDB_GPU_ROW_ORDER_DIRECT_SUBMIT") == "1":
+        print("[row-order direct submit]: on")
     if os.environ.get("DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID") == "1":
         print("[assume payload all valid]: on")
     if os.environ.get("DUCKDB_GPU_FETCH_RAW") == "1":
