@@ -2792,21 +2792,31 @@ static void ConfigureDirectParquetReaderProjection(ParquetReader &reader, const 
 	}
 }
 
-static void MakeDirectMappedParquetOutputChunk(DataChunk &result, DirectMultiPipelineBuffer &buffer, idx_t output_row,
-                                               idx_t column_count) {
+static vector<LogicalType> MakeDirectMappedPayloadTypes(idx_t column_count) {
 	vector<LogicalType> types;
 	types.reserve(column_count);
 	for (idx_t column = 0; column < column_count; column++) {
 		types.emplace_back(LogicalType::DOUBLE);
 	}
+	return types;
+}
+
+static void InitializeDirectMappedParquetOutputChunk(DataChunk &result, const vector<LogicalType> &types) {
 	result.InitializeEmpty(types);
+	result.SetCapacity(STANDARD_VECTOR_SIZE);
+}
+
+static void BindDirectMappedParquetOutputChunk(DataChunk &result, DirectMultiPipelineBuffer &buffer, idx_t output_row,
+                                               idx_t column_count) {
+	result.SetCardinality(0);
 	for (idx_t column = 0; column < column_count; column++) {
 		auto value_ptr = buffer.values + column * buffer.value_stride + output_row;
 		result.data[column].SetVectorType(VectorType::FLAT_VECTOR);
 		FlatVector::SetData(result.data[column], reinterpret_cast<data_ptr_t>(value_ptr));
-		FlatVector::Validity(result.data[column]).Reset(STANDARD_VECTOR_SIZE);
+		if (!AssumePayloadAllValid()) {
+			FlatVector::Validity(result.data[column]).Reset(STANDARD_VECTOR_SIZE);
+		}
 	}
-	result.SetCapacity(STANDARD_VECTOR_SIZE);
 }
 
 static void FinishDirectMappedDecodedChunk(DirectMultiPipelineBuffer &buffer, DataChunk *chunk, idx_t chunk_row_base,
@@ -2964,6 +2974,8 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 		if (row_order_direct_submit && !AssumePayloadAllValid()) {
 			throw InvalidInputException("row-order direct submit currently requires DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID=1");
 		}
+		auto direct_double_scan =
+		    row_order_direct_submit && ReadEnvFlag("DUCKDB_GPU_PARQUET_DIRECT_DOUBLE_SCAN", true);
 		auto target_batch_rows = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_ROWS", 65536);
 		auto target_batch_chunks = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_CHUNKS", 32);
 		if (target_batch_rows < STANDARD_VECTOR_SIZE || target_batch_chunks == 0) {
@@ -3038,6 +3050,15 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 			idx_t reserved_rows = 0;
 			idx_t reserved_chunks = 0;
 			idx_t fact_row_base = 0;
+			auto direct_payload_types = MakeDirectMappedPayloadTypes(payload_columns.size());
+			DataChunk row_order_direct_result;
+			if (row_order_direct_submit && !direct_double_scan) {
+				InitializeDirectMappedParquetOutputChunk(row_order_direct_result, direct_payload_types);
+			}
+			vector<double *> direct_outputs;
+			if (direct_double_scan) {
+				direct_outputs.resize(payload_columns.size());
+			}
 			auto flush_current = [&]() {
 				if (!current) {
 					return;
@@ -3092,13 +3113,34 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 
 				auto output_row = reserved_rows;
 				auto output_chunk_start = std::chrono::steady_clock::now();
-				auto result = make_uniq<DataChunk>();
-				MakeDirectMappedParquetOutputChunk(*result, *current, output_row, payload_columns.size());
+				std::unique_ptr<DataChunk> result_owner;
+				DataChunk *result = nullptr;
+				if (direct_double_scan) {
+					for (idx_t column = 0; column < payload_columns.size(); column++) {
+						direct_outputs[column] = current->values + column * current->value_stride + output_row;
+					}
+				} else if (row_order_direct_submit) {
+					BindDirectMappedParquetOutputChunk(row_order_direct_result, *current, output_row,
+					                                   payload_columns.size());
+					result = &row_order_direct_result;
+				} else {
+					result_owner = make_uniq<DataChunk>();
+					InitializeDirectMappedParquetOutputChunk(*result_owner, direct_payload_types);
+					BindDirectMappedParquetOutputChunk(*result_owner, *current, output_row, payload_columns.size());
+					result = result_owner.get();
+				}
 				auto output_chunk_elapsed = ElapsedSeconds(output_chunk_start);
 				prepare_work_elapsed += output_chunk_elapsed;
 				direct_output_chunk_elapsed += output_chunk_elapsed;
 				auto fetch_start = std::chrono::steady_clock::now();
-				auto scan_result = reader.Scan(context, scan_state, *result);
+				idx_t result_size = 0;
+				AsyncResult scan_result;
+				if (direct_double_scan) {
+					scan_result = reader.ScanDirectDoubles(context, scan_state, direct_outputs.data(),
+					                                      direct_outputs.size(), STANDARD_VECTOR_SIZE, result_size);
+				} else {
+					scan_result = reader.Scan(context, scan_state, *result);
+				}
 				if (scan_result.GetResultType() == AsyncResultType::BLOCKED) {
 					scan_result.ExecuteTasksSynchronously();
 				}
@@ -3111,12 +3153,14 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 					finished_fetches++;
 					break;
 				}
-				if (result->size() == 0) {
+				if (!direct_double_scan) {
+					result_size = result->size();
+				}
+				if (result_size == 0) {
 					continue;
 				}
 				fetch_nonempty_elapsed += fetch_call_elapsed;
 				direct_decode_materialize_elapsed += fetch_call_elapsed;
-				auto result_size = result->size();
 				if (row_order_direct_submit) {
 					current->row_count += result_size;
 					current->chunks++;
@@ -3125,7 +3169,7 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 					event.type = DirectMappedDecodedEventType::CHUNK;
 					event.buffer = current;
 					if (!AssumePayloadAllValid()) {
-						event.chunk = std::move(result);
+						event.chunk = std::move(result_owner);
 					}
 					event.chunk_row_base = fact_row_base;
 					event.output_row = output_row;

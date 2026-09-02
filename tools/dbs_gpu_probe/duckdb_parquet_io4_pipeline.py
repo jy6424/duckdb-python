@@ -327,6 +327,7 @@ def main():
     if args.row_order_direct_submit:
         os.environ["DUCKDB_GPU_ROW_ORDER_DIRECT_SUBMIT"] = "1"
         os.environ.setdefault("DUCKDB_GPU_PARQUET_DIRECT_DECODE", "1")
+        os.environ.setdefault("DUCKDB_GPU_PARQUET_DIRECT_DOUBLE_SCAN", "1")
         os.environ.setdefault("DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID", "1")
         os.environ.setdefault("DUCKDB_GPU_INFER_GRID_FROM_ROW_ORDER", "1")
     if args.assume_payload_all_valid:
@@ -423,6 +424,8 @@ def main():
             print("[direct decode emit split]: on")
     if os.environ.get("DUCKDB_GPU_ROW_ORDER_DIRECT_SUBMIT") == "1":
         print("[row-order direct submit]: on")
+        if os.environ.get("DUCKDB_GPU_PARQUET_DIRECT_DOUBLE_SCAN", "1") == "1":
+            print("[parquet direct double scan]: on")
     if os.environ.get("DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID") == "1":
         print("[assume payload all valid]: on")
     if os.environ.get("DUCKDB_GPU_FETCH_RAW") == "1":
