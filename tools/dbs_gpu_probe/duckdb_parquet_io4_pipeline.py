@@ -79,6 +79,11 @@ def parse_args():
         help="pipeline Parquet page reads by prefetching the next page/window while the current page is decoded",
     )
     parser.add_argument(
+        "--parquet-page-io-queue",
+        action="store_true",
+        help="queue exact compressed Parquet page payload reads inside DuckDB's column reader",
+    )
+    parser.add_argument(
         "--parquet-pipelined-page-read-bytes",
         type=int,
         default=None,
@@ -298,6 +303,10 @@ def main():
         os.environ["DUCKDB_PARQUET_PIPELINED_PAGE_READ"] = "1"
         os.environ.setdefault("DUCKDB_PARQUET_ASYNC_PREFETCH", "1")
         os.environ.setdefault("DUCKDB_PARQUET_ASYNC_SINGLE_PREFETCH", "1")
+    if args.parquet_page_io_queue:
+        os.environ["DUCKDB_PARQUET_PAGE_IO_QUEUE"] = "1"
+        os.environ.setdefault("DUCKDB_PARQUET_ASYNC_PREFETCH", "1")
+        os.environ.setdefault("DUCKDB_PARQUET_ASYNC_SINGLE_PREFETCH", "1")
     if args.parquet_pipelined_page_read_bytes is not None:
         if args.parquet_pipelined_page_read_bytes <= 0:
             raise SystemExit("--parquet-pipelined-page-read-bytes must be positive")
@@ -390,6 +399,8 @@ def main():
                 os.environ.get("DUCKDB_PARQUET_PIPELINED_PAGE_READ_BYTES", "default")
             )
         )
+    if os.environ.get("DUCKDB_PARQUET_PAGE_IO_QUEUE") == "1":
+        print("[duckdb parquet page io queue]: on")
     if os.environ.get("DUCKDB_GPU_PARQUET_DIRECT_DECODE") == "1":
         print("[parquet direct decode]: on")
         if args.mode == "pipeline-mapped-direct" and args.infer_grid_from_row_order:
@@ -400,7 +411,7 @@ def main():
         print("[duckdb fetch raw]: on")
     if args.infer_grid_from_row_order:
         print("[grid inference]: row-order")
-    print("[payload columns]: {}".format(",".join(payload_columns)))
+    print("[variable count]: {}".format(len(payload_columns)))
     if args.print_stage_times and "stage_times" in result:
         stage = result["stage_times"]
         if "gpu_read_time" in stage:
