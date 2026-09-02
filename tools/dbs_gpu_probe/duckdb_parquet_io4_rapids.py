@@ -35,6 +35,7 @@ def new_timers():
         "merge_groupby": 0.0,
         "row_count_sum": 0.0,
         "row_order_reduce": 0.0,
+        "row_group_metadata": 0.0,
         "reader_wall": 0.0,
         "aggregate_wall": 0.0,
         "aggregate_stage_wall": 0.0,
@@ -192,6 +193,20 @@ def parse_args():
         default=os.environ.get("CUDF_AGGREGATE_STRATEGY", "auto"),
         choices=["auto", "cudf-groupby", "row-order-reduce"],
         help="aggregation implementation; row-order-reduce requires inferred grid order and all-valid payloads",
+    )
+    parser.add_argument(
+        "--row-group-stream",
+        type=parse_bool01,
+        nargs="?",
+        const=True,
+        default=os.environ.get("CUDF_ROW_GROUP_STREAM", "0") == "1",
+        help="read Parquet row-group chunks and immediately reduce them instead of materializing full file batches",
+    )
+    parser.add_argument(
+        "--row-group-batch-size",
+        type=int,
+        default=int(os.environ.get("CUDF_ROW_GROUP_BATCH_SIZE", "1")),
+        help="number of row groups read by each --row-group-stream task",
     )
     parser.add_argument(
         "--parquet-column-prefetch",
@@ -561,6 +576,7 @@ def build_row_order_reduce_plan(dim, group_column):
 
 
 _ROW_ORDER_REDUCE_KERNEL = None
+_ROW_ORDER_REDUCE_OFFSET_KERNEL = None
 
 
 def row_order_reduce_kernel():
@@ -603,6 +619,44 @@ def row_order_reduce_kernel():
     return _ROW_ORDER_REDUCE_KERNEL
 
 
+def row_order_reduce_offset_kernel():
+    global _ROW_ORDER_REDUCE_OFFSET_KERNEL
+    if _ROW_ORDER_REDUCE_OFFSET_KERNEL is not None:
+        return _ROW_ORDER_REDUCE_OFFSET_KERNEL
+
+    import cupy
+
+    code = r'''
+    extern "C" __global__
+    void row_order_reduce_offset_many(
+        const unsigned long long *column_ptrs,
+        const int *group_ids,
+        double *out,
+        long long dim_rows,
+        long long start_row,
+        long long fact_rows,
+        int num_cols,
+        int group_count,
+        long long total
+    ) {
+        long long idx = blockDim.x * (long long)blockIdx.x + threadIdx.x;
+        long long stride = blockDim.x * (long long)gridDim.x;
+        for (; idx < total; idx += stride) {
+            long long row = idx / num_cols;
+            int col = (int)(idx - row * num_cols);
+            long long grid_idx = (start_row + row) % dim_rows;
+            int group_id = group_ids[grid_idx];
+            if (group_id >= 0 && group_id < group_count) {
+                const double *values = (const double *)column_ptrs[col];
+                atomicAdd(out + ((long long)col * group_count + group_id), values[row]);
+            }
+        }
+    }
+    '''
+    _ROW_ORDER_REDUCE_OFFSET_KERNEL = cupy.RawKernel(code, "row_order_reduce_offset_many")
+    return _ROW_ORDER_REDUCE_OFFSET_KERNEL
+
+
 def aggregate_row_order_reduce(
     cudf,
     fact,
@@ -612,6 +666,7 @@ def aggregate_row_order_reduce(
     timers,
     need_counts=True,
     need_row_counts=True,
+    start_row=0,
 ):
     import cupy
 
@@ -619,14 +674,8 @@ def aggregate_row_order_reduce(
     fact_rows = len(fact)
     if dim_rows <= 0:
         raise ValueError("dimension file has no rows")
-    if fact_rows % dim_rows != 0:
-        raise ValueError(
-            "cannot row-order reduce: fact rows {} is not a multiple of dimension rows {}".format(
-                fact_rows, dim_rows
-            )
-        )
-
     timer_start = time.time()
+    start_row = int(start_row)
     repeats = fact_rows // dim_rows
     group_ids = reduce_plan["group_ids"]
     group_count = reduce_plan["group_count"]
@@ -639,23 +688,42 @@ def aggregate_row_order_reduce(
 
     column_ptrs = cupy.asarray([int(values.data.ptr) for values in arrays], dtype=cupy.uint64)
     out = cupy.zeros((len(payload_columns), group_count), dtype=cupy.float64)
-    total = dim_rows * len(payload_columns)
     block_size = 256
-    grid_size = min(65535, max(1, int((total + block_size - 1) // block_size)))
-    row_order_reduce_kernel()(
-        (grid_size,),
-        (block_size,),
-        (
-            column_ptrs,
-            group_ids,
-            out,
-            dim_rows,
-            repeats,
-            len(payload_columns),
-            group_count,
-            total,
-        ),
-    )
+    if start_row % dim_rows == 0 and fact_rows % dim_rows == 0:
+        total = dim_rows * len(payload_columns)
+        grid_size = min(65535, max(1, int((total + block_size - 1) // block_size)))
+        row_order_reduce_kernel()(
+            (grid_size,),
+            (block_size,),
+            (
+                column_ptrs,
+                group_ids,
+                out,
+                dim_rows,
+                repeats,
+                len(payload_columns),
+                group_count,
+                total,
+            ),
+        )
+    else:
+        total = fact_rows * len(payload_columns)
+        grid_size = min(65535, max(1, int((total + block_size - 1) // block_size)))
+        row_order_reduce_offset_kernel()(
+            (grid_size,),
+            (block_size,),
+            (
+                column_ptrs,
+                group_ids,
+                out,
+                dim_rows,
+                start_row,
+                fact_rows,
+                len(payload_columns),
+                group_count,
+                total,
+            ),
+        )
 
     result_columns = {group_column: reduce_plan["group_values"]}
     for column_idx, payload_column in enumerate(payload_columns):
@@ -665,7 +733,11 @@ def aggregate_row_order_reduce(
     row_counts = None
     counts = None
     if need_row_counts or need_counts:
-        row_count_values = cupy.bincount(group_ids, minlength=group_count) * repeats
+        if start_row % dim_rows == 0 and fact_rows % dim_rows == 0:
+            row_count_values = cupy.bincount(group_ids, minlength=group_count) * repeats
+        else:
+            row_offsets = (cupy.arange(fact_rows, dtype=cupy.int64) + start_row) % dim_rows
+            row_count_values = cupy.bincount(group_ids[row_offsets], minlength=group_count)
         row_counts = cudf.DataFrame(
             {
                 group_column: reduce_plan["group_values"],
@@ -743,14 +815,16 @@ def cuda_synchronize():
         pass
 
 
-def read_parquet_gpu(cudf, source, columns):
+def read_parquet_gpu(cudf, source, columns, row_groups=None):
+    if row_groups is not None:
+        return cudf.read_parquet(source, columns=columns, row_groups=row_groups)
     return cudf.read_parquet(source, columns=columns)
 
 
-def timed_read_parquet_gpu(cudf, source, columns, measure_materialized_bytes=False):
+def timed_read_parquet_gpu(cudf, source, columns, measure_materialized_bytes=False, row_groups=None):
     io_before = read_proc_io()
     timer_start = time.time()
-    frame = read_parquet_gpu(cudf, source, columns=columns)
+    frame = read_parquet_gpu(cudf, source, columns=columns, row_groups=row_groups)
     cuda_synchronize()
     elapsed = time.time() - timer_start
     io_after = read_proc_io()
@@ -1841,6 +1915,205 @@ def split_file_io_read_aggregate(
     return read_seconds, detail_timers["join"], detail_timers["aggregate_wall"], row_count
 
 
+def parquet_row_group_tasks(path, row_group_batch_size):
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError("pyarrow is required for --row-group-stream: {}".format(exc))
+
+    parquet_file = pq.ParquetFile(path)
+    metadata = parquet_file.metadata
+    row_groups = []
+    start_row = 0
+    for row_group_idx in range(metadata.num_row_groups):
+        rows = metadata.row_group(row_group_idx).num_rows
+        row_groups.append((row_group_idx, start_row, rows))
+        start_row += rows
+
+    tasks = []
+    batch_size = max(1, int(row_group_batch_size))
+    for idx in range(0, len(row_groups), batch_size):
+        group_batch = row_groups[idx:idx + batch_size]
+        indices = [item[0] for item in group_batch]
+        batch_start = group_batch[0][1]
+        row_count = sum(item[2] for item in group_batch)
+        tasks.append((indices, batch_start, row_count))
+    return tasks
+
+
+def row_group_stream_read_aggregate(
+    cudf,
+    args,
+    parquet_paths,
+    payload_columns,
+    detail_timers,
+    sum_frames,
+    count_frames,
+    row_count_frames,
+    batch_profiles,
+):
+    if not args.infer_grid_from_row_order:
+        raise ValueError("--row-group-stream requires --infer-grid-from-row-order")
+    if not args.assume_payload_all_valid:
+        raise ValueError("--row-group-stream requires --assume-payload-all-valid")
+
+    fact_columns = payload_columns
+    dimension_columns = [args.group_column]
+    need_counts = args.print_results
+    need_row_counts = args.print_results
+    measure_materialized_bytes = args.print_stage_times or args.print_batch_times
+
+    metadata_start = time.time()
+    task_queue = queue.Queue()
+    batch_id = 0
+    for path in parquet_paths:
+        for row_groups, start_row, expected_rows in parquet_row_group_tasks(path, args.row_group_batch_size):
+            task_queue.put((batch_id, path, row_groups, start_row, expected_rows))
+            batch_id += 1
+    add_elapsed(detail_timers, "row_group_metadata", metadata_start)
+
+    dimension_path = resolve_dimension_path(parquet_paths[0], args.dimension_file)
+    shared_dim, dim_profile = timed_read_parquet_gpu(
+        cudf,
+        dimension_path,
+        columns=dimension_columns,
+        measure_materialized_bytes=measure_materialized_bytes,
+    )
+    detail_timers["dimension_read"] += dim_profile["elapsed"]
+    detail_timers["dimension_rchar"] += dim_profile["rchar"]
+    detail_timers["dimension_read_bytes"] += dim_profile["read_bytes"]
+    detail_timers["dimension_syscr"] += dim_profile["syscr"]
+    reduce_plan = build_row_order_reduce_plan(shared_dim, args.group_column)
+
+    worker_count = max(1, min(args.decode_threads, max(1, batch_id)))
+    partial_queue = queue.Queue(maxsize=max(1, args.aggregate_queue_depth))
+    worker_wall_times = []
+    timer_lock = threading.Lock()
+
+    def add_counter(name, value):
+        with timer_lock:
+            detail_timers[name] += value
+
+    def worker():
+        worker_start = time.time()
+        try:
+            while True:
+                try:
+                    task_id, path, row_groups, start_row, expected_rows = task_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                fact, fact_profile = timed_read_parquet_gpu(
+                    cudf,
+                    path,
+                    columns=fact_columns,
+                    measure_materialized_bytes=measure_materialized_bytes,
+                    row_groups=row_groups,
+                )
+                fact_profile["decode_source"] = "path-row-groups"
+                add_counter("fact_read", fact_profile["elapsed"])
+                add_counter("decode_materialize", fact_profile["elapsed"])
+                add_counter("fact_rchar", fact_profile["rchar"])
+                add_counter("fact_read_bytes", fact_profile["read_bytes"])
+                add_counter("fact_syscr", fact_profile["syscr"])
+                add_counter("materialized_bytes", fact_profile["materialized_bytes"])
+
+                group_start = time.time()
+                aggregate_timers = new_timers()
+                sums, counts, row_counts = aggregate_row_order_reduce(
+                    cudf,
+                    fact,
+                    args.group_column,
+                    payload_columns,
+                    reduce_plan,
+                    aggregate_timers,
+                    need_counts=need_counts,
+                    need_row_counts=need_row_counts,
+                    start_row=start_row,
+                )
+                cuda_synchronize()
+                group_elapsed = time.time() - group_start
+                for timer_name in [
+                    "groupby_size",
+                    "groupby_sum",
+                    "groupby_count",
+                    "count_from_rows",
+                    "row_order_reduce",
+                ]:
+                    add_counter(timer_name, aggregate_timers[timer_name])
+                add_counter("aggregate_wall", group_elapsed)
+
+                partial_queue.put(
+                    (
+                        "partial",
+                        task_id,
+                        {
+                            "batch_id": task_id,
+                            "files": 1,
+                            "rows": fact_profile["rows"],
+                            "read": fact_profile["elapsed"],
+                            "prefetch": 0.0,
+                            "prefetch_bytes": 0,
+                            "prefetch_ranges": 0,
+                            "prefetch_method": "off",
+                            "file_io": 0.0,
+                            "decode": fact_profile["elapsed"],
+                            "io_method": "path-row-groups",
+                            "decode_source": fact_profile["decode_source"],
+                            "io_fallback_reason": "",
+                            "rchar": fact_profile["rchar"],
+                            "read_bytes": fact_profile["read_bytes"],
+                            "syscr": fact_profile["syscr"],
+                            "materialized_bytes": fact_profile["materialized_bytes"],
+                            "join": 0.0,
+                            "groupby": group_elapsed,
+                        },
+                        sums,
+                        counts,
+                        row_counts,
+                        len(fact),
+                    )
+                )
+                del fact
+        except BaseException as exc:
+            partial_queue.put(("error", exc))
+        finally:
+            worker_wall_times.append(time.time() - worker_start)
+            partial_queue.put(("done",))
+
+    workers = [threading.Thread(target=worker) for _ in range(worker_count)]
+    for thread in workers:
+        thread.start()
+
+    done_workers = 0
+    row_count = 0
+    while done_workers < worker_count:
+        item = partial_queue.get()
+        item_type = item[0]
+        if item_type == "done":
+            done_workers += 1
+            continue
+        if item_type == "error":
+            for thread in workers:
+                thread.join()
+            raise item[1]
+
+        _, _, batch_profile, sums, counts, row_counts, batch_rows = item
+        append_frame(sum_frames, sums)
+        append_frame(count_frames, counts)
+        append_frame(row_count_frames, row_counts)
+        batch_profiles.append(batch_profile)
+        row_count += batch_rows
+
+    for thread in workers:
+        thread.join()
+
+    detail_timers["decode_wall"] = max(worker_wall_times) if worker_wall_times else 0.0
+    detail_timers["aggregate_stage_wall"] = detail_timers["decode_wall"]
+    read_seconds = detail_timers["dimension_read"] + detail_timers["decode_wall"]
+    return read_seconds, 0.0, detail_timers["aggregate_wall"], row_count
+
+
 def combine_frames(cudf, frames, group_column, payload_columns, timers, is_row_count=False):
     if not frames:
         columns = [group_column, "row_count"] if is_row_count else [group_column] + payload_columns
@@ -1903,6 +2176,8 @@ def main():
         raise SystemExit("--aggregate-threads must be positive")
     if args.aggregate_queue_depth <= 0:
         raise SystemExit("--aggregate-queue-depth must be positive")
+    if args.row_group_batch_size <= 0:
+        raise SystemExit("--row-group-batch-size must be positive")
     if args.parquet_prefetch_workers <= 0:
         raise SystemExit("--parquet-prefetch-workers must be positive")
     if args.parquet_prefetch_queue_depth <= 0:
@@ -1914,10 +2189,28 @@ def main():
 
     use_row_order_reduce = should_use_row_order_reduce(args)
 
+    if args.row_group_stream and args.read_mode != "per-file":
+        raise SystemExit("--row-group-stream requires --read-mode per-file")
+    if args.row_group_stream and not args.infer_grid_from_row_order:
+        raise SystemExit("--row-group-stream requires --infer-grid-from-row-order")
+    if args.row_group_stream and not args.assume_payload_all_valid:
+        raise SystemExit("--row-group-stream requires --assume-payload-all-valid")
     if args.split_file_io and args.read_mode != "per-file":
         raise SystemExit("--split-file-io requires --read-mode per-file")
 
-    if args.split_file_io:
+    if args.row_group_stream:
+        read_seconds, join_seconds, group_seconds, row_count = row_group_stream_read_aggregate(
+            cudf,
+            args,
+            parquet_paths,
+            payload_columns,
+            detail_timers,
+            sum_frames,
+            count_frames,
+            row_count_frames,
+            batch_profiles,
+        )
+    elif args.split_file_io:
         read_seconds, join_seconds, group_seconds, row_count = split_file_io_read_aggregate(
             cudf,
             args,
@@ -2067,6 +2360,9 @@ def main():
     print("[read mode]: {}".format(args.read_mode))
     print("[scan/decode engine]: cudf/libcudf")
     print("[reader threads]: {}".format(max(1, min(args.reader_threads, len(parquet_paths)))))
+    if args.row_group_stream:
+        print("[row group stream]: on")
+        print("[row group batch size]: {}".format(args.row_group_batch_size))
     if rmm_pool_enabled:
         print("[rmm pool]: on size={} bytes".format(rmm_pool_size))
     if args.read_mode == "per-file":
@@ -2108,7 +2404,7 @@ def main():
             "[stage detail] dimension_read={:.6f}s fact_read={:.6f}s join={:.6f}s "
             "groupby_size={:.6f}s groupby_sum={:.6f}s groupby_count={:.6f}s "
             "count_from_rows={:.6f}s row_order_reduce={:.6f}s "
-            "merge_concat={:.6f}s merge_groupby={:.6f}s "
+            "row_group_metadata={:.6f}s merge_concat={:.6f}s merge_groupby={:.6f}s "
             "row_count_sum={:.6f}s reader_wall={:.6f}s aggregate_wall={:.6f}s "
             "file_io_read={:.6f}s file_io_wall={:.6f}s decode_materialize={:.6f}s "
             "decode_wall={:.6f}s aggregate_stage_wall={:.6f}s "
@@ -2122,6 +2418,7 @@ def main():
                 detail_timers["groupby_count"],
                 detail_timers["count_from_rows"],
                 detail_timers["row_order_reduce"],
+                detail_timers["row_group_metadata"],
                 detail_timers["merge_concat"],
                 detail_timers["merge_groupby"],
                 detail_timers["row_count_sum"],
