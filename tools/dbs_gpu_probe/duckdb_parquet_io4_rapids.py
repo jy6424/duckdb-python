@@ -142,9 +142,15 @@ def parse_args():
     )
     parser.add_argument(
         "--file-io-method",
-        default=os.environ.get("CUDF_FILE_IO_METHOD", "read"),
+        default=os.environ.get("CUDF_FILE_IO_METHOD", "path"),
         choices=["path", "read", "readinto", "mmap", "io_uring"],
         help="file byte read method used by --split-file-io",
+    )
+    parser.add_argument(
+        "--reader-engine",
+        default=os.environ.get("CUDF_READER_ENGINE", "auto"),
+        choices=["auto", "cudf", "pylibcudf"],
+        help="Parquet reader engine; pylibcudf avoids cuDF DataFrame wrappers when row-order reduce is used",
     )
     parser.add_argument(
         "--decode-source",
@@ -444,6 +450,9 @@ def empty_prefetch_profile():
 
 
 def dataframe_nbytes(frame):
+    device_nbytes = getattr(frame, "device_nbytes", None)
+    if device_nbytes is not None:
+        return int(device_nbytes)
     try:
         usage = frame.memory_usage(deep=True)
         return int(usage.sum())
@@ -547,6 +556,14 @@ def should_use_row_order_reduce(args):
             raise ValueError("--aggregate-strategy row-order-reduce requires --assume-payload-all-valid")
         return True
     return args.infer_grid_from_row_order and args.assume_payload_all_valid
+
+
+def effective_reader_engine(args, use_row_order_reduce):
+    if use_row_order_reduce:
+        return args.reader_engine
+    if args.reader_engine == "pylibcudf":
+        raise ValueError("--reader-engine pylibcudf requires --aggregate-strategy row-order-reduce")
+    return "cudf"
 
 
 def series_to_cupy(series):
@@ -815,16 +832,223 @@ def cuda_synchronize():
         pass
 
 
-def read_parquet_gpu(cudf, source, columns, row_groups=None):
+class PylibcudfFrame(object):
+    def __init__(self, table, columns, arrays):
+        self._table = table
+        self.columns = list(columns)
+        self._arrays = dict(zip(self.columns, arrays))
+        self.device_nbytes = sum(int(array.nbytes) for array in arrays)
+        if arrays:
+            self._rows = int(arrays[0].shape[0])
+        else:
+            self._rows = table_num_rows(table)
+
+    def __len__(self):
+        return self._rows
+
+    def __getitem__(self, column):
+        return self._arrays[column]
+
+
+def is_path_source(source):
+    if isinstance(source, (str, bytes, os.PathLike)):
+        return True
+    if isinstance(source, (list, tuple)):
+        return all(isinstance(item, (str, bytes, os.PathLike)) for item in source)
+    return False
+
+
+def table_with_metadata_table(result):
+    for attr in ["tbl", "table"]:
+        if hasattr(result, attr):
+            value = getattr(result, attr)
+            return value() if callable(value) else value
+    if isinstance(result, (list, tuple)) and result:
+        return result[0]
+    return result
+
+
+def table_columns(table):
+    value = getattr(table, "columns", None)
+    if value is not None:
+        return list(value() if callable(value) else value)
+    value = getattr(table, "_columns", None)
+    if value is not None:
+        return list(value)
+    raise TypeError("cannot access pylibcudf table columns")
+
+
+def table_num_rows(table):
+    for attr in ["num_rows", "nrows"]:
+        if hasattr(table, attr):
+            value = getattr(table, attr)
+            return int(value() if callable(value) else value)
+    columns = table_columns(table)
+    if not columns:
+        return 0
+    return int(column_size(columns[0]))
+
+
+def column_size(column):
+    for attr in ["size", "__len__"]:
+        if hasattr(column, attr):
+            value = getattr(column, attr)
+            return int(value() if callable(value) else value)
+    raise TypeError("cannot access pylibcudf column size")
+
+
+def column_offset(column):
+    if hasattr(column, "offset"):
+        value = getattr(column, "offset")
+        return int(value() if callable(value) else value)
+    return 0
+
+
+def column_data_buffer(column):
+    for attr in ["data", "base_data"]:
+        if hasattr(column, attr):
+            value = getattr(column, attr)
+            buffer = value() if callable(value) else value
+            if buffer is not None:
+                return buffer
+    raise TypeError("cannot access pylibcudf column data buffer")
+
+
+def column_dtype(column):
+    try:
+        type_value = column.type()
+    except Exception:
+        type_value = getattr(column, "type", None)
+    typestr = getattr(type_value, "typestr", None)
+    text = str(typestr if typestr is not None else type_value).lower()
+    import cupy
+
+    if text in ["<f8", "|f8", "f8"] or "float64" in text or "double" in text:
+        return cupy.float64
+    if text in ["<f4", "|f4", "f4"] or "float32" in text or "float" in text:
+        return cupy.float32
+    if text in ["<i8", "|i8", "i8"] or "int64" in text:
+        return cupy.int64
+    if text in ["<u8", "|u8", "u8"] or "uint64" in text:
+        return cupy.uint64
+    if text in ["<i4", "|i4", "i4"] or "int32" in text:
+        return cupy.int32
+    if text in ["<u4", "|u4", "u4"] or "uint32" in text:
+        return cupy.uint32
+    raise TypeError("unsupported pylibcudf column type: {}".format(type_value))
+
+
+def buffer_ptr_and_nbytes(buffer):
+    ptr = getattr(buffer, "ptr", None)
+    if ptr is None:
+        ptr = getattr(buffer, "__cuda_array_interface__", {}).get("data", [None])[0]
+    if ptr is None:
+        raise TypeError("cannot access pylibcudf buffer device pointer")
+    nbytes = getattr(buffer, "nbytes", None)
+    if nbytes is None:
+        nbytes = getattr(buffer, "size", None)
+    if callable(nbytes):
+        nbytes = nbytes()
+    if nbytes is None:
+        raise TypeError("cannot access pylibcudf buffer size")
+    return int(ptr), int(nbytes)
+
+
+def column_to_cupy(column):
+    import cupy
+
+    dtype = column_dtype(column)
+    size = column_size(column)
+    offset = column_offset(column)
+    buffer = column_data_buffer(column)
+    ptr, nbytes = buffer_ptr_and_nbytes(buffer)
+    itemsize = cupy.dtype(dtype).itemsize
+    byte_offset = offset * itemsize
+    if byte_offset + size * itemsize > nbytes:
+        raise ValueError("pylibcudf column buffer is smaller than expected")
+    memory = cupy.cuda.UnownedMemory(ptr + byte_offset, nbytes - byte_offset, buffer)
+    memptr = cupy.cuda.MemoryPointer(memory, 0)
+    return cupy.ndarray((size,), dtype=dtype, memptr=memptr)
+
+
+def build_pylibcudf_reader_options(plc, source, columns, row_groups=None):
+    source_paths = [os.fspath(source)] if isinstance(source, (str, bytes, os.PathLike)) else [os.fspath(path) for path in source]
+    source_info_class = getattr(plc.io, "SourceInfo", None)
+    if source_info_class is None:
+        source_info_class = plc.io.types.SourceInfo
+    source_info = source_info_class(source_paths)
+    builder = plc.io.parquet.ParquetReaderOptions.builder(source_info)
+    for method_name in ["column_names", "columns", "set_column_names", "set_columns"]:
+        method = getattr(builder, method_name, None)
+        if method is not None:
+            result = method(list(columns))
+            builder = builder if result is None else result
+            break
+    build = getattr(builder, "build", None)
+    options = build() if build is not None else builder
     if row_groups is not None:
-        return cudf.read_parquet(source, columns=columns, row_groups=row_groups)
-    return cudf.read_parquet(source, columns=columns)
+        row_group_selection = [list(row_groups)]
+        for method_name in ["set_row_groups", "row_groups"]:
+            method = getattr(options, method_name, None)
+            if method is not None:
+                result = method(row_group_selection)
+                options = options if result is None else result
+                break
+    return options
 
 
-def timed_read_parquet_gpu(cudf, source, columns, measure_materialized_bytes=False, row_groups=None):
+def read_parquet_pylibcudf(source, columns, row_groups=None):
+    import pylibcudf as plc
+
+    options = build_pylibcudf_reader_options(plc, source, columns, row_groups=row_groups)
+    result = plc.io.parquet.read_parquet(options)
+    table = table_with_metadata_table(result)
+    raw_columns = table_columns(table)
+    if len(raw_columns) != len(columns):
+        raise ValueError("pylibcudf returned {} columns for {} requested columns".format(len(raw_columns), len(columns)))
+    arrays = [column_to_cupy(column) for column in raw_columns]
+    return PylibcudfFrame(table, columns, arrays)
+
+
+def resolve_reader_engine(reader_engine, source):
+    if reader_engine == "cudf":
+        return "cudf"
+    if not is_path_source(source):
+        return "cudf"
+    return "pylibcudf"
+
+
+def read_parquet_gpu(cudf, source, columns, row_groups=None, reader_engine="cudf"):
+    actual_engine = resolve_reader_engine(reader_engine, source)
+    if actual_engine == "pylibcudf":
+        try:
+            return read_parquet_pylibcudf(source, columns, row_groups=row_groups), "pylibcudf"
+        except Exception:
+            if reader_engine == "pylibcudf":
+                raise
+            actual_engine = "cudf"
+    if row_groups is not None:
+        return cudf.read_parquet(source, columns=columns, row_groups=row_groups), "cudf"
+    return cudf.read_parquet(source, columns=columns), "cudf"
+
+
+def timed_read_parquet_gpu(
+    cudf,
+    source,
+    columns,
+    measure_materialized_bytes=False,
+    row_groups=None,
+    reader_engine="cudf",
+):
     io_before = read_proc_io()
     timer_start = time.time()
-    frame = read_parquet_gpu(cudf, source, columns=columns, row_groups=row_groups)
+    frame, actual_reader_engine = read_parquet_gpu(
+        cudf,
+        source,
+        columns=columns,
+        row_groups=row_groups,
+        reader_engine=reader_engine,
+    )
     cuda_synchronize()
     elapsed = time.time() - timer_start
     io_after = read_proc_io()
@@ -835,6 +1059,7 @@ def timed_read_parquet_gpu(cudf, source, columns, measure_materialized_bytes=Fal
         "syscr": io_diff(io_before, io_after, "syscr"),
         "rows": len(frame),
         "materialized_bytes": 0,
+        "reader_engine": actual_reader_engine,
     }
     if measure_materialized_bytes:
         profile["materialized_bytes"] = dataframe_nbytes(frame)
@@ -1298,6 +1523,8 @@ def default_file_batch_size(read_mode, reader_threads, file_count):
 def resolve_file_batch_size(args, reader_threads, file_count):
     if args.file_batch_size is not None:
         file_batch_size = args.file_batch_size
+    elif args.split_file_io and args.file_io_method == "path":
+        file_batch_size = int(math.ceil(float(file_count) / float(reader_threads)))
     else:
         file_batch_size = default_file_batch_size(args.read_mode, reader_threads, file_count)
     if file_batch_size <= 0:
@@ -1351,6 +1578,7 @@ def threaded_read_aggregate(
     need_counts = args.print_results
     need_row_counts = args.print_results
     use_row_order_reduce = should_use_row_order_reduce(args)
+    reader_engine = effective_reader_engine(args, use_row_order_reduce)
 
     shared_dim = None
     shared_reduce_plan = None
@@ -1361,6 +1589,7 @@ def threaded_read_aggregate(
             dimension_path,
             columns=dimension_columns,
             measure_materialized_bytes=args.print_stage_times or args.print_batch_times,
+            reader_engine=reader_engine,
         )
         detail_timers["dimension_read"] += dim_profile["elapsed"]
         detail_timers["dimension_rchar"] += dim_profile["rchar"]
@@ -1391,6 +1620,7 @@ def threaded_read_aggregate(
                     source,
                     columns=fact_columns,
                     measure_materialized_bytes=args.print_stage_times or args.print_batch_times,
+                    reader_engine=reader_engine,
                 )
                 put_start = time.time()
                 results.put(("batch", batch_id, batch_paths, fact, fact_profile))
@@ -1438,8 +1668,8 @@ def threaded_read_aggregate(
             "prefetch_method": "off",
             "file_io": 0.0,
             "decode": fact_profile["elapsed"],
-            "io_method": "cudf",
-            "decode_source": "path",
+            "io_method": fact_profile["reader_engine"],
+            "decode_source": fact_profile["reader_engine"] + "-path",
             "io_fallback_reason": "",
             "rows": fact_profile["rows"],
             "rchar": fact_profile["rchar"],
@@ -1457,6 +1687,7 @@ def threaded_read_aggregate(
                 dimension_path,
                 columns=dimension_columns,
                 measure_materialized_bytes=args.print_stage_times or args.print_batch_times,
+                reader_engine=reader_engine,
             )
             detail_timers["dimension_read"] += dim_profile["elapsed"]
             detail_timers["dimension_rchar"] += dim_profile["rchar"]
@@ -1555,6 +1786,7 @@ def split_file_io_read_aggregate(
     need_row_counts = args.print_results
     measure_materialized_bytes = args.print_stage_times or args.print_batch_times
     use_row_order_reduce = should_use_row_order_reduce(args)
+    reader_engine = effective_reader_engine(args, use_row_order_reduce)
 
     shared_dim = None
     shared_reduce_plan = None
@@ -1575,6 +1807,7 @@ def split_file_io_read_aggregate(
             dimension_path,
             columns=dimension_columns,
             measure_materialized_bytes=measure_materialized_bytes,
+            reader_engine=reader_engine,
         )
         detail_timers["dimension_read"] += dim_profile["elapsed"]
         detail_timers["dimension_rchar"] += dim_profile["rchar"]
@@ -1693,8 +1926,9 @@ def split_file_io_read_aggregate(
                         source,
                         columns=fact_columns,
                         measure_materialized_bytes=measure_materialized_bytes,
+                        reader_engine=reader_engine,
                     )
-                    decode_profile["decode_source"] = "path"
+                    decode_profile["decode_source"] = decode_profile["reader_engine"] + "-path"
                 else:
                     fact, decode_profile = timed_decode_parquet_bytes(
                         cudf,
@@ -1759,6 +1993,7 @@ def split_file_io_read_aggregate(
                         dimension_path,
                         columns=dimension_columns,
                         measure_materialized_bytes=measure_materialized_bytes,
+                        reader_engine=reader_engine,
                     )
                     add_counter("dimension_read", dim_profile["elapsed"])
                     add_counter("dimension_rchar", dim_profile["rchar"])
@@ -1962,6 +2197,7 @@ def row_group_stream_read_aggregate(
     need_counts = args.print_results
     need_row_counts = args.print_results
     measure_materialized_bytes = args.print_stage_times or args.print_batch_times
+    reader_engine = effective_reader_engine(args, True)
 
     metadata_start = time.time()
     task_queue = queue.Queue()
@@ -1978,6 +2214,7 @@ def row_group_stream_read_aggregate(
         dimension_path,
         columns=dimension_columns,
         measure_materialized_bytes=measure_materialized_bytes,
+        reader_engine=reader_engine,
     )
     detail_timers["dimension_read"] += dim_profile["elapsed"]
     detail_timers["dimension_rchar"] += dim_profile["rchar"]
@@ -2009,8 +2246,9 @@ def row_group_stream_read_aggregate(
                     columns=fact_columns,
                     measure_materialized_bytes=measure_materialized_bytes,
                     row_groups=row_groups,
+                    reader_engine=reader_engine,
                 )
-                fact_profile["decode_source"] = "path-row-groups"
+                fact_profile["decode_source"] = fact_profile["reader_engine"] + "-path-row-groups"
                 add_counter("fact_read", fact_profile["elapsed"])
                 add_counter("decode_materialize", fact_profile["elapsed"])
                 add_counter("fact_rchar", fact_profile["rchar"])
@@ -2188,6 +2426,7 @@ def main():
         raise SystemExit("--parquet-prefetch-extra-bytes must be non-negative")
 
     use_row_order_reduce = should_use_row_order_reduce(args)
+    reader_engine = effective_reader_engine(args, use_row_order_reduce)
 
     if args.row_group_stream and args.read_mode != "per-file":
         raise SystemExit("--row-group-stream requires --read-mode per-file")
@@ -2243,6 +2482,7 @@ def main():
             dimension_path,
             columns=dimension_columns,
             measure_materialized_bytes=args.print_stage_times or args.print_batch_times,
+            reader_engine=reader_engine,
         )
         detail_timers["dimension_read"] += dim_profile["elapsed"]
         detail_timers["dimension_rchar"] += dim_profile["rchar"]
@@ -2255,6 +2495,7 @@ def main():
             parquet_paths,
             columns=fact_columns,
             measure_materialized_bytes=args.print_stage_times or args.print_batch_times,
+            reader_engine=reader_engine,
         )
         detail_timers["fact_read"] += fact_profile["elapsed"]
         detail_timers["fact_rchar"] += fact_profile["rchar"]
@@ -2272,8 +2513,8 @@ def main():
             "prefetch_method": "off",
             "file_io": 0.0,
             "decode": fact_profile["elapsed"],
-            "io_method": "cudf",
-            "decode_source": "path",
+            "io_method": fact_profile["reader_engine"],
+            "decode_source": fact_profile["reader_engine"] + "-path",
             "io_fallback_reason": "",
             "rows": fact_profile["rows"],
             "rchar": fact_profile["rchar"],
@@ -2359,6 +2600,7 @@ def main():
     print("[number of input file]: {}".format(len(parquet_paths)))
     print("[read mode]: {}".format(args.read_mode))
     print("[scan/decode engine]: cudf/libcudf")
+    print("[reader engine]: {}".format(reader_engine))
     print("[reader threads]: {}".format(max(1, min(args.reader_threads, len(parquet_paths)))))
     if args.row_group_stream:
         print("[row group stream]: on")
