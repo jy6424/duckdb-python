@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <math.h>
 
 namespace {
 
@@ -19,6 +20,38 @@ bool EnvFlag(const char *name) {
 
 bool AssumePayloadAllValid() {
 	return EnvFlag("DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID");
+}
+
+int ComputeBenchmarkMode() {
+	const auto value = std::getenv("DUCKDB_GPU_COMPUTE_BENCHMARK");
+	if (!value || value[0] == '\0' || std::strcmp(value, "sum") == 0) {
+		return 0;
+	}
+	if (std::strcmp(value, "sum-sumsq") == 0) {
+		return 1;
+	}
+	if (std::strcmp(value, "derived") == 0) {
+		return 2;
+	}
+	if (std::strcmp(value, "sum-sumsq-derived") == 0) {
+		return 3;
+	}
+	return 0;
+}
+
+__device__ double BenchmarkAggregateValue(double value, int benchmark_mode) {
+	if (benchmark_mode == 0) {
+		return value;
+	}
+	const auto absolute = fabs(value);
+	if (benchmark_mode == 1) {
+		return value + value * value;
+	}
+	const auto derived = sqrt(absolute) + log1p(absolute) + exp(-absolute);
+	if (benchmark_mode == 2) {
+		return value + derived;
+	}
+	return value + value * value + derived;
 }
 
 __global__ void DuckDBGpuProbeI64Kernel(const int64_t *keys, const uint8_t *validity, uint64_t count,
@@ -255,7 +288,7 @@ __device__ void DuckDBGpuFusedLatAggMultiRow(
     const int64_t *grids, const double *values, const uint8_t *value_validity, uint64_t column_count,
     uint64_t value_stride, uint64_t count, int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group,
     uint64_t build_size, uint64_t group_count, double *sum_out, unsigned long long *count_out,
-    unsigned long long *row_count_out, uint64_t row) {
+    unsigned long long *row_count_out, uint64_t row, int benchmark_mode) {
 	if (row >= count) {
 		return;
 	}
@@ -282,7 +315,7 @@ __device__ void DuckDBGpuFusedLatAggMultiRow(
 		const auto input_idx = column * value_stride + row;
 		if (!value_validity || value_validity[input_idx] != 0) {
 			const auto output_idx = column * group_count + group;
-			AtomicAddDouble(&sum_out[output_idx], values[input_idx]);
+			AtomicAddDouble(&sum_out[output_idx], BenchmarkAggregateValue(values[input_idx], benchmark_mode));
 			atomicAdd(&count_out[output_idx], 1ULL);
 		}
 	}
@@ -293,28 +326,29 @@ __global__ void DuckDBGpuFusedLatAggMultiKernel(const int64_t *grids, const doub
                                                 int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group,
                                                 uint64_t build_size, uint64_t group_count, double *sum_out,
                                                 unsigned long long *count_out,
-                                                unsigned long long *row_count_out) {
+                                                unsigned long long *row_count_out, int benchmark_mode) {
 	const auto row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 	DuckDBGpuFusedLatAggMultiRow(grids, values, value_validity, column_count, count, count, grid_min, grid_max,
-	                             grid_to_group, build_size, group_count, sum_out, count_out, row_count_out, row);
+	                             grid_to_group, build_size, group_count, sum_out, count_out, row_count_out, row,
+	                             benchmark_mode);
 }
 
 __global__ void DuckDBGpuFusedLatAggMultiStridedKernel(
     const int64_t *grids, const double *values, const uint8_t *value_validity, uint64_t column_count,
     uint64_t value_stride, uint64_t count, int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group,
     uint64_t build_size, uint64_t group_count, double *sum_out, unsigned long long *count_out,
-    unsigned long long *row_count_out) {
+    unsigned long long *row_count_out, int benchmark_mode) {
 	const auto row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 	DuckDBGpuFusedLatAggMultiRow(grids, values, value_validity, column_count, value_stride, count, grid_min,
 	                             grid_max, grid_to_group, build_size, group_count, sum_out, count_out,
-	                             row_count_out, row);
+	                             row_count_out, row, benchmark_mode);
 }
 
 __global__ void DuckDBGpuFusedLatAggMultiRowOrderKernel(
     const double *values, const uint8_t *value_validity, uint64_t column_count, uint64_t value_stride,
     uint64_t count, uint64_t row_base, int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group,
     uint64_t build_size, uint64_t group_count, double *sum_out, unsigned long long *count_out,
-    unsigned long long *row_count_out) {
+    unsigned long long *row_count_out, int benchmark_mode) {
 	const auto row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 	if (row >= count || build_size == 0) {
 		return;
@@ -342,7 +376,7 @@ __global__ void DuckDBGpuFusedLatAggMultiRowOrderKernel(
 		const auto input_idx = column * value_stride + row;
 		if (!value_validity || value_validity[input_idx] != 0) {
 			const auto output_idx = column * group_count + group;
-			AtomicAddDouble(&sum_out[output_idx], values[input_idx]);
+			AtomicAddDouble(&sum_out[output_idx], BenchmarkAggregateValue(values[input_idx], benchmark_mode));
 			atomicAdd(&count_out[output_idx], 1ULL);
 		}
 	}
@@ -351,7 +385,7 @@ __global__ void DuckDBGpuFusedLatAggMultiRowOrderKernel(
 __global__ void DuckDBGpuFusedLatAggRowOrderColumnKernel(
     const double *values, uint64_t column_idx, uint64_t count, uint64_t row_base, int update_row_counts,
     int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group, uint64_t build_size, uint64_t group_count,
-    double *sum_out, unsigned long long *count_out, unsigned long long *row_count_out) {
+    double *sum_out, unsigned long long *count_out, unsigned long long *row_count_out, int benchmark_mode) {
 	const auto row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 	if (row >= count || build_size == 0) {
 		return;
@@ -378,7 +412,7 @@ __global__ void DuckDBGpuFusedLatAggRowOrderColumnKernel(
 	}
 
 	const auto output_idx = column_idx * group_count + group;
-	AtomicAddDouble(&sum_out[output_idx], values[row]);
+	AtomicAddDouble(&sum_out[output_idx], BenchmarkAggregateValue(values[row], benchmark_mode));
 	atomicAdd(&count_out[output_idx], 1ULL);
 }
 
@@ -1428,7 +1462,7 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double_strided(
 	const auto blocks = static_cast<unsigned int>((count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
 	DuckDBGpuFusedLatAggMultiStridedKernel<<<blocks, THREADS_PER_BLOCK>>>(
 	    d_grids, d_values, d_value_validity, column_count, value_stride, count, grid_min, grid_max, d_grid_to_group,
-	    build_size, group_count, d_sums, d_counts, d_row_counts);
+	    build_size, group_count, d_sums, d_counts, d_row_counts, ComputeBenchmarkMode());
 	error |= CheckCuda(cudaGetLastError(), "launch multi fused lat aggregate kernel");
 	error |= CheckCuda(cudaDeviceSynchronize(), "synchronize multi fused lat aggregate kernel");
 	if (error) {
@@ -1532,7 +1566,7 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_i64_double_strided_mapped(
 	const auto blocks = static_cast<unsigned int>((count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
 	DuckDBGpuFusedLatAggMultiStridedKernel<<<blocks, THREADS_PER_BLOCK>>>(
 	    d_grids, d_values, d_value_validity, column_count, value_stride, count, grid_min, grid_max, d_grid_to_group,
-	    build_size, group_count, d_sums, d_counts, d_row_counts);
+	    build_size, group_count, d_sums, d_counts, d_row_counts, ComputeBenchmarkMode());
 	error |= CheckCuda(cudaGetLastError(), "launch mapped multi fused lat aggregate kernel");
 	error |= CheckCuda(cudaDeviceSynchronize(), "synchronize mapped multi fused lat aggregate kernel");
 	if (error) {
@@ -2328,7 +2362,7 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_submit_prepared_i64_doubl
 	DuckDBGpuFusedLatAggMultiStridedKernel<<<blocks, THREADS_PER_BLOCK, 0, slot.stream>>>(
 	    d_grids, d_values, d_value_validity, column_count, value_stride, count, slot.grid_min, slot.grid_max,
 	    d_grid_to_group, slot.build_size, slot.group_count, slot.sums.As<double>(),
-	    slot.counts.As<unsigned long long>(), slot.row_counts.As<unsigned long long>());
+	    slot.counts.As<unsigned long long>(), slot.row_counts.As<unsigned long long>(), ComputeBenchmarkMode());
 	if (CheckCuda(cudaGetLastError(), "launch prepared direct multi pipeline fused lat aggregate kernel")) {
 		return 1;
 	}
@@ -2381,7 +2415,7 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_submit_prepared_row_order
 	DuckDBGpuFusedLatAggMultiRowOrderKernel<<<blocks, THREADS_PER_BLOCK, 0, slot.stream>>>(
 	    d_values, d_value_validity, column_count, value_stride, count, row_base, slot.grid_min, slot.grid_max,
 	    d_grid_to_group, slot.build_size, slot.group_count, slot.sums.As<double>(),
-	    slot.counts.As<unsigned long long>(), slot.row_counts.As<unsigned long long>());
+	    slot.counts.As<unsigned long long>(), slot.row_counts.As<unsigned long long>(), ComputeBenchmarkMode());
 	if (CheckCuda(cudaGetLastError(), "launch row-order prepared direct multi pipeline fused lat aggregate kernel")) {
 		return 1;
 	}
@@ -2443,7 +2477,7 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_accumulate_row_order_colu
 	DuckDBGpuFusedLatAggRowOrderColumnKernel<<<blocks, THREADS_PER_BLOCK, 0, slot.stream>>>(
 	    d_values, column_idx, count, row_base, update_row_counts, slot.grid_min, slot.grid_max, d_grid_to_group,
 	    slot.build_size, slot.group_count, slot.sums.As<double>(), slot.counts.As<unsigned long long>(),
-	    slot.row_counts.As<unsigned long long>());
+	    slot.row_counts.As<unsigned long long>(), ComputeBenchmarkMode());
 	if (CheckCuda(cudaGetLastError(), "launch streaming row-order column aggregate kernel")) {
 		return 1;
 	}

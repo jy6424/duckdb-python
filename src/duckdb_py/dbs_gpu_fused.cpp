@@ -59,6 +59,9 @@ struct DuckDBDBSParquetReaderMetricsSnapshot {
 
 extern "C" void duckdb_dbs_parquet_reader_metrics_reset();
 extern "C" void duckdb_dbs_parquet_reader_metrics_snapshot(DuckDBDBSParquetReaderMetricsSnapshot *out);
+extern "C" void *duckdb_dbs_parquet_reader_metrics_create();
+extern "C" void duckdb_dbs_parquet_reader_metrics_destroy(void *metrics);
+extern "C" void duckdb_dbs_parquet_reader_metrics_set_current(void *metrics);
 
 namespace duckdb {
 
@@ -2945,7 +2948,8 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
                                                   std::map<string, std::shared_ptr<GroupMapping>> &dimension_mapping_cache,
                                                   std::mutex &dimension_mapping_cache_lock,
                                                   std::exception_ptr &error_out, std::mutex &error_lock,
-                                                  MultiPipelineStageTimers *timers) {
+                                                  MultiPipelineStageTimers *timers, void *parquet_metrics_context) {
+	duckdb_dbs_parquet_reader_metrics_set_current(parquet_metrics_context);
 	auto stage_start = std::chrono::steady_clock::now();
 	uint64_t chunk_count = 0;
 	uint64_t batch_count = 0;
@@ -4501,6 +4505,17 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 	auto payload_columns = ParsePayloadColumns(payload_columns_p);
 	auto column_count = payload_columns.size();
 
+	void *parquet_metrics_context = duckdb_dbs_parquet_reader_metrics_create();
+	if (!parquet_metrics_context) {
+		throw InvalidInputException("failed to create Parquet reader metrics context");
+	}
+	auto parquet_metrics_deleter = [](void *metrics) {
+		duckdb_dbs_parquet_reader_metrics_set_current(nullptr);
+		duckdb_dbs_parquet_reader_metrics_destroy(metrics);
+	};
+	std::unique_ptr<void, void (*)(void *)> parquet_metrics_guard(parquet_metrics_context,
+	                                                              parquet_metrics_deleter);
+	duckdb_dbs_parquet_reader_metrics_set_current(parquet_metrics_context);
 	duckdb_dbs_parquet_reader_metrics_reset();
 	auto start = std::chrono::steady_clock::now();
 	DuckDB db(nullptr);
@@ -4517,7 +4532,9 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		prefetch_thread.Start(PrefetchPipelineFiles, fact_paths, dimension_file);
 	}
 
-	if (pipeline_mode) {
+	{
+		py::gil_scoped_release release;
+		if (pipeline_mode) {
 		auto reader_thread_count = std::min<idx_t>(ReadEnvIdx("DUCKDB_GPU_PIPELINE_READER_THREADS", 1),
 		                                           std::max<idx_t>(fact_paths.size(), 1));
 		if (reader_thread_count == 0) {
@@ -4572,7 +4589,7 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 					                            std::cref(group_column), std::cref(dimension_file),
 					                            std::ref(dimension_mapping_cache),
 					                            std::ref(dimension_mapping_cache_lock), std::ref(worker_error),
-					                            std::ref(worker_error_lock), &stage_timers);
+					                            std::ref(worker_error_lock), &stage_timers, parquet_metrics_context);
 				}
 			} else if (reader_thread_count == 1) {
 				reader_thread = std::thread(ReadMultiPipelineChunkBatches, std::ref(db), std::cref(fact_paths),
@@ -4772,7 +4789,7 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 				throw;
 			}
 		}
-	} else {
+		} else {
 		auto fused_agg = LoadFusedLatAggMulti(lib_path, mapped);
 		for (auto &fact_path : fact_paths) {
 			auto dimension_path = ResolveDimensionPath(fact_path, dimension_file);
@@ -4802,6 +4819,7 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 
 			MergeMultiFusedResult(total_sums, total_counts, total_row_counts, total_rows, mapping, sums, counts,
 			                      row_counts, column_count);
+		}
 		}
 	}
 
@@ -4938,6 +4956,7 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		}
 	}
 	result["groups"] = groups;
+	duckdb_dbs_parquet_reader_metrics_set_current(nullptr);
 	return result;
 }
 
