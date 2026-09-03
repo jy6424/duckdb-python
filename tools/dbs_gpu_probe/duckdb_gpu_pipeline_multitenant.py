@@ -208,6 +208,10 @@ def run_tenant(tenant_id, args, fact_inputs, payload_columns, dimension_file, st
         "gpu_pop": float(stage_times.get("gpu_pop_time", 0.0)),
         "parquet_decode": float(stage_times.get("parquet_page_decode_time", 0.0)),
         "parquet_direct_scan": float(stage_times.get("parquet_direct_scan_time", 0.0)),
+        "pipeline_handle_reused": int(stage_times.get("pipeline_handle_reused", 0)),
+        "pipeline_acquire_time": float(stage_times.get("pipeline_acquire_time", 0.0)),
+        "pipeline_release_time": float(stage_times.get("pipeline_release_time", 0.0)),
+        "stage_times_full": dict(stage_times),
     }
 
 
@@ -307,12 +311,16 @@ def main():
         for result in results:
             print(
                 "[tenant {} stage] read_thread_max={:.6f}s gpu_pop={:.6f}s "
-                "parquet_decode={:.6f}s parquet_direct_scan={:.6f}s".format(
+                "parquet_decode={:.6f}s parquet_direct_scan={:.6f}s "
+                "pipeline_reused={} pipeline_acquire={:.6f}s pipeline_release={:.6f}s".format(
                     result["tenant_id"],
                     result["read_thread_max"],
                     result["gpu_pop"],
                     result["parquet_decode"],
                     result["parquet_direct_scan"],
+                    result["pipeline_handle_reused"],
+                    result["pipeline_acquire_time"],
+                    result["pipeline_release_time"],
                 )
             )
 

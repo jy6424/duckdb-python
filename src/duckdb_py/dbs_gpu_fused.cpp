@@ -158,6 +158,46 @@ struct FusedLatAggMultiDirectPipelineFuncs {
 	FusedLatAggPipelineDestroyFunc destroy = nullptr;
 };
 
+// Per-request create()/destroy() of a direct multi pipeline handle is expensive: destroy() tears
+// down cudaStream_t objects and (in mapped mode) cudaFreeHost's page-locked host buffers, both of
+// which serialize against a process-wide CUDA driver lock. Under many concurrent tenants, those
+// teardowns queue up back-to-back at the tail of a run instead of overlapping. Handles are safe to
+// reuse across calls because every per-file usage already calls reset()/prepare_input() before
+// submitting new data (see PrepareDirectMultiPipelineChunkBatches / ReadDirectMappedParquetPipelineWorker),
+// and internal buffers only grow-on-demand (FusedLatAggPipelineSlot::Ensure), so a pooled handle
+// simply reuses its largest-seen allocation instead of freeing and reallocating it every call.
+class DirectMultiPipelinePool {
+public:
+	void *Acquire(uint32_t pipeline_slots, int memory_mode) {
+		std::lock_guard<std::mutex> guard(lock);
+		auto &free_list = pools[MakeKey(pipeline_slots, memory_mode)];
+		if (free_list.empty()) {
+			return nullptr;
+		}
+		auto handle = free_list.back();
+		free_list.pop_back();
+		return handle;
+	}
+
+	void Release(uint32_t pipeline_slots, int memory_mode, void *handle) {
+		std::lock_guard<std::mutex> guard(lock);
+		pools[MakeKey(pipeline_slots, memory_mode)].push_back(handle);
+	}
+
+private:
+	static uint64_t MakeKey(uint32_t pipeline_slots, int memory_mode) {
+		return (static_cast<uint64_t>(pipeline_slots) << 32) | static_cast<uint32_t>(memory_mode);
+	}
+
+	std::mutex lock;
+	std::map<uint64_t, vector<void *>> pools;
+};
+
+static DirectMultiPipelinePool &GetDirectMultiPipelinePool() {
+	static DirectMultiPipelinePool pool;
+	return pool;
+}
+
 static string EscapeSQLString(const string &value) {
 	string result;
 	result.reserve(value.size());
@@ -1320,6 +1360,9 @@ struct MultiPipelineStageTimers {
 	uint64_t dimension_mapping_reuses = 0;
 	uint64_t direct_decode_queue_depth = 0;
 	uint64_t pipeline_slots = 0;
+	uint64_t pipeline_handle_reused = 0;
+	double pipeline_acquire_time = 0;
+	double pipeline_release_time = 0;
 };
 
 static double ElapsedSeconds(std::chrono::steady_clock::time_point start) {
@@ -4562,8 +4605,15 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 			}
 			pipeline_slots = MinValue<idx_t>(pipeline_slots, 16);
 			auto direct_pipeline = LoadFusedLatAggMultiDirectPipeline(lib_path, pipeline_device_direct_mode);
-			void *handle =
-			    direct_pipeline.create(static_cast<uint32_t>(pipeline_slots), pipeline_device_direct_mode ? 0 : 1);
+			const int pipeline_memory_mode_key = pipeline_device_direct_mode ? 0 : 1;
+			auto &pipeline_pool = GetDirectMultiPipelinePool();
+			auto acquire_start = std::chrono::steady_clock::now();
+			void *handle = pipeline_pool.Acquire(static_cast<uint32_t>(pipeline_slots), pipeline_memory_mode_key);
+			stage_timers.pipeline_handle_reused = handle != nullptr ? 1 : 0;
+			if (!handle) {
+				handle = direct_pipeline.create(static_cast<uint32_t>(pipeline_slots), pipeline_memory_mode_key);
+			}
+			stage_timers.pipeline_acquire_time = ElapsedSeconds(acquire_start);
 			if (!handle) {
 				throw InvalidInputException("GPU fused direct multi pipeline create failed");
 			}
@@ -4684,10 +4734,14 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 				if (merge_thread.joinable()) {
 					merge_thread.join();
 				}
+				// Don't return a handle that failed mid-flight to the pool: its CUDA streams/buffers
+				// may be left in an inconsistent state, so tear it down for real instead of reusing it.
 				direct_pipeline.destroy(handle);
 				throw;
 			}
-			direct_pipeline.destroy(handle);
+			auto release_start = std::chrono::steady_clock::now();
+			pipeline_pool.Release(static_cast<uint32_t>(pipeline_slots), pipeline_memory_mode_key, handle);
+			stage_timers.pipeline_release_time = ElapsedSeconds(release_start);
 		} else if (reader_thread_count == 1) {
 			auto fused_agg_strided = LoadFusedLatAggMultiStrided(lib_path, mapped);
 			BlockingQueue<MultiPipelineInputBatch> input_queue(8);
@@ -4895,6 +4949,9 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		stage_times["dimension_mapping_reuses"] = py::int_(stage_timers.dimension_mapping_reuses);
 		stage_times["direct_decode_queue_depth"] = py::int_(stage_timers.direct_decode_queue_depth);
 		stage_times["pipeline_slots"] = py::int_(stage_timers.pipeline_slots);
+		stage_times["pipeline_handle_reused"] = py::int_(stage_timers.pipeline_handle_reused);
+		stage_times["pipeline_acquire_time"] = py::float_(stage_timers.pipeline_acquire_time);
+		stage_times["pipeline_release_time"] = py::float_(stage_timers.pipeline_release_time);
 	}
 	DuckDBDBSParquetReaderMetricsSnapshot parquet_metrics;
 	duckdb_dbs_parquet_reader_metrics_snapshot(&parquet_metrics);
