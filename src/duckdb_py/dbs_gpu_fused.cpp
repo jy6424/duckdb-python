@@ -374,218 +374,232 @@ static void CopyUnifiedValidityToBytes(uint8_t *target, const UnifiedColumnReade
 	}
 }
 
+// Note on thread safety: these Load* functions cache dlopen/dlsym results in function-local statics
+// and are called concurrently by every tenant's worker thread the first time a given mode is used.
+// C++11 "magic statics" only guarantee thread-safe *construction* of the static objects themselves --
+// the dlopen/dlsym/field-assignment code below runs every time the cached-value check fails, with no
+// synchronization, so concurrent first calls used to race on writing the same static variables (data
+// race / UB, and duplicated dlopen/dlsym work). std::call_once makes the actual loading run exactly
+// once, with every other concurrent caller blocking until it's done instead of redoing or racing it.
 static FusedLatAggFunc LoadFusedLatAgg(const string &path_p, bool mapped) {
+	static std::once_flag device_once;
+	static std::once_flag mapped_once;
 	static void *device_handle = nullptr;
 	static void *mapped_handle = nullptr;
 	static FusedLatAggFunc device_func = nullptr;
 	static FusedLatAggFunc mapped_func = nullptr;
 
+	auto &once = mapped ? mapped_once : device_once;
 	void **handle_ptr = mapped ? &mapped_handle : &device_handle;
 	auto &func = mapped ? mapped_func : device_func;
-	if (func) {
-		return func;
-	}
 
-	string path = path_p;
-	if (path.empty()) {
-		const char *env_path = std::getenv("DUCKDB_GPU_PROBE_LIB");
-		if (env_path && env_path[0]) {
-			path = env_path;
-		} else {
-			path = "libduckdb_gpu_probe.so";
+	std::call_once(once, [&]() {
+		string path = path_p;
+		if (path.empty()) {
+			const char *env_path = std::getenv("DUCKDB_GPU_PROBE_LIB");
+			if (env_path && env_path[0]) {
+				path = env_path;
+			} else {
+				path = "libduckdb_gpu_probe.so";
+			}
 		}
-	}
 
-	*handle_ptr = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-	if (!*handle_ptr) {
-		throw InvalidInputException("Failed to load GPU helper library '%s': %s", path, dlerror());
-	}
+		*handle_ptr = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+		if (!*handle_ptr) {
+			throw InvalidInputException("Failed to load GPU helper library '%s': %s", path, dlerror());
+		}
 
-	const char *symbol = mapped ? "duckdb_gpu_fused_lat_agg_i64_double_mapped" : "duckdb_gpu_fused_lat_agg_i64_double";
-	func = reinterpret_cast<FusedLatAggFunc>(dlsym(*handle_ptr, symbol));
-	if (!func) {
-		throw InvalidInputException("Failed to load GPU helper symbol '%s': %s", symbol, dlerror());
-	}
+		const char *symbol =
+		    mapped ? "duckdb_gpu_fused_lat_agg_i64_double_mapped" : "duckdb_gpu_fused_lat_agg_i64_double";
+		func = reinterpret_cast<FusedLatAggFunc>(dlsym(*handle_ptr, symbol));
+		if (!func) {
+			throw InvalidInputException("Failed to load GPU helper symbol '%s': %s", symbol, dlerror());
+		}
+	});
 	return func;
 }
 
 static FusedLatAggMultiFunc LoadFusedLatAggMulti(const string &path_p, bool mapped) {
+	static std::once_flag device_once;
+	static std::once_flag mapped_once;
 	static void *device_handle = nullptr;
 	static void *mapped_handle = nullptr;
 	static FusedLatAggMultiFunc device_func = nullptr;
 	static FusedLatAggMultiFunc mapped_func = nullptr;
 
+	auto &once = mapped ? mapped_once : device_once;
 	void **handle_ptr = mapped ? &mapped_handle : &device_handle;
 	auto &func = mapped ? mapped_func : device_func;
-	if (func) {
-		return func;
-	}
 
-	string path = path_p;
-	if (path.empty()) {
-		const char *env_path = std::getenv("DUCKDB_GPU_PROBE_LIB");
-		if (env_path && env_path[0]) {
-			path = env_path;
-		} else {
-			path = "libduckdb_gpu_probe.so";
+	std::call_once(once, [&]() {
+		string path = path_p;
+		if (path.empty()) {
+			const char *env_path = std::getenv("DUCKDB_GPU_PROBE_LIB");
+			if (env_path && env_path[0]) {
+				path = env_path;
+			} else {
+				path = "libduckdb_gpu_probe.so";
+			}
 		}
-	}
 
-	*handle_ptr = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-	if (!*handle_ptr) {
-		throw InvalidInputException("Failed to load GPU helper library '%s': %s", path, dlerror());
-	}
+		*handle_ptr = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+		if (!*handle_ptr) {
+			throw InvalidInputException("Failed to load GPU helper library '%s': %s", path, dlerror());
+		}
 
-	const char *symbol =
-	    mapped ? "duckdb_gpu_fused_lat_agg_multi_i64_double_mapped" : "duckdb_gpu_fused_lat_agg_multi_i64_double";
-	func = reinterpret_cast<FusedLatAggMultiFunc>(dlsym(*handle_ptr, symbol));
-	if (!func) {
-		throw InvalidInputException("Failed to load GPU helper symbol '%s': %s", symbol, dlerror());
-	}
+		const char *symbol =
+		    mapped ? "duckdb_gpu_fused_lat_agg_multi_i64_double_mapped" : "duckdb_gpu_fused_lat_agg_multi_i64_double";
+		func = reinterpret_cast<FusedLatAggMultiFunc>(dlsym(*handle_ptr, symbol));
+		if (!func) {
+			throw InvalidInputException("Failed to load GPU helper symbol '%s': %s", symbol, dlerror());
+		}
+	});
 	return func;
 }
 
 static FusedLatAggMultiStridedFunc LoadFusedLatAggMultiStrided(const string &path_p, bool mapped) {
+	static std::once_flag device_once;
+	static std::once_flag mapped_once;
 	static void *device_handle = nullptr;
 	static void *mapped_handle = nullptr;
 	static FusedLatAggMultiStridedFunc device_func = nullptr;
 	static FusedLatAggMultiStridedFunc mapped_func = nullptr;
 
+	auto &once = mapped ? mapped_once : device_once;
 	void **handle_ptr = mapped ? &mapped_handle : &device_handle;
 	auto &func = mapped ? mapped_func : device_func;
-	if (func) {
-		return func;
-	}
 
-	string path = path_p;
-	if (path.empty()) {
-		const char *env_path = std::getenv("DUCKDB_GPU_PROBE_LIB");
-		if (env_path && env_path[0]) {
-			path = env_path;
-		} else {
-			path = "libduckdb_gpu_probe.so";
+	std::call_once(once, [&]() {
+		string path = path_p;
+		if (path.empty()) {
+			const char *env_path = std::getenv("DUCKDB_GPU_PROBE_LIB");
+			if (env_path && env_path[0]) {
+				path = env_path;
+			} else {
+				path = "libduckdb_gpu_probe.so";
+			}
 		}
-	}
 
-	*handle_ptr = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-	if (!*handle_ptr) {
-		throw InvalidInputException("Failed to load GPU helper library '%s': %s", path, dlerror());
-	}
+		*handle_ptr = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+		if (!*handle_ptr) {
+			throw InvalidInputException("Failed to load GPU helper library '%s': %s", path, dlerror());
+		}
 
-	const char *symbol = mapped ? "duckdb_gpu_fused_lat_agg_multi_i64_double_strided_mapped" :
-	                             "duckdb_gpu_fused_lat_agg_multi_i64_double_strided";
-	func = reinterpret_cast<FusedLatAggMultiStridedFunc>(dlsym(*handle_ptr, symbol));
-	if (!func) {
-		throw InvalidInputException("Failed to load GPU helper symbol '%s': %s", symbol, dlerror());
-	}
+		const char *symbol = mapped ? "duckdb_gpu_fused_lat_agg_multi_i64_double_strided_mapped" :
+		                             "duckdb_gpu_fused_lat_agg_multi_i64_double_strided";
+		func = reinterpret_cast<FusedLatAggMultiStridedFunc>(dlsym(*handle_ptr, symbol));
+		if (!func) {
+			throw InvalidInputException("Failed to load GPU helper symbol '%s': %s", symbol, dlerror());
+		}
+	});
 	return func;
 }
 
 static FusedLatAggPipelineFuncs LoadFusedLatAggPipeline(const string &path_p) {
+	static std::once_flag once;
 	static void *handle = nullptr;
 	static FusedLatAggPipelineFuncs funcs;
-	if (funcs.create && funcs.submit && funcs.reset && funcs.submit_accumulate && funcs.prepare_input &&
-	    funcs.submit_prepared && funcs.sync_slot && funcs.wait && funcs.destroy) {
-		return funcs;
-	}
 
-	string path = path_p;
-	if (path.empty()) {
-		const char *env_path = std::getenv("DUCKDB_GPU_PROBE_LIB");
-		if (env_path && env_path[0]) {
-			path = env_path;
-		} else {
-			path = "libduckdb_gpu_probe.so";
+	std::call_once(once, [&]() {
+		string path = path_p;
+		if (path.empty()) {
+			const char *env_path = std::getenv("DUCKDB_GPU_PROBE_LIB");
+			if (env_path && env_path[0]) {
+				path = env_path;
+			} else {
+				path = "libduckdb_gpu_probe.so";
+			}
 		}
-	}
 
-	handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-	if (!handle) {
-		throw InvalidInputException("Failed to load GPU helper library '%s': %s", path, dlerror());
-	}
+		handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+		if (!handle) {
+			throw InvalidInputException("Failed to load GPU helper library '%s': %s", path, dlerror());
+		}
 
-	funcs.create = reinterpret_cast<FusedLatAggPipelineCreateFunc>(
-	    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_create"));
-	funcs.submit = reinterpret_cast<FusedLatAggPipelineSubmitFunc>(
-	    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_submit_i64_double"));
-	funcs.reset = reinterpret_cast<FusedLatAggPipelineResetFunc>(
-	    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_reset_i64_double"));
-	funcs.submit_accumulate = reinterpret_cast<FusedLatAggPipelineSubmitAccumulateFunc>(
-	    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_submit_accumulate_i64_double"));
-	funcs.prepare_input = reinterpret_cast<FusedLatAggPipelinePrepareInputFunc>(
-	    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_prepare_input_i64_double"));
-	funcs.submit_prepared = reinterpret_cast<FusedLatAggPipelineSubmitPreparedFunc>(
-	    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_submit_prepared_i64_double"));
-	funcs.sync_slot =
-	    reinterpret_cast<FusedLatAggPipelineSyncSlotFunc>(dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_sync_slot"));
-	funcs.wait =
-	    reinterpret_cast<FusedLatAggPipelineWaitFunc>(dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_wait"));
-	funcs.destroy =
-	    reinterpret_cast<FusedLatAggPipelineDestroyFunc>(dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_destroy"));
-	if (!funcs.create || !funcs.submit || !funcs.reset || !funcs.submit_accumulate || !funcs.prepare_input ||
-	    !funcs.submit_prepared || !funcs.sync_slot || !funcs.wait || !funcs.destroy) {
-		throw InvalidInputException("Failed to load GPU fused pipeline symbols from '%s'", path);
-	}
+		funcs.create = reinterpret_cast<FusedLatAggPipelineCreateFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_create"));
+		funcs.submit = reinterpret_cast<FusedLatAggPipelineSubmitFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_submit_i64_double"));
+		funcs.reset = reinterpret_cast<FusedLatAggPipelineResetFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_reset_i64_double"));
+		funcs.submit_accumulate = reinterpret_cast<FusedLatAggPipelineSubmitAccumulateFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_submit_accumulate_i64_double"));
+		funcs.prepare_input = reinterpret_cast<FusedLatAggPipelinePrepareInputFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_prepare_input_i64_double"));
+		funcs.submit_prepared = reinterpret_cast<FusedLatAggPipelineSubmitPreparedFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_submit_prepared_i64_double"));
+		funcs.sync_slot = reinterpret_cast<FusedLatAggPipelineSyncSlotFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_sync_slot"));
+		funcs.wait =
+		    reinterpret_cast<FusedLatAggPipelineWaitFunc>(dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_wait"));
+		funcs.destroy = reinterpret_cast<FusedLatAggPipelineDestroyFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_destroy"));
+		if (!funcs.create || !funcs.submit || !funcs.reset || !funcs.submit_accumulate || !funcs.prepare_input ||
+		    !funcs.submit_prepared || !funcs.sync_slot || !funcs.wait || !funcs.destroy) {
+			throw InvalidInputException("Failed to load GPU fused pipeline symbols from '%s'", path);
+		}
+	});
 	return funcs;
 }
 
 static FusedLatAggMultiDirectPipelineFuncs LoadFusedLatAggMultiDirectPipeline(const string &path_p,
                                                                              bool require_device_direct = false) {
+	static std::once_flag once;
 	static void *handle = nullptr;
 	static FusedLatAggMultiDirectPipelineFuncs funcs;
-	if (funcs.create && funcs.prepare_input && funcs.reset && funcs.submit_prepared && funcs.sync_slot &&
-	    funcs.wait && funcs.destroy &&
-	    (!require_device_direct || (funcs.prepare_device_input && funcs.copy_grids && funcs.copy_values))) {
-		return funcs;
-	}
 
-	string path = path_p;
-	if (path.empty()) {
-		const char *env_path = std::getenv("DUCKDB_GPU_PROBE_LIB");
-		if (env_path && env_path[0]) {
-			path = env_path;
-		} else {
-			path = "libduckdb_gpu_probe.so";
+	// The actual dlopen/dlsym work loads every symbol unconditionally regardless of
+	// require_device_direct, so it only needs to happen once ever; the device-direct-specific
+	// symbols are validated below, on every call, against whichever caller's requirement.
+	std::call_once(once, [&]() {
+		string path = path_p;
+		if (path.empty()) {
+			const char *env_path = std::getenv("DUCKDB_GPU_PROBE_LIB");
+			if (env_path && env_path[0]) {
+				path = env_path;
+			} else {
+				path = "libduckdb_gpu_probe.so";
+			}
 		}
-	}
 
-	handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-	if (!handle) {
-		throw InvalidInputException("Failed to load GPU helper library '%s': %s", path, dlerror());
-	}
+		handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+		if (!handle) {
+			throw InvalidInputException("Failed to load GPU helper library '%s': %s", path, dlerror());
+		}
 
-	funcs.create = reinterpret_cast<FusedLatAggPipelineCreateFunc>(
-	    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_create"));
-	funcs.prepare_input = reinterpret_cast<FusedLatAggMultiPipelinePrepareInputFunc>(
-	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_prepare_input_i64_double"));
-	funcs.prepare_row_order_input = reinterpret_cast<FusedLatAggMultiPipelinePrepareRowOrderInputFunc>(
-	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_prepare_row_order_input_i64_double"));
-	funcs.prepare_device_input = reinterpret_cast<FusedLatAggMultiPipelinePrepareDeviceInputFunc>(
-	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_prepare_device_input_i64_double"));
-	funcs.copy_grids = reinterpret_cast<FusedLatAggMultiPipelineCopyGridsFunc>(
-	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_copy_grids_i64"));
-	funcs.copy_values = reinterpret_cast<FusedLatAggMultiPipelineCopyValuesFunc>(
-	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_copy_values_double"));
-	funcs.reset = reinterpret_cast<FusedLatAggMultiPipelineResetFunc>(
-	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_reset_i64_double"));
-	funcs.submit_prepared = reinterpret_cast<FusedLatAggMultiPipelineSubmitPreparedFunc>(
-	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_submit_prepared_i64_double"));
-	funcs.submit_prepared_row_order = reinterpret_cast<FusedLatAggMultiPipelineSubmitPreparedRowOrderFunc>(
-	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_submit_prepared_row_order_i64_double"));
-	funcs.accumulate_row_order_column = reinterpret_cast<FusedLatAggMultiPipelineAccumulateRowOrderColumnFunc>(
-	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_accumulate_row_order_column_i64_double"));
-	funcs.sync_slot =
-	    reinterpret_cast<FusedLatAggPipelineSyncSlotFunc>(dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_sync_slot"));
-	funcs.wait = reinterpret_cast<FusedLatAggMultiPipelineWaitFunc>(
-	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_wait"));
-	funcs.destroy =
-	    reinterpret_cast<FusedLatAggPipelineDestroyFunc>(dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_destroy"));
-	if (!funcs.create || !funcs.prepare_input || !funcs.reset || !funcs.submit_prepared || !funcs.sync_slot ||
-	    !funcs.wait || !funcs.destroy) {
-		throw InvalidInputException("Failed to load GPU fused multi direct pipeline symbols from '%s'", path);
-	}
+		funcs.create = reinterpret_cast<FusedLatAggPipelineCreateFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_create"));
+		funcs.prepare_input = reinterpret_cast<FusedLatAggMultiPipelinePrepareInputFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_prepare_input_i64_double"));
+		funcs.prepare_row_order_input = reinterpret_cast<FusedLatAggMultiPipelinePrepareRowOrderInputFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_prepare_row_order_input_i64_double"));
+		funcs.prepare_device_input = reinterpret_cast<FusedLatAggMultiPipelinePrepareDeviceInputFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_prepare_device_input_i64_double"));
+		funcs.copy_grids = reinterpret_cast<FusedLatAggMultiPipelineCopyGridsFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_copy_grids_i64"));
+		funcs.copy_values = reinterpret_cast<FusedLatAggMultiPipelineCopyValuesFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_copy_values_double"));
+		funcs.reset = reinterpret_cast<FusedLatAggMultiPipelineResetFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_reset_i64_double"));
+		funcs.submit_prepared = reinterpret_cast<FusedLatAggMultiPipelineSubmitPreparedFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_submit_prepared_i64_double"));
+		funcs.submit_prepared_row_order = reinterpret_cast<FusedLatAggMultiPipelineSubmitPreparedRowOrderFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_submit_prepared_row_order_i64_double"));
+		funcs.accumulate_row_order_column = reinterpret_cast<FusedLatAggMultiPipelineAccumulateRowOrderColumnFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_accumulate_row_order_column_i64_double"));
+		funcs.sync_slot = reinterpret_cast<FusedLatAggPipelineSyncSlotFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_sync_slot"));
+		funcs.wait = reinterpret_cast<FusedLatAggMultiPipelineWaitFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_wait"));
+		funcs.destroy = reinterpret_cast<FusedLatAggPipelineDestroyFunc>(
+		    dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_destroy"));
+		if (!funcs.create || !funcs.prepare_input || !funcs.reset || !funcs.submit_prepared || !funcs.sync_slot ||
+		    !funcs.wait || !funcs.destroy) {
+			throw InvalidInputException("Failed to load GPU fused multi direct pipeline symbols from '%s'", path);
+		}
+	});
 	if (require_device_direct && (!funcs.prepare_device_input || !funcs.copy_grids || !funcs.copy_values)) {
-		throw InvalidInputException("Failed to load GPU fused multi device-direct pipeline symbols from '%s'", path);
+		throw InvalidInputException("Failed to load GPU fused multi device-direct pipeline symbols from '%s'", path_p);
 	}
 	return funcs;
 }
