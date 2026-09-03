@@ -2978,6 +2978,10 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 		    row_order_direct_submit && ReadEnvFlag("DUCKDB_GPU_PARQUET_DIRECT_DOUBLE_SCAN", true);
 		auto target_batch_rows = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_ROWS", 65536);
 		auto target_batch_chunks = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_CHUNKS", 32);
+		auto direct_scan_rows = ReadEnvIdx("DUCKDB_GPU_PARQUET_DIRECT_SCAN_ROWS", STANDARD_VECTOR_SIZE);
+		if (!direct_double_scan) {
+			direct_scan_rows = STANDARD_VECTOR_SIZE;
+		}
 		if (target_batch_rows < STANDARD_VECTOR_SIZE || target_batch_chunks == 0) {
 			throw InvalidInputException(
 			    "direct parquet decode requires DUCKDB_GPU_PIPELINE_BATCH_ROWS >= STANDARD_VECTOR_SIZE and chunks > 0");
@@ -3136,8 +3140,13 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 				idx_t result_size = 0;
 				AsyncResult scan_result;
 				if (direct_double_scan) {
+					auto scan_capacity = MinValue<idx_t>(direct_scan_rows, target_batch_rows - reserved_rows);
+					if (scan_capacity == 0) {
+						flush_current();
+						continue;
+					}
 					scan_result = reader.ScanDirectDoubles(context, scan_state, direct_outputs.data(),
-					                                      direct_outputs.size(), STANDARD_VECTOR_SIZE, result_size);
+					                                      direct_outputs.size(), scan_capacity, result_size);
 				} else {
 					scan_result = reader.Scan(context, scan_state, *result);
 				}

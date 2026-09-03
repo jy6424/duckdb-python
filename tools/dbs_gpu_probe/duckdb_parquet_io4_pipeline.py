@@ -432,6 +432,7 @@ def main():
         print("[row-order direct submit]: on")
         if os.environ.get("DUCKDB_GPU_PARQUET_DIRECT_DOUBLE_SCAN", "1") == "1":
             print("[parquet direct double scan]: on")
+            print("[parquet direct scan rows]: {}".format(os.environ.get("DUCKDB_GPU_PARQUET_DIRECT_SCAN_ROWS", "2048")))
     if os.environ.get("DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID") == "1":
         print("[assume payload all valid]: on")
     if os.environ.get("DUCKDB_GPU_FETCH_RAW") == "1":
