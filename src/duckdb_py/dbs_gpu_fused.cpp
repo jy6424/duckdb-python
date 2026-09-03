@@ -3076,7 +3076,8 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
                                                   std::map<string, std::shared_ptr<GroupMapping>> &dimension_mapping_cache,
                                                   std::mutex &dimension_mapping_cache_lock,
                                                   std::exception_ptr &error_out, std::mutex &error_lock,
-                                                  MultiPipelineStageTimers *timers, void *parquet_metrics_context) {
+                                                  MultiPipelineStageTimers *timers, void *parquet_metrics_context,
+                                                  BlockingQueue<RowOrderAccumulateEvent> *accumulate_queue) {
 	duckdb_dbs_parquet_reader_metrics_set_current(parquet_metrics_context);
 	auto stage_start = std::chrono::steady_clock::now();
 	uint64_t chunk_count = 0;
@@ -3111,12 +3112,6 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 	std::unique_ptr<BlockingQueue<DirectMappedDecodedEvent>> decoded_queue;
 	std::unique_ptr<std::thread> emit_thread;
 	bool emit_thread_started = false;
-	std::unique_ptr<BlockingQueue<RowOrderAccumulateEvent>> accumulate_queue;
-	std::unique_ptr<std::thread> accumulate_thread;
-	bool accumulate_thread_started = false;
-	double accumulate_pop_elapsed = 0;
-	double accumulate_work_elapsed = 0;
-	double accumulate_push_elapsed = 0;
 	double reader_stage_elapsed = 0;
 	idx_t decoded_queue_depth = 0;
 	try {
@@ -3134,17 +3129,8 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 		if (row_order_stream_accumulate && !pipeline.accumulate_row_order_column) {
 			throw InvalidInputException("GPU helper library does not provide row-order streaming accumulation support");
 		}
-		if (row_order_stream_accumulate) {
-			auto accumulate_queue_depth = ReadEnvIdx("DUCKDB_GPU_ROW_ORDER_ACCUMULATE_QUEUE_DEPTH", 8);
-			if (accumulate_queue_depth == 0) {
-				accumulate_queue_depth = 1;
-			}
-			accumulate_queue = make_uniq<BlockingQueue<RowOrderAccumulateEvent>>(accumulate_queue_depth);
-			accumulate_thread = make_uniq<std::thread>(
-			    RunRowOrderAccumulateWorker, pipeline, handle, std::ref(*accumulate_queue), std::ref(input_queue),
-			    std::ref(accumulate_pop_elapsed), std::ref(accumulate_work_elapsed),
-			    std::ref(accumulate_push_elapsed), std::ref(error_out), std::ref(error_lock));
-			accumulate_thread_started = true;
+		if (row_order_stream_accumulate && !accumulate_queue) {
+			throw InvalidInputException("row-order stream accumulate requires a shared accumulate queue");
 		}
 		auto target_batch_rows = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_ROWS", 65536);
 		auto target_batch_chunks = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_CHUNKS", 32);
@@ -3463,12 +3449,8 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 	if (emit_thread_started && emit_thread && emit_thread->joinable()) {
 		emit_thread->join();
 	}
-	if (accumulate_queue) {
-		accumulate_queue->Close();
-	}
-	if (accumulate_thread_started && accumulate_thread && accumulate_thread->joinable()) {
-		accumulate_thread->join();
-	}
+	// accumulate_queue/its worker thread are shared across this tenant's reader threads and owned
+	// by the caller (DBSGPUFusedLatMulti) -- it closes and joins them once all reader threads finish.
 	prepare_work_elapsed += direct_finish_chunk_elapsed;
 	if (timers) {
 		auto read_elapsed = reader_stage_elapsed;
@@ -3506,9 +3488,6 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 		timers->dimension_mapping_reuses += mapping_reuses;
 		timers->direct_decode_queue_depth = std::max<uint64_t>(
 		    timers->direct_decode_queue_depth, static_cast<uint64_t>(decoded_queue_depth));
-		timers->accumulate_pop_time += accumulate_pop_elapsed;
-		timers->accumulate_work_time += accumulate_work_elapsed;
-		timers->accumulate_push_time += accumulate_push_elapsed;
 	}
 }
 
@@ -4757,6 +4736,33 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 				    "row-order direct submit requires pipeline-mapped-direct mode with direct parquet decode and "
 				    "row-order grid inference");
 			}
+			// One shared GPU-submission thread per tenant (not one per reader thread): all of this
+			// tenant's reader threads decode into the same accumulate_queue. A per-reader-thread
+			// submitter was tried first and made things *worse* -- it multiplied the number of
+			// threads hammering the GPU driver/streams concurrently (reader_thread_count per tenant
+			// instead of 1), and that extra contention outweighed the overlap benefit. One shared
+			// submitter matches how RunDirectMultiPipelineGPUWorker (the non-stream-accumulate GPU
+			// consumer, below) is already scoped -- one per tenant, fed by however many readers.
+			auto row_order_stream_accumulate_flag =
+			    ReadEnvFlag("DUCKDB_GPU_ROW_ORDER_DIRECT_SUBMIT", false) &&
+			    ReadEnvFlag("DUCKDB_GPU_PARQUET_DIRECT_DOUBLE_SCAN", true) &&
+			    ReadEnvFlag("DUCKDB_GPU_ROW_ORDER_STREAM_ACCUMULATE", false);
+			std::unique_ptr<BlockingQueue<RowOrderAccumulateEvent>> accumulate_queue;
+			std::unique_ptr<std::thread> accumulate_thread;
+			double accumulate_pop_elapsed = 0;
+			double accumulate_work_elapsed = 0;
+			double accumulate_push_elapsed = 0;
+			if (direct_parquet_decode && row_order_stream_accumulate_flag) {
+				auto accumulate_queue_depth = ReadEnvIdx("DUCKDB_GPU_ROW_ORDER_ACCUMULATE_QUEUE_DEPTH", 8);
+				if (accumulate_queue_depth == 0) {
+					accumulate_queue_depth = 1;
+				}
+				accumulate_queue = make_uniq<BlockingQueue<RowOrderAccumulateEvent>>(accumulate_queue_depth);
+				accumulate_thread = make_uniq<std::thread>(
+				    RunRowOrderAccumulateWorker, direct_pipeline, handle, std::ref(*accumulate_queue),
+				    std::ref(input_queue), std::ref(accumulate_pop_elapsed), std::ref(accumulate_work_elapsed),
+				    std::ref(accumulate_push_elapsed), std::ref(worker_error), std::ref(worker_error_lock));
+			}
 			if (direct_parquet_decode) {
 				for (auto &fact_path : fact_paths) {
 					file_queue.Push(fact_path);
@@ -4770,7 +4776,8 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 					                            std::cref(group_column), std::cref(dimension_file),
 					                            std::ref(dimension_mapping_cache),
 					                            std::ref(dimension_mapping_cache_lock), std::ref(worker_error),
-					                            std::ref(worker_error_lock), &stage_timers, parquet_metrics_context);
+					                            std::ref(worker_error_lock), &stage_timers, parquet_metrics_context,
+					                            accumulate_queue.get());
 				}
 			} else if (reader_thread_count == 1) {
 				reader_thread = std::thread(ReadMultiPipelineChunkBatches, std::ref(db), std::cref(fact_paths),
@@ -4812,6 +4819,12 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 					for (auto &reader_thread_item : reader_threads) {
 						reader_thread_item.join();
 					}
+					if (accumulate_queue) {
+						accumulate_queue->Close();
+					}
+					if (accumulate_thread && accumulate_thread->joinable()) {
+						accumulate_thread->join();
+					}
 					input_queue.Close();
 				} else if (reader_thread_count == 1) {
 					reader_thread.join();
@@ -4831,12 +4844,21 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 					std::rethrow_exception(worker_error);
 				}
 				stage_timers.pipeline_slots = static_cast<uint64_t>(pipeline_slots);
+				if (accumulate_thread) {
+					std::lock_guard<std::mutex> guard(stage_timers.lock);
+					stage_timers.accumulate_pop_time += accumulate_pop_elapsed;
+					stage_timers.accumulate_work_time += accumulate_work_elapsed;
+					stage_timers.accumulate_push_time += accumulate_push_elapsed;
+				}
 			} catch (...) {
 				chunk_queue.Close();
 				input_queue.Close();
 				output_queue.Close();
 				free_slots.Close();
 				file_queue.Close();
+				if (accumulate_queue) {
+					accumulate_queue->Close();
+				}
 				if (reader_thread.joinable()) {
 					reader_thread.join();
 				}
@@ -4844,6 +4866,9 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 					if (reader_thread_item.joinable()) {
 						reader_thread_item.join();
 					}
+				}
+				if (accumulate_thread && accumulate_thread->joinable()) {
+					accumulate_thread->join();
 				}
 				if (prepare_thread && prepare_thread->joinable()) {
 					prepare_thread->join();
