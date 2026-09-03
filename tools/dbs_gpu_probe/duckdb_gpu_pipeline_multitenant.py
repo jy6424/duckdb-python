@@ -62,6 +62,11 @@ def parse_args():
     parser.add_argument("--parquet-direct-decode", action="store_true")
     parser.add_argument("--row-order-direct-submit", action="store_true")
     parser.add_argument("--row-order-stream-accumulate", action="store_true")
+    parser.add_argument(
+        "--materialize-results",
+        action="store_true",
+        help="build the full per-group Python result objects; off by default for latency/throughput tests",
+    )
     parser.add_argument("--disable-column-chunk-prefetch", action="store_true")
     parser.add_argument("--disable-async-prefetch", action="store_true")
     parser.add_argument(
@@ -167,6 +172,8 @@ def configure_environment(args):
         os.environ.setdefault("DUCKDB_GPU_ROW_ORDER_DIRECT_SUBMIT", "1")
     if args.benchmark_expr != "sum":
         os.environ["DUCKDB_GPU_COMPUTE_BENCHMARK"] = args.benchmark_expr
+    if not args.materialize_results:
+        os.environ["DUCKDB_GPU_SKIP_GROUP_RESULTS"] = "1"
 
 
 def resolve_fact_inputs(args, parquet_paths, grid_paths):
@@ -196,7 +203,7 @@ def run_tenant(tenant_id, args, fact_inputs, payload_columns, dimension_file, st
         "elapsed": elapsed,
         "query_time": float(result.get("query_time", elapsed)),
         "row_count": int(result["row_count"]),
-        "group_count": len(result.get("groups", [])),
+        "group_count": int(result.get("group_count", len(result.get("groups", [])))),
         "read_thread_max": float(stage_times.get("read_thread_max_time", 0.0)),
         "gpu_pop": float(stage_times.get("gpu_pop_time", 0.0)),
         "parquet_decode": float(stage_times.get("parquet_page_decode_time", 0.0)),

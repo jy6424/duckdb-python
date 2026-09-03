@@ -4910,6 +4910,13 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		payloads.append(payload_column);
 	}
 	result["payload_columns"] = payloads;
+	auto result_group_count = pipeline_mode ? accumulated_result.group_values.size() : total_row_counts.size();
+	result["group_count"] = py::int_(result_group_count);
+	if (ReadEnvFlag("DUCKDB_GPU_SKIP_GROUP_RESULTS", false)) {
+		result["groups"] = py::list();
+		duckdb_dbs_parquet_reader_metrics_set_current(nullptr);
+		return result;
+	}
 
 	py::list groups;
 	if (pipeline_mode) {
