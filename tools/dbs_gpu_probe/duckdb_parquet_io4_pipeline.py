@@ -328,6 +328,10 @@ def main():
         os.environ["DUCKDB_GPU_ROW_ORDER_DIRECT_SUBMIT"] = "1"
         os.environ.setdefault("DUCKDB_GPU_PARQUET_DIRECT_DECODE", "1")
         os.environ.setdefault("DUCKDB_GPU_PARQUET_DIRECT_DOUBLE_SCAN", "1")
+        os.environ.setdefault("DUCKDB_PARQUET_DIRECT_PAGE_BUFFER", "1")
+        os.environ.setdefault("DUCKDB_PARQUET_COLUMN_CHUNK_PREFETCH", "1")
+        os.environ.setdefault("DUCKDB_PARQUET_ASYNC_PREFETCH", "1")
+        os.environ.setdefault("DUCKDB_PARQUET_ASYNC_PREFETCH_WORKERS", "4")
         os.environ.setdefault("DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID", "1")
         os.environ.setdefault("DUCKDB_GPU_INFER_GRID_FROM_ROW_ORDER", "1")
     if args.assume_payload_all_valid:
@@ -418,6 +422,8 @@ def main():
         )
     if os.environ.get("DUCKDB_PARQUET_PAGE_IO_QUEUE") == "1":
         print("[duckdb parquet page io queue]: on")
+    if os.environ.get("DUCKDB_PARQUET_DIRECT_PAGE_BUFFER") == "1":
+        print("[duckdb parquet direct page buffer]: on")
     if os.environ.get("DUCKDB_GPU_PARQUET_DIRECT_DECODE") == "1":
         print("[parquet direct decode]: on")
         if args.mode == "pipeline-mapped-direct" and args.infer_grid_from_row_order:
