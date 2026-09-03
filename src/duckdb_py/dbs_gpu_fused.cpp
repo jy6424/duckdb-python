@@ -1296,6 +1296,26 @@ struct DirectMappedDecodedEvent {
 	idx_t row_count = 0;
 };
 
+// One unit of work handed from a row-order-stream-accumulate reader thread to its dedicated GPU
+// submission thread (see RunRowOrderAccumulateWorker). Decoupling "decode next chunk from parquet"
+// from "hand this chunk to the GPU" lets the two genuinely overlap -- previously the reader thread
+// called pipeline.accumulate_row_order_column() inline and could block on cudaEventSynchronize
+// waiting for a free streaming-staging slot, stalling the parquet scan for no reason.
+struct RowOrderAccumulateEvent {
+	bool is_finish = false;
+	uint32_t slot = 0;
+	idx_t row_base = 0;
+	vector<vector<double>> columns;
+
+	// Populated only when is_finish is true, to hand the now-fully-submitted file off to the
+	// wait/merge stage exactly like the inline path used to.
+	string fact_path;
+	std::shared_ptr<GroupMapping> mapping;
+	idx_t total_row_count = 0;
+	idx_t value_stride = 0;
+	idx_t column_count = 0;
+};
+
 struct MultiPipelineOutputBatch {
 	string fact_path;
 	std::shared_ptr<GroupMapping> mapping;
@@ -1363,6 +1383,12 @@ struct MultiPipelineStageTimers {
 	uint64_t pipeline_handle_reused = 0;
 	double pipeline_acquire_time = 0;
 	double pipeline_release_time = 0;
+	// Time spent by row-order-stream-accumulate's dedicated GPU submission thread, decoupled from
+	// the reader thread's own decode time (read_*_time above). If the decoupling is doing its job,
+	// accumulate_work_time should stop tracking read_thread_max_time in lockstep.
+	double accumulate_pop_time = 0;
+	double accumulate_work_time = 0;
+	double accumulate_push_time = 0;
 };
 
 static double ElapsedSeconds(std::chrono::steady_clock::time_point start) {
@@ -2983,6 +3009,64 @@ static void RunDirectMappedDecodedEmitWorker(BlockingQueue<DirectMappedDecodedEv
 	prepare_stage_elapsed += ElapsedSeconds(stage_start);
 }
 
+// Dedicated GPU-submission companion thread for a row-order-stream-accumulate reader thread. Pops
+// decoded chunks off event_queue and calls pipeline.accumulate_row_order_column() for each column,
+// exactly like the reader thread used to do inline -- the only change is that this now runs on its
+// own thread, so a stall waiting for a free GPU streaming-staging slot (cudaEventSynchronize inside
+// accumulate_row_order_column) no longer blocks the parquet scan that's feeding the next chunk.
+static void RunRowOrderAccumulateWorker(FusedLatAggMultiDirectPipelineFuncs pipeline, void *handle,
+                                        BlockingQueue<RowOrderAccumulateEvent> &event_queue,
+                                        BlockingQueue<DirectMultiPipelineInputBatch> &input_queue,
+                                        double &pop_elapsed, double &work_elapsed, double &push_elapsed,
+                                        std::exception_ptr &error_out, std::mutex &error_lock) {
+	try {
+		RowOrderAccumulateEvent event;
+		while (true) {
+			auto pop_start = std::chrono::steady_clock::now();
+			auto has_event = event_queue.Pop(event);
+			pop_elapsed += ElapsedSeconds(pop_start);
+			if (!has_event) {
+				break;
+			}
+			if (event.is_finish) {
+				DirectMultiPipelineInputBatch batch;
+				batch.fact_path = event.fact_path;
+				batch.mapping = event.mapping;
+				batch.slot = event.slot;
+				batch.row_count = event.total_row_count;
+				batch.row_base = 0;
+				batch.value_stride = event.value_stride;
+				batch.column_count = event.column_count;
+				batch.pre_accumulated = true;
+				auto push_start = std::chrono::steady_clock::now();
+				input_queue.Push(std::move(batch));
+				push_elapsed += ElapsedSeconds(push_start);
+				continue;
+			}
+			auto work_start = std::chrono::steady_clock::now();
+			for (idx_t column_idx = 0; column_idx < event.columns.size(); column_idx++) {
+				auto &col = event.columns[column_idx];
+				if (col.empty()) {
+					continue;
+				}
+				auto rc = pipeline.accumulate_row_order_column(
+				    handle, event.slot, static_cast<uint64_t>(column_idx), col.data(),
+				    static_cast<uint64_t>(col.size()), static_cast<uint64_t>(event.row_base),
+				    column_idx == 0 ? 1 : 0);
+				if (rc != 0) {
+					throw InvalidInputException("GPU fused streaming row-order column accumulate failed");
+				}
+			}
+			work_elapsed += ElapsedSeconds(work_start);
+		}
+	} catch (...) {
+		std::lock_guard<std::mutex> guard(error_lock);
+		if (!error_out) {
+			error_out = std::current_exception();
+		}
+	}
+}
+
 static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipelineFuncs pipeline, void *handle,
                                                   BlockingQueue<string> &file_queue,
                                                   BlockingQueue<DirectMultiPipelineInputBatch> &input_queue,
@@ -3027,6 +3111,12 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 	std::unique_ptr<BlockingQueue<DirectMappedDecodedEvent>> decoded_queue;
 	std::unique_ptr<std::thread> emit_thread;
 	bool emit_thread_started = false;
+	std::unique_ptr<BlockingQueue<RowOrderAccumulateEvent>> accumulate_queue;
+	std::unique_ptr<std::thread> accumulate_thread;
+	bool accumulate_thread_started = false;
+	double accumulate_pop_elapsed = 0;
+	double accumulate_work_elapsed = 0;
+	double accumulate_push_elapsed = 0;
 	double reader_stage_elapsed = 0;
 	idx_t decoded_queue_depth = 0;
 	try {
@@ -3043,6 +3133,18 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 		    direct_double_scan && ReadEnvFlag("DUCKDB_GPU_ROW_ORDER_STREAM_ACCUMULATE", false);
 		if (row_order_stream_accumulate && !pipeline.accumulate_row_order_column) {
 			throw InvalidInputException("GPU helper library does not provide row-order streaming accumulation support");
+		}
+		if (row_order_stream_accumulate) {
+			auto accumulate_queue_depth = ReadEnvIdx("DUCKDB_GPU_ROW_ORDER_ACCUMULATE_QUEUE_DEPTH", 8);
+			if (accumulate_queue_depth == 0) {
+				accumulate_queue_depth = 1;
+			}
+			accumulate_queue = make_uniq<BlockingQueue<RowOrderAccumulateEvent>>(accumulate_queue_depth);
+			accumulate_thread = make_uniq<std::thread>(
+			    RunRowOrderAccumulateWorker, pipeline, handle, std::ref(*accumulate_queue), std::ref(input_queue),
+			    std::ref(accumulate_pop_elapsed), std::ref(accumulate_work_elapsed),
+			    std::ref(accumulate_push_elapsed), std::ref(error_out), std::ref(error_lock));
+			accumulate_thread_started = true;
 		}
 		auto target_batch_rows = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_ROWS", 65536);
 		auto target_batch_chunks = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_CHUNKS", 32);
@@ -3136,19 +3238,19 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 				}
 
 				ResizeableBuffer direct_scratch;
+				auto make_pending_event = [&]() {
+					RowOrderAccumulateEvent event;
+					event.slot = static_cast<uint32_t>(slot);
+					event.columns.resize(payload_columns.size());
+					return event;
+				};
+				auto pending_event = make_pending_event();
 				while (true) {
 					auto fetch_start = std::chrono::steady_clock::now();
 					idx_t result_size = 0;
 					const auto row_base = fact_row_base;
 					auto sink = [&](idx_t column_idx, const double *values, idx_t count) {
-						auto rc = pipeline.accumulate_row_order_column(
-						    handle, static_cast<uint32_t>(slot), static_cast<uint64_t>(column_idx), values,
-						    static_cast<uint64_t>(count), static_cast<uint64_t>(row_base),
-						    column_idx == 0 ? 1 : 0);
-						if (rc != 0) {
-							throw InvalidInputException("GPU fused streaming row-order column accumulate failed for '%s'",
-							                            fact_path);
-						}
+						pending_event.columns[column_idx].assign(values, values + count);
 					};
 					auto scan_result = reader.ScanDirectDoublesToSink(context, scan_state, payload_columns.size(),
 					                                                   direct_scan_rows, result_size, direct_scratch,
@@ -3170,22 +3272,31 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 					}
 					fetch_nonempty_elapsed += fetch_call_elapsed;
 					direct_decode_materialize_elapsed += fetch_call_elapsed;
+
+					// Hand the decoded chunk off to the dedicated GPU submission thread instead of
+					// calling accumulate_row_order_column() here -- this is what lets decoding the
+					// next chunk overlap with the previous chunk's H2D copy + kernel on the GPU.
+					pending_event.row_base = row_base;
+					auto push_start = std::chrono::steady_clock::now();
+					accumulate_queue->Push(std::move(pending_event));
+					push_elapsed += ElapsedSeconds(push_start);
+					pending_event = make_pending_event();
+
 					fact_row_base += result_size;
 					row_count += result_size;
 					chunk_count++;
 				}
 
-				DirectMultiPipelineInputBatch batch;
-				batch.fact_path = fact_path;
-				batch.mapping = mapping;
-				batch.slot = slot;
-				batch.row_count = fact_row_base;
-				batch.row_base = 0;
-				batch.value_stride = direct_scan_rows;
-				batch.column_count = payload_columns.size();
-				batch.pre_accumulated = true;
+				RowOrderAccumulateEvent finish_event;
+				finish_event.is_finish = true;
+				finish_event.slot = static_cast<uint32_t>(slot);
+				finish_event.fact_path = fact_path;
+				finish_event.mapping = mapping;
+				finish_event.total_row_count = fact_row_base;
+				finish_event.value_stride = direct_scan_rows;
+				finish_event.column_count = payload_columns.size();
 				auto push_start = std::chrono::steady_clock::now();
-				input_queue.Push(std::move(batch));
+				accumulate_queue->Push(std::move(finish_event));
 				push_elapsed += ElapsedSeconds(push_start);
 				batch_count++;
 				continue;
@@ -3352,6 +3463,12 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 	if (emit_thread_started && emit_thread && emit_thread->joinable()) {
 		emit_thread->join();
 	}
+	if (accumulate_queue) {
+		accumulate_queue->Close();
+	}
+	if (accumulate_thread_started && accumulate_thread && accumulate_thread->joinable()) {
+		accumulate_thread->join();
+	}
 	prepare_work_elapsed += direct_finish_chunk_elapsed;
 	if (timers) {
 		auto read_elapsed = reader_stage_elapsed;
@@ -3389,6 +3506,9 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 		timers->dimension_mapping_reuses += mapping_reuses;
 		timers->direct_decode_queue_depth = std::max<uint64_t>(
 		    timers->direct_decode_queue_depth, static_cast<uint64_t>(decoded_queue_depth));
+		timers->accumulate_pop_time += accumulate_pop_elapsed;
+		timers->accumulate_work_time += accumulate_work_elapsed;
+		timers->accumulate_push_time += accumulate_push_elapsed;
 	}
 }
 
@@ -4952,6 +5072,9 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		stage_times["pipeline_handle_reused"] = py::int_(stage_timers.pipeline_handle_reused);
 		stage_times["pipeline_acquire_time"] = py::float_(stage_timers.pipeline_acquire_time);
 		stage_times["pipeline_release_time"] = py::float_(stage_timers.pipeline_release_time);
+		stage_times["accumulate_pop_time"] = py::float_(stage_timers.accumulate_pop_time);
+		stage_times["accumulate_work_time"] = py::float_(stage_timers.accumulate_work_time);
+		stage_times["accumulate_push_time"] = py::float_(stage_timers.accumulate_push_time);
 	}
 	DuckDBDBSParquetReaderMetricsSnapshot parquet_metrics;
 	duckdb_dbs_parquet_reader_metrics_snapshot(&parquet_metrics);

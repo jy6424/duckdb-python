@@ -211,6 +211,9 @@ def run_tenant(tenant_id, args, fact_inputs, payload_columns, dimension_file, st
         "pipeline_handle_reused": int(stage_times.get("pipeline_handle_reused", 0)),
         "pipeline_acquire_time": float(stage_times.get("pipeline_acquire_time", 0.0)),
         "pipeline_release_time": float(stage_times.get("pipeline_release_time", 0.0)),
+        "accumulate_pop_time": float(stage_times.get("accumulate_pop_time", 0.0)),
+        "accumulate_work_time": float(stage_times.get("accumulate_work_time", 0.0)),
+        "accumulate_push_time": float(stage_times.get("accumulate_push_time", 0.0)),
         "stage_times_full": dict(stage_times),
     }
 
@@ -312,7 +315,8 @@ def main():
             print(
                 "[tenant {} stage] read_thread_max={:.6f}s gpu_pop={:.6f}s "
                 "parquet_decode={:.6f}s parquet_direct_scan={:.6f}s "
-                "pipeline_reused={} pipeline_acquire={:.6f}s pipeline_release={:.6f}s".format(
+                "pipeline_reused={} pipeline_acquire={:.6f}s pipeline_release={:.6f}s "
+                "accumulate_pop={:.6f}s accumulate_work={:.6f}s accumulate_push={:.6f}s".format(
                     result["tenant_id"],
                     result["read_thread_max"],
                     result["gpu_pop"],
@@ -321,6 +325,9 @@ def main():
                     result["pipeline_handle_reused"],
                     result["pipeline_acquire_time"],
                     result["pipeline_release_time"],
+                    result["accumulate_pop_time"],
+                    result["accumulate_work_time"],
+                    result["accumulate_push_time"],
                 )
             )
 
