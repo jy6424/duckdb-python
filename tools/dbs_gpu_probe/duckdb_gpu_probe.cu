@@ -348,6 +348,40 @@ __global__ void DuckDBGpuFusedLatAggMultiRowOrderKernel(
 	}
 }
 
+__global__ void DuckDBGpuFusedLatAggRowOrderColumnKernel(
+    const double *values, uint64_t column_idx, uint64_t count, uint64_t row_base, int update_row_counts,
+    int64_t grid_min, int64_t grid_max, const int32_t *grid_to_group, uint64_t build_size, uint64_t group_count,
+    double *sum_out, unsigned long long *count_out, unsigned long long *row_count_out) {
+	const auto row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	if (row >= count || build_size == 0) {
+		return;
+	}
+
+	const auto grid = static_cast<int64_t>((row_base + row) % build_size);
+	if (grid < grid_min || grid > grid_max) {
+		return;
+	}
+
+	const auto build_idx = static_cast<uint64_t>(grid - grid_min);
+	if (build_idx >= build_size) {
+		return;
+	}
+
+	const auto group_i32 = grid_to_group[build_idx];
+	if (group_i32 < 0) {
+		return;
+	}
+
+	const auto group = static_cast<uint64_t>(group_i32);
+	if (update_row_counts) {
+		atomicAdd(&row_count_out[group], 1ULL);
+	}
+
+	const auto output_idx = column_idx * group_count + group;
+	AtomicAddDouble(&sum_out[output_idx], values[row]);
+	atomicAdd(&count_out[output_idx], 1ULL);
+}
+
 int CheckCuda(cudaError_t status, const char *step) {
 	if (status == cudaSuccess) {
 		return 0;
@@ -2355,6 +2389,66 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_submit_prepared_row_order
 	slot.count += count;
 	slot.column_count = column_count;
 	slot.value_stride = value_stride;
+	slot.active = true;
+	return 0;
+}
+
+extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_accumulate_row_order_column_i64_double(
+    void *handle, uint32_t slot_idx, uint64_t column_idx, const double *values, uint64_t count, uint64_t row_base,
+    int update_row_counts) {
+	if (!handle || !values || count == 0) {
+		return 1;
+	}
+
+	auto state = reinterpret_cast<FusedLatAggPipelineState *>(handle);
+	if (slot_idx >= state->slot_count) {
+		return 1;
+	}
+	auto &slot = state->slots[slot_idx];
+	if (slot.EnsureStream()) {
+		return 1;
+	}
+	if (slot.group_count == 0 || slot.build_size == 0 || column_idx >= slot.column_count) {
+		return 1;
+	}
+
+	if (CheckCuda(cudaStreamSynchronize(slot.stream), "sync streaming row-order column slot before staging")) {
+		return 1;
+	}
+
+	const auto value_bytes = count * sizeof(double);
+	if (slot.values.Ensure(value_bytes, "resize streaming row-order column staging values")) {
+		return 1;
+	}
+	auto d_values = slot.values.As<double>();
+	if (CheckCuda(cudaMemcpyAsync(d_values, values, value_bytes, cudaMemcpyHostToDevice, slot.stream),
+	              "copy streaming row-order column values")) {
+		return 1;
+	}
+	if (CheckCuda(cudaStreamSynchronize(slot.stream), "sync streaming row-order column value copy")) {
+		return 1;
+	}
+
+	int32_t *d_grid_to_group = nullptr;
+	if (slot.IsMapped()) {
+		d_grid_to_group = slot.mapped_grid_to_group.DeviceAs<int32_t>();
+	} else if (slot.IsManaged()) {
+		d_grid_to_group = slot.managed_grid_to_group.As<int32_t>();
+	} else {
+		d_grid_to_group = slot.grid_to_group.As<int32_t>();
+	}
+
+	constexpr int THREADS_PER_BLOCK = 256;
+	const auto blocks = static_cast<unsigned int>((count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+	DuckDBGpuFusedLatAggRowOrderColumnKernel<<<blocks, THREADS_PER_BLOCK, 0, slot.stream>>>(
+	    d_values, column_idx, count, row_base, update_row_counts, slot.grid_min, slot.grid_max, d_grid_to_group,
+	    slot.build_size, slot.group_count, slot.sums.As<double>(), slot.counts.As<unsigned long long>(),
+	    slot.row_counts.As<unsigned long long>());
+	if (CheckCuda(cudaGetLastError(), "launch streaming row-order column aggregate kernel")) {
+		return 1;
+	}
+
+	slot.count += update_row_counts ? count : 0;
 	slot.active = true;
 	return 0;
 }

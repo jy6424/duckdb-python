@@ -3063,6 +3063,7 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 			query_submit_elapsed += ElapsedSeconds(query_submit_start);
 			setup_elapsed += ElapsedSeconds(setup_start);
 
+			idx_t fact_row_base = 0;
 			if (row_order_stream_accumulate) {
 				idx_t slot = 0;
 				if (!free_slots.Pop(slot)) {
@@ -3137,7 +3138,6 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 			std::shared_ptr<DirectMultiPipelineBuffer> current;
 			idx_t reserved_rows = 0;
 			idx_t reserved_chunks = 0;
-			idx_t fact_row_base = 0;
 			auto direct_payload_types = MakeDirectMappedPayloadTypes(payload_columns.size());
 			DataChunk row_order_direct_result;
 			if (row_order_direct_submit && !direct_double_scan) {
