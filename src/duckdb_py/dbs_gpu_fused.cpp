@@ -3023,16 +3023,68 @@ static void RunDirectMappedDecodedEmitWorker(BlockingQueue<DirectMappedDecodedEv
 	prepare_stage_elapsed += ElapsedSeconds(stage_start);
 }
 
+// Caps how many tenants' accumulate threads may be actively submitting to the GPU at once. Under a
+// cheap workload (plain sum) the GPU has slack and every tenant's kernels fit comfortably, so this
+// makes no difference. Under a compute-heavy workload (e.g. an activation function applied to every
+// value), the GPU's SMs genuinely saturate, and its hardware kernel scheduler does not time-slice
+// many concurrent streams/contexts as fairly as the OS scheduler does CPU threads -- some tenants'
+// kernels get scheduled promptly while others starve for a long time (observed: ~4x spread in
+// accumulate_work between tenants processing identical data). Limiting how many tenants contend for
+// the GPU at once lets the hardware scheduler do a cleaner job across a smaller set, at the cost of
+// the rest queuing up-front instead of all racing simultaneously. Configurable via
+// DUCKDB_GPU_MAX_CONCURRENT_ACCUMULATE (default 8); set to a value >= tenant count to disable.
+class GpuSubmitSemaphore {
+public:
+	GpuSubmitSemaphore() : tokens(Capacity()) {
+		for (idx_t i = 0; i < Capacity(); i++) {
+			tokens.Push(0);
+		}
+	}
+	void Acquire() {
+		int token;
+		tokens.Pop(token);
+	}
+	void Release() {
+		tokens.Push(0);
+	}
+
+private:
+	static idx_t Capacity() {
+		auto capacity = ReadEnvIdx("DUCKDB_GPU_MAX_CONCURRENT_ACCUMULATE", 8);
+		return capacity == 0 ? 8 : capacity;
+	}
+
+	BlockingQueue<int> tokens;
+};
+
+static GpuSubmitSemaphore &GetGpuSubmitSemaphore() {
+	static GpuSubmitSemaphore semaphore;
+	return semaphore;
+}
+
+struct GpuSubmitSemaphoreGuard {
+	explicit GpuSubmitSemaphoreGuard(GpuSubmitSemaphore &semaphore_p) : semaphore(semaphore_p) {
+		semaphore.Acquire();
+	}
+	~GpuSubmitSemaphoreGuard() {
+		semaphore.Release();
+	}
+	GpuSubmitSemaphore &semaphore;
+};
+
 // Dedicated GPU-submission companion thread for a row-order-stream-accumulate reader thread. Pops
 // decoded chunks off event_queue and calls pipeline.accumulate_row_order_column() for each column,
 // exactly like the reader thread used to do inline -- the only change is that this now runs on its
 // own thread, so a stall waiting for a free GPU streaming-staging slot (cudaEventSynchronize inside
 // accumulate_row_order_column) no longer blocks the parquet scan that's feeding the next chunk.
+// Holds a GpuSubmitSemaphore token for its whole lifetime, admitting only a bounded number of
+// tenants' worth of concurrent GPU submission at a time (see GpuSubmitSemaphore above).
 static void RunRowOrderAccumulateWorker(FusedLatAggMultiDirectPipelineFuncs pipeline, void *handle,
                                         BlockingQueue<RowOrderAccumulateEvent> &event_queue,
                                         BlockingQueue<DirectMultiPipelineInputBatch> &input_queue,
                                         double &pop_elapsed, double &work_elapsed, double &push_elapsed,
                                         std::exception_ptr &error_out, std::mutex &error_lock) {
+	GpuSubmitSemaphoreGuard admission_guard(GetGpuSubmitSemaphore());
 	try {
 		RowOrderAccumulateEvent event;
 		while (true) {
