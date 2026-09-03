@@ -4658,6 +4658,15 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 	auto payload_columns = ParsePayloadColumns(payload_columns_p);
 	auto column_count = payload_columns.size();
 
+	// Release the GIL as early as possible: everything from here down to gil_release.reset() below
+	// is pure C++ (DuckDB instance construction, thread spawning, GPU calls) and touches no Python
+	// objects. With N tenants calling in concurrently from separate threads, doing this work --
+	// especially constructing a full DuckDB instance -- while still holding the GIL serializes all
+	// of them through this section one at a time (only one thread can run GIL-held code at once),
+	// before any of them can start real parallel work. Releasing here instead of just before the
+	// pipeline dispatch lets DuckDB construction itself run in parallel across tenants too.
+	auto gil_release = make_uniq<py::gil_scoped_release>();
+
 	void *parquet_metrics_context = duckdb_dbs_parquet_reader_metrics_create();
 	if (!parquet_metrics_context) {
 		throw InvalidInputException("failed to create Parquet reader metrics context");
@@ -4685,9 +4694,7 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		prefetch_thread.Start(PrefetchPipelineFiles, fact_paths, dimension_file);
 	}
 
-	{
-		py::gil_scoped_release release;
-		if (pipeline_mode) {
+	if (pipeline_mode) {
 		auto reader_thread_count = std::min<idx_t>(ReadEnvIdx("DUCKDB_GPU_PIPELINE_READER_THREADS", 1),
 		                                           std::max<idx_t>(fact_paths.size(), 1));
 		if (reader_thread_count == 0) {
@@ -5030,8 +5037,10 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 			MergeMultiFusedResult(total_sums, total_counts, total_row_counts, total_rows, mapping, sums, counts,
 			                      row_counts, column_count);
 		}
-		}
 	}
+	// Re-acquire the GIL now that all C++-only work (DuckDB instance, threads, GPU calls) is done --
+	// everything from here on touches Python objects again (building the result py::dict below).
+	gil_release.reset();
 
 	if (pipeline_mode) {
 		total_rows = accumulated_result.total_rows;
