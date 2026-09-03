@@ -583,6 +583,18 @@ def main():
                 int(stage.get("parquet_prefetch_bytes", 0)),
             )
         )
+        if float(stage.get("parquet_direct_scan_time", 0.0)) > 0.0:
+            print(
+                "[parquet direct detail] direct_scan={:.6f}s row_group_setup={:.6f}s "
+                "column_loop={:.6f}s sink={:.6f}s scratch_resize={:.6f}s sink_calls={}".format(
+                    float(stage.get("parquet_direct_scan_time", 0.0)),
+                    float(stage.get("parquet_row_group_setup_time", 0.0)),
+                    float(stage.get("parquet_column_loop_time", 0.0)),
+                    float(stage.get("parquet_sink_time", 0.0)),
+                    float(stage.get("parquet_scratch_resize_time", 0.0)),
+                    int(stage.get("parquet_sink_calls", 0)),
+                )
+            )
     print("[query time]: {:.6f}s".format(float(result["query_time"])))
     print("[wrapper time]: {:.6f}s".format(elapsed))
 

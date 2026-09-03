@@ -49,6 +49,12 @@ struct DuckDBDBSParquetReaderMetricsSnapshot {
 	uint64_t decode_calls;
 	uint64_t prefetch_ranges;
 	uint64_t prefetch_bytes;
+	uint64_t direct_scan_ns;
+	uint64_t row_group_setup_ns;
+	uint64_t column_loop_ns;
+	uint64_t sink_ns;
+	uint64_t scratch_resize_ns;
+	uint64_t sink_calls;
 };
 
 extern "C" void duckdb_dbs_parquet_reader_metrics_reset();
@@ -4865,12 +4871,20 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 	stage_times["parquet_page_decode_time"] = py::float_(NanosecondsToSeconds(parquet_metrics.page_decode_ns));
 	stage_times["parquet_page_prepare_time"] = py::float_(NanosecondsToSeconds(parquet_metrics.page_prepare_ns));
 	stage_times["parquet_page_prefetch_time"] = py::float_(NanosecondsToSeconds(parquet_metrics.page_prefetch_ns));
+	stage_times["parquet_direct_scan_time"] = py::float_(NanosecondsToSeconds(parquet_metrics.direct_scan_ns));
+	stage_times["parquet_row_group_setup_time"] =
+	    py::float_(NanosecondsToSeconds(parquet_metrics.row_group_setup_ns));
+	stage_times["parquet_column_loop_time"] = py::float_(NanosecondsToSeconds(parquet_metrics.column_loop_ns));
+	stage_times["parquet_sink_time"] = py::float_(NanosecondsToSeconds(parquet_metrics.sink_ns));
+	stage_times["parquet_scratch_resize_time"] =
+	    py::float_(NanosecondsToSeconds(parquet_metrics.scratch_resize_ns));
 	stage_times["parquet_pages"] = py::int_(parquet_metrics.pages);
 	stage_times["parquet_page_payload_bytes"] = py::int_(parquet_metrics.page_payload_bytes);
 	stage_times["parquet_decoded_rows"] = py::int_(parquet_metrics.decoded_rows);
 	stage_times["parquet_decode_calls"] = py::int_(parquet_metrics.decode_calls);
 	stage_times["parquet_prefetch_ranges"] = py::int_(parquet_metrics.prefetch_ranges);
 	stage_times["parquet_prefetch_bytes"] = py::int_(parquet_metrics.prefetch_bytes);
+	stage_times["parquet_sink_calls"] = py::int_(parquet_metrics.sink_calls);
 	result["stage_times"] = stage_times;
 
 	py::list payloads;
