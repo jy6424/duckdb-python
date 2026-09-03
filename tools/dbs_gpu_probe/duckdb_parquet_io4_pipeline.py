@@ -110,6 +110,11 @@ def parse_args():
         help="with direct parquet decode, derive grid ids in the GPU kernel and submit decoded values directly",
     )
     parser.add_argument(
+        "--row-order-stream-accumulate",
+        action="store_true",
+        help="stream direct decoded row-order column slices into the GPU accumulator without a full batch value buffer",
+    )
+    parser.add_argument(
         "--assume-payload-all-valid",
         action="store_true",
         help="treat payload DOUBLE columns as non-null and skip validity buffer generation/copy",
@@ -251,6 +256,8 @@ def main():
             raise SystemExit("--cudf-device must be non-negative")
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(args.cudf_device))
         os.environ["DUCKDB_GPU_CUDF_DEVICE"] = str(args.cudf_device)
+    if args.row_order_stream_accumulate:
+        args.row_order_direct_submit = True
     if args.row_order_direct_submit:
         if args.mode != "pipeline-mapped-direct":
             raise SystemExit("--row-order-direct-submit requires --mode pipeline-mapped-direct")
@@ -334,6 +341,8 @@ def main():
         os.environ.setdefault("DUCKDB_PARQUET_ASYNC_PREFETCH_WORKERS", "4")
         os.environ.setdefault("DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID", "1")
         os.environ.setdefault("DUCKDB_GPU_INFER_GRID_FROM_ROW_ORDER", "1")
+    if args.row_order_stream_accumulate:
+        os.environ["DUCKDB_GPU_ROW_ORDER_STREAM_ACCUMULATE"] = "1"
     if args.assume_payload_all_valid:
         os.environ["DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID"] = "1"
     if args.fetch_raw or (not args.regular_fetch and args.mode.startswith("pipeline-")):
@@ -433,6 +442,8 @@ def main():
         if os.environ.get("DUCKDB_GPU_PARQUET_DIRECT_DOUBLE_SCAN", "1") == "1":
             print("[parquet direct double scan]: on")
             print("[parquet direct scan rows]: {}".format(os.environ.get("DUCKDB_GPU_PARQUET_DIRECT_SCAN_ROWS", "2048")))
+    if os.environ.get("DUCKDB_GPU_ROW_ORDER_STREAM_ACCUMULATE") == "1":
+        print("[row-order stream accumulate]: on")
     if os.environ.get("DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID") == "1":
         print("[assume payload all valid]: on")
     if os.environ.get("DUCKDB_GPU_FETCH_RAW") == "1":

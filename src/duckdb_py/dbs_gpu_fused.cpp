@@ -114,6 +114,10 @@ using FusedLatAggMultiPipelineSubmitPreparedFunc = int (*)(void *handle, uint32_
 using FusedLatAggMultiPipelineSubmitPreparedRowOrderFunc = int (*)(void *handle, uint32_t slot_idx, uint64_t count,
                                                                    uint64_t column_count, uint64_t value_stride,
                                                                    uint64_t row_base);
+using FusedLatAggMultiPipelineAccumulateRowOrderColumnFunc = int (*)(void *handle, uint32_t slot_idx,
+                                                                     uint64_t column_idx, const double *values,
+                                                                     uint64_t count, uint64_t row_base,
+                                                                     int update_row_counts);
 using FusedLatAggMultiPipelineWaitFunc = int (*)(void *handle, uint32_t slot_idx, double *sum_out,
                                                  uint64_t *count_out, uint64_t *row_count_out);
 
@@ -139,6 +143,7 @@ struct FusedLatAggMultiDirectPipelineFuncs {
 	FusedLatAggMultiPipelineResetFunc reset = nullptr;
 	FusedLatAggMultiPipelineSubmitPreparedFunc submit_prepared = nullptr;
 	FusedLatAggMultiPipelineSubmitPreparedRowOrderFunc submit_prepared_row_order = nullptr;
+	FusedLatAggMultiPipelineAccumulateRowOrderColumnFunc accumulate_row_order_column = nullptr;
 	FusedLatAggPipelineSyncSlotFunc sync_slot = nullptr;
 	FusedLatAggMultiPipelineWaitFunc wait = nullptr;
 	FusedLatAggPipelineDestroyFunc destroy = nullptr;
@@ -518,6 +523,8 @@ static FusedLatAggMultiDirectPipelineFuncs LoadFusedLatAggMultiDirectPipeline(co
 	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_submit_prepared_i64_double"));
 	funcs.submit_prepared_row_order = reinterpret_cast<FusedLatAggMultiPipelineSubmitPreparedRowOrderFunc>(
 	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_submit_prepared_row_order_i64_double"));
+	funcs.accumulate_row_order_column = reinterpret_cast<FusedLatAggMultiPipelineAccumulateRowOrderColumnFunc>(
+	    dlsym(handle, "duckdb_gpu_fused_lat_agg_multi_pipeline_accumulate_row_order_column_i64_double"));
 	funcs.sync_slot =
 	    reinterpret_cast<FusedLatAggPipelineSyncSlotFunc>(dlsym(handle, "duckdb_gpu_fused_lat_agg_pipeline_sync_slot"));
 	funcs.wait = reinterpret_cast<FusedLatAggMultiPipelineWaitFunc>(
@@ -1209,6 +1216,7 @@ struct DirectMultiPipelineInputBatch {
 	idx_t row_base = 0;
 	idx_t value_stride = 0;
 	idx_t column_count = 0;
+	bool pre_accumulated = false;
 };
 
 struct DirectMultiPipelineBuffer {
@@ -2976,6 +2984,11 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 		}
 		auto direct_double_scan =
 		    row_order_direct_submit && ReadEnvFlag("DUCKDB_GPU_PARQUET_DIRECT_DOUBLE_SCAN", true);
+		auto row_order_stream_accumulate =
+		    direct_double_scan && ReadEnvFlag("DUCKDB_GPU_ROW_ORDER_STREAM_ACCUMULATE", false);
+		if (row_order_stream_accumulate && !pipeline.accumulate_row_order_column) {
+			throw InvalidInputException("GPU helper library does not provide row-order streaming accumulation support");
+		}
 		auto target_batch_rows = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_ROWS", 65536);
 		auto target_batch_chunks = ReadEnvIdx("DUCKDB_GPU_PIPELINE_BATCH_CHUNKS", 32);
 		auto direct_scan_rows = ReadEnvIdx("DUCKDB_GPU_PARQUET_DIRECT_SCAN_ROWS", STANDARD_VECTOR_SIZE);
@@ -3049,6 +3062,77 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 			reader.InitializeScan(context, scan_state, std::move(groups_to_read));
 			query_submit_elapsed += ElapsedSeconds(query_submit_start);
 			setup_elapsed += ElapsedSeconds(setup_start);
+
+			if (row_order_stream_accumulate) {
+				idx_t slot = 0;
+				if (!free_slots.Pop(slot)) {
+					throw InvalidInputException("GPU fused streaming row-order slot queue closed");
+				}
+				auto reset_rc = pipeline.reset(handle, static_cast<uint32_t>(slot), mapping->join_min,
+				                               mapping->join_max, mapping->join_to_group.data(),
+				                               static_cast<uint64_t>(mapping->join_to_group.size()),
+				                               static_cast<uint64_t>(mapping->group_values.size()),
+				                               static_cast<uint64_t>(payload_columns.size()));
+				if (reset_rc != 0) {
+					throw InvalidInputException("GPU fused streaming row-order accumulator reset failed for '%s'",
+					                            fact_path);
+				}
+
+				ResizeableBuffer direct_scratch;
+				while (true) {
+					auto fetch_start = std::chrono::steady_clock::now();
+					idx_t result_size = 0;
+					const auto row_base = fact_row_base;
+					auto sink = [&](idx_t column_idx, const double *values, idx_t count) {
+						auto rc = pipeline.accumulate_row_order_column(
+						    handle, static_cast<uint32_t>(slot), static_cast<uint64_t>(column_idx), values,
+						    static_cast<uint64_t>(count), static_cast<uint64_t>(row_base),
+						    column_idx == 0 ? 1 : 0);
+						if (rc != 0) {
+							throw InvalidInputException("GPU fused streaming row-order column accumulate failed for '%s'",
+							                            fact_path);
+						}
+					};
+					auto scan_result = reader.ScanDirectDoublesToSink(context, scan_state, payload_columns.size(),
+					                                                   direct_scan_rows, result_size, direct_scratch,
+					                                                   sink);
+					if (scan_result.GetResultType() == AsyncResultType::BLOCKED) {
+						scan_result.ExecuteTasksSynchronously();
+					}
+					auto fetch_call_elapsed = ElapsedSeconds(fetch_start);
+					fetch_elapsed += fetch_call_elapsed;
+					fetch_max_elapsed = std::max(fetch_max_elapsed, fetch_call_elapsed);
+					fetch_calls++;
+					if (scan_result.GetResultType() == AsyncResultType::FINISHED) {
+						fetch_finished_elapsed += fetch_call_elapsed;
+						finished_fetches++;
+						break;
+					}
+					if (result_size == 0) {
+						continue;
+					}
+					fetch_nonempty_elapsed += fetch_call_elapsed;
+					direct_decode_materialize_elapsed += fetch_call_elapsed;
+					fact_row_base += result_size;
+					row_count += result_size;
+					chunk_count++;
+				}
+
+				DirectMultiPipelineInputBatch batch;
+				batch.fact_path = fact_path;
+				batch.mapping = mapping;
+				batch.slot = slot;
+				batch.row_count = fact_row_base;
+				batch.row_base = 0;
+				batch.value_stride = direct_scan_rows;
+				batch.column_count = payload_columns.size();
+				batch.pre_accumulated = true;
+				auto push_start = std::chrono::steady_clock::now();
+				input_queue.Push(std::move(batch));
+				push_elapsed += ElapsedSeconds(push_start);
+				batch_count++;
+				continue;
+			}
 
 			std::shared_ptr<DirectMultiPipelineBuffer> current;
 			idx_t reserved_rows = 0;
@@ -3930,6 +4014,36 @@ static void RunDirectMultiPipelineGPUWorker(FusedLatAggMultiDirectPipelineFuncs 
 				break;
 			}
 			if (batch.row_count == 0) {
+				free_slots.Push(batch.slot);
+				continue;
+			}
+			if (batch.pre_accumulated) {
+				flush_active_file();
+				auto gpu_start = std::chrono::steady_clock::now();
+				auto rc = pipeline.sync_slot(handle, static_cast<uint32_t>(batch.slot));
+				if (rc != 0) {
+					throw InvalidInputException("GPU fused streaming row-order slot sync failed for '%s'",
+					                            batch.fact_path);
+				}
+				MultiPipelineOutputBatch output;
+				output.fact_path = batch.fact_path;
+				output.mapping = batch.mapping;
+				output.column_count = column_count;
+				auto group_count = batch.mapping->group_values.size();
+				output.sums.assign(column_count * group_count, 0);
+				output.counts.assign(column_count * group_count, 0);
+				output.row_counts.assign(group_count, 0);
+				rc = pipeline.wait(handle, static_cast<uint32_t>(batch.slot), output.sums.data(),
+				                   output.counts.data(), output.row_counts.data());
+				if (rc != 0) {
+					throw InvalidInputException("GPU fused streaming row-order wait failed for '%s'",
+					                            batch.fact_path);
+				}
+				work_elapsed += ElapsedSeconds(gpu_start);
+				auto push_start = std::chrono::steady_clock::now();
+				output_queue.Push(std::move(output));
+				push_elapsed += ElapsedSeconds(push_start);
+				batch_count++;
 				free_slots.Push(batch.slot);
 				continue;
 			}
