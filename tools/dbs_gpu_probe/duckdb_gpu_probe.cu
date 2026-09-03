@@ -22,6 +22,19 @@ bool AssumePayloadAllValid() {
 	return EnvFlag("DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID");
 }
 
+uint32_t EnvUInt(const char *name, uint32_t default_value) {
+	const auto value = std::getenv(name);
+	if (!value || value[0] == '\0') {
+		return default_value;
+	}
+	char *end = nullptr;
+	auto parsed = std::strtoul(value, &end, 10);
+	if (end == value || parsed == 0) {
+		return default_value;
+	}
+	return static_cast<uint32_t>(parsed);
+}
+
 int ComputeBenchmarkMode() {
 	const auto value = std::getenv("DUCKDB_GPU_COMPUTE_BENCHMARK");
 	if (!value || value[0] == '\0' || std::strcmp(value, "sum") == 0) {
@@ -702,12 +715,25 @@ struct FusedLatAggPipelineSlot {
 	uint64_t value_stride = 0;
 	int64_t grid_min = 0;
 	int64_t grid_max = 0;
+	DeviceBuffer *streaming_values = nullptr;
+	cudaEvent_t *streaming_events = nullptr;
+	uint32_t streaming_depth = 0;
+	uint32_t streaming_next = 0;
 
 	~FusedLatAggPipelineSlot() {
 		if (stream) {
 			cudaStreamSynchronize(stream);
 			cudaStreamDestroy(stream);
 		}
+		if (streaming_events) {
+			for (uint32_t idx = 0; idx < streaming_depth; idx++) {
+				if (streaming_events[idx]) {
+					cudaEventDestroy(streaming_events[idx]);
+				}
+			}
+			delete[] streaming_events;
+		}
+		delete[] streaming_values;
 	}
 
 	int EnsureStream() {
@@ -727,6 +753,47 @@ struct FusedLatAggPipelineSlot {
 
 	bool IsDevice() const {
 		return memory_mode == 0;
+	}
+
+	int EnsureStreamingStaging(uint32_t depth) {
+		if (depth == 0) {
+			depth = 1;
+		}
+		if (streaming_depth == depth && streaming_values && streaming_events) {
+			return 0;
+		}
+		if (stream) {
+			if (CheckCuda(cudaStreamSynchronize(stream), "sync streaming row-order slot before staging resize")) {
+				return 1;
+			}
+		}
+		if (streaming_events) {
+			for (uint32_t idx = 0; idx < streaming_depth; idx++) {
+				if (streaming_events[idx]) {
+					if (CheckCuda(cudaEventDestroy(streaming_events[idx]), "destroy streaming staging event")) {
+						return 1;
+					}
+				}
+			}
+			delete[] streaming_events;
+			streaming_events = nullptr;
+		}
+		delete[] streaming_values;
+		streaming_values = new DeviceBuffer[depth];
+		streaming_events = new cudaEvent_t[depth];
+		for (uint32_t idx = 0; idx < depth; idx++) {
+			streaming_events[idx] = nullptr;
+		}
+		for (uint32_t idx = 0; idx < depth; idx++) {
+			if (CheckCuda(cudaEventCreateWithFlags(&streaming_events[idx], cudaEventDisableTiming),
+			              "create streaming staging event")) {
+				streaming_depth = idx + 1;
+				return 1;
+			}
+		}
+		streaming_depth = depth;
+		streaming_next = 0;
+		return 0;
 	}
 };
 
@@ -2446,20 +2513,31 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_accumulate_row_order_colu
 		return 1;
 	}
 
-	if (CheckCuda(cudaStreamSynchronize(slot.stream), "sync streaming row-order column slot before staging")) {
+	const auto staging_depth = EnvUInt("DUCKDB_GPU_STREAM_STAGING_DEPTH", 64);
+	if (slot.EnsureStreamingStaging(staging_depth)) {
 		return 1;
 	}
 
 	const auto value_bytes = count * sizeof(double);
-	if (slot.values.Ensure(value_bytes, "resize streaming row-order column staging values")) {
+	auto staging_idx = slot.streaming_next++ % slot.streaming_depth;
+	auto &staging_values = slot.streaming_values[staging_idx];
+	auto staging_event = slot.streaming_events[staging_idx];
+	auto event_status = cudaEventQuery(staging_event);
+	if (event_status == cudaErrorNotReady) {
+		if (CheckCuda(cudaEventSynchronize(staging_event), "wait streaming staging buffer reuse")) {
+			return 1;
+		}
+	} else if (event_status != cudaSuccess && event_status != cudaErrorNotReady) {
+		if (CheckCuda(event_status, "query streaming staging event")) {
+			return 1;
+		}
+	}
+	if (staging_values.Ensure(value_bytes, "resize streaming row-order column staging values")) {
 		return 1;
 	}
-	auto d_values = slot.values.As<double>();
+	auto d_values = staging_values.As<double>();
 	if (CheckCuda(cudaMemcpyAsync(d_values, values, value_bytes, cudaMemcpyHostToDevice, slot.stream),
 	              "copy streaming row-order column values")) {
-		return 1;
-	}
-	if (CheckCuda(cudaStreamSynchronize(slot.stream), "sync streaming row-order column value copy")) {
 		return 1;
 	}
 
@@ -2479,6 +2557,9 @@ extern "C" int duckdb_gpu_fused_lat_agg_multi_pipeline_accumulate_row_order_colu
 	    slot.build_size, slot.group_count, slot.sums.As<double>(), slot.counts.As<unsigned long long>(),
 	    slot.row_counts.As<unsigned long long>(), ComputeBenchmarkMode());
 	if (CheckCuda(cudaGetLastError(), "launch streaming row-order column aggregate kernel")) {
+		return 1;
+	}
+	if (CheckCuda(cudaEventRecord(staging_event, slot.stream), "record streaming staging event")) {
 		return 1;
 	}
 

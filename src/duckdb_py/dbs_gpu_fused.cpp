@@ -1315,6 +1315,7 @@ struct MultiPipelineStageTimers {
 	uint64_t prepared_batches = 0;
 	uint64_t gpu_batches = 0;
 	uint64_t merged_batches = 0;
+	uint64_t max_group_count = 0;
 	uint64_t dimension_mapping_reads = 0;
 	uint64_t dimension_mapping_reuses = 0;
 	uint64_t direct_decode_queue_depth = 0;
@@ -2955,6 +2956,7 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 	uint64_t batch_count = 0;
 	uint64_t mapping_reads = 0;
 	uint64_t mapping_reuses = 0;
+	uint64_t max_group_count = 0;
 	double setup_elapsed = 0;
 	double connection_elapsed = 0;
 	double mapping_lock_elapsed = 0;
@@ -3055,6 +3057,7 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 					mapping_reuses++;
 				}
 			}
+			max_group_count = std::max<uint64_t>(max_group_count, mapping->group_values.size());
 
 			auto query_build_start = std::chrono::steady_clock::now();
 			ParquetOptions parquet_options(context);
@@ -3338,6 +3341,7 @@ static void ReadDirectMappedParquetPipelineWorker(FusedLatAggMultiDirectPipeline
 		timers->direct_flush_time += direct_flush_elapsed;
 		timers->direct_decode_materialize_time += direct_decode_materialize_elapsed;
 		timers->prepared_batches += batch_count;
+		timers->max_group_count = std::max(timers->max_group_count, max_group_count);
 		timers->dimension_mapping_reads += mapping_reads;
 		timers->dimension_mapping_reuses += mapping_reuses;
 		timers->direct_decode_queue_depth = std::max<uint64_t>(
@@ -3971,6 +3975,7 @@ static void RunDirectMultiPipelineGPUWorker(FusedLatAggMultiDirectPipelineFuncs 
 
 		ActiveFile active_file;
 		DirectMultiPipelineInputBatch batch;
+		auto skip_group_results = ReadEnvFlag("DUCKDB_GPU_SKIP_GROUP_RESULTS", false);
 
 		auto flush_active_file = [&]() {
 			if (!active_file.active) {
@@ -4034,6 +4039,12 @@ static void RunDirectMultiPipelineGPUWorker(FusedLatAggMultiDirectPipelineFuncs 
 				if (rc != 0) {
 					throw InvalidInputException("GPU fused streaming row-order slot sync failed for '%s'",
 					                            batch.fact_path);
+				}
+				if (skip_group_results) {
+					work_elapsed += ElapsedSeconds(gpu_start);
+					batch_count++;
+					free_slots.Push(batch.slot);
+					continue;
 				}
 				MultiPipelineOutputBatch output;
 				output.fact_path = batch.fact_path;
@@ -4825,6 +4836,10 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 
 	if (pipeline_mode) {
 		total_rows = accumulated_result.total_rows;
+		if (total_rows == 0 && ReadEnvFlag("DUCKDB_GPU_SKIP_GROUP_RESULTS", false)) {
+			std::lock_guard<std::mutex> guard(stage_timers.lock);
+			total_rows = stage_timers.read_rows;
+		}
 	}
 	prefetch_thread.Join();
 
@@ -4875,6 +4890,7 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 		stage_times["prepared_batches"] = py::int_(stage_timers.prepared_batches);
 		stage_times["gpu_batches"] = py::int_(stage_timers.gpu_batches);
 		stage_times["merged_batches"] = py::int_(stage_timers.merged_batches);
+		stage_times["max_group_count"] = py::int_(stage_timers.max_group_count);
 		stage_times["dimension_mapping_reads"] = py::int_(stage_timers.dimension_mapping_reads);
 		stage_times["dimension_mapping_reuses"] = py::int_(stage_timers.dimension_mapping_reuses);
 		stage_times["direct_decode_queue_depth"] = py::int_(stage_timers.direct_decode_queue_depth);
@@ -4911,6 +4927,10 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 	}
 	result["payload_columns"] = payloads;
 	auto result_group_count = pipeline_mode ? accumulated_result.group_values.size() : total_row_counts.size();
+	if (result_group_count == 0 && ReadEnvFlag("DUCKDB_GPU_SKIP_GROUP_RESULTS", false)) {
+		std::lock_guard<std::mutex> guard(stage_timers.lock);
+		result_group_count = stage_timers.max_group_count;
+	}
 	result["group_count"] = py::int_(result_group_count);
 	if (ReadEnvFlag("DUCKDB_GPU_SKIP_GROUP_RESULTS", false)) {
 		result["groups"] = py::list();
