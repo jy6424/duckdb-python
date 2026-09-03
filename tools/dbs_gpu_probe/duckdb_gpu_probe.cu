@@ -49,12 +49,55 @@ int ComputeBenchmarkMode() {
 	if (std::strcmp(value, "sum-sumsq-derived") == 0) {
 		return 3;
 	}
+	if (std::strcmp(value, "sigmoid") == 0) {
+		return 4;
+	}
+	if (std::strcmp(value, "relu") == 0) {
+		return 5;
+	}
+	if (std::strcmp(value, "tanh") == 0) {
+		return 6;
+	}
+	if (std::strcmp(value, "gelu") == 0) {
+		return 7;
+	}
+	if (std::strcmp(value, "softplus") == 0) {
+		return 8;
+	}
 	return 0;
 }
 
+// benchmark_mode 4-8 apply a common ML activation function to each raw value before it's summed
+// into the group total -- these are compute-heavier, per-element transforms (transcendental
+// functions) meant to shift the workload from memory/bandwidth-bound (plain sum) towards
+// compute-bound, which is where a GPU's throughput advantage over a CPU should show up more
+// clearly. They only change what's computed per value; nothing about buffer layout, memory, or
+// threading changes, so this is independent of (and safe to combine with) every pipeline/staging
+// change made so far.
 __device__ double BenchmarkAggregateValue(double value, int benchmark_mode) {
 	if (benchmark_mode == 0) {
 		return value;
+	}
+	if (benchmark_mode == 4) {
+		// Sigmoid: 1 / (1 + e^-x)
+		return 1.0 / (1.0 + exp(-value));
+	}
+	if (benchmark_mode == 5) {
+		// ReLU: max(0, x)
+		return value > 0.0 ? value : 0.0;
+	}
+	if (benchmark_mode == 6) {
+		return tanh(value);
+	}
+	if (benchmark_mode == 7) {
+		// GELU (tanh approximation), as used in e.g. BERT/GPT-2:
+		// 0.5x * (1 + tanh(sqrt(2/pi) * (x + 0.044715x^3)))
+		const auto cubed = value * value * value;
+		return 0.5 * value * (1.0 + tanh(0.7978845608028654 * (value + 0.044715 * cubed)));
+	}
+	if (benchmark_mode == 8) {
+		// Softplus: ln(1 + e^x), computed in a form stable for large |x|
+		return value > 0.0 ? value + log1p(exp(-value)) : log1p(exp(value));
 	}
 	const auto absolute = fabs(value);
 	if (benchmark_mode == 1) {

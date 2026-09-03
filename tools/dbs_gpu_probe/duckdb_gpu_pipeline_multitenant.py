@@ -72,7 +72,17 @@ def parse_args():
     parser.add_argument(
         "--benchmark-expr",
         default="sum",
-        choices=["sum", "sum-sumsq", "derived", "sum-sumsq-derived"],
+        choices=[
+            "sum",
+            "sum-sumsq",
+            "derived",
+            "sum-sumsq-derived",
+            "sigmoid",
+            "relu",
+            "tanh",
+            "gelu",
+            "softplus",
+        ],
     )
     parser.add_argument(
         "--mode",
