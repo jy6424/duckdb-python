@@ -129,6 +129,9 @@ using FusedLatAggMultiPipelineAccumulateRowOrderColumnFunc = int (*)(void *handl
                                                                      int update_row_counts);
 using FusedLatAggMultiPipelineWaitFunc = int (*)(void *handle, uint32_t slot_idx, double *sum_out,
                                                  uint64_t *count_out, uint64_t *row_count_out);
+using NormalizeFloatTensorFunc = int (*)(const float *input, uint64_t outer_count, uint64_t var_count,
+                                         uint64_t level_count, float eps, float *output, float *mean_out,
+                                         float *stddev_out);
 
 struct FusedLatAggPipelineFuncs {
 	FusedLatAggPipelineCreateFunc create = nullptr;
@@ -602,6 +605,35 @@ static FusedLatAggMultiDirectPipelineFuncs LoadFusedLatAggMultiDirectPipeline(co
 		throw InvalidInputException("Failed to load GPU fused multi device-direct pipeline symbols from '%s'", path_p);
 	}
 	return funcs;
+}
+
+static NormalizeFloatTensorFunc LoadNormalizeFloatTensor(const string &path_p) {
+	static std::once_flag once;
+	static NormalizeFloatTensorFunc func = nullptr;
+
+	std::call_once(once, [&]() {
+		string path = path_p;
+		if (path.empty()) {
+			const char *env_path = std::getenv("DUCKDB_GPU_PROBE_LIB");
+			if (env_path && env_path[0]) {
+				path = env_path;
+			} else {
+				path = "libduckdb_gpu_probe.so";
+			}
+		}
+
+		auto handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+		if (!handle) {
+			throw InvalidInputException("Failed to load GPU helper library '%s': %s", path, dlerror());
+		}
+
+		const char *symbol = "duckdb_gpu_normalize_float_tensor";
+		func = reinterpret_cast<NormalizeFloatTensorFunc>(dlsym(handle, symbol));
+		if (!func) {
+			throw InvalidInputException("Failed to load GPU helper symbol '%s': %s", symbol, dlerror());
+		}
+	});
+	return func;
 }
 
 static unique_ptr<QueryResult> RunStreamingQuery(Connection &connection, const string &query) {
@@ -3023,68 +3055,16 @@ static void RunDirectMappedDecodedEmitWorker(BlockingQueue<DirectMappedDecodedEv
 	prepare_stage_elapsed += ElapsedSeconds(stage_start);
 }
 
-// Caps how many tenants' accumulate threads may be actively submitting to the GPU at once. Under a
-// cheap workload (plain sum) the GPU has slack and every tenant's kernels fit comfortably, so this
-// makes no difference. Under a compute-heavy workload (e.g. an activation function applied to every
-// value), the GPU's SMs genuinely saturate, and its hardware kernel scheduler does not time-slice
-// many concurrent streams/contexts as fairly as the OS scheduler does CPU threads -- some tenants'
-// kernels get scheduled promptly while others starve for a long time (observed: ~4x spread in
-// accumulate_work between tenants processing identical data). Limiting how many tenants contend for
-// the GPU at once lets the hardware scheduler do a cleaner job across a smaller set, at the cost of
-// the rest queuing up-front instead of all racing simultaneously. Configurable via
-// DUCKDB_GPU_MAX_CONCURRENT_ACCUMULATE (default 8); set to a value >= tenant count to disable.
-class GpuSubmitSemaphore {
-public:
-	GpuSubmitSemaphore() : tokens(Capacity()) {
-		for (idx_t i = 0; i < Capacity(); i++) {
-			tokens.Push(0);
-		}
-	}
-	void Acquire() {
-		int token;
-		tokens.Pop(token);
-	}
-	void Release() {
-		tokens.Push(0);
-	}
-
-private:
-	static idx_t Capacity() {
-		auto capacity = ReadEnvIdx("DUCKDB_GPU_MAX_CONCURRENT_ACCUMULATE", 8);
-		return capacity == 0 ? 8 : capacity;
-	}
-
-	BlockingQueue<int> tokens;
-};
-
-static GpuSubmitSemaphore &GetGpuSubmitSemaphore() {
-	static GpuSubmitSemaphore semaphore;
-	return semaphore;
-}
-
-struct GpuSubmitSemaphoreGuard {
-	explicit GpuSubmitSemaphoreGuard(GpuSubmitSemaphore &semaphore_p) : semaphore(semaphore_p) {
-		semaphore.Acquire();
-	}
-	~GpuSubmitSemaphoreGuard() {
-		semaphore.Release();
-	}
-	GpuSubmitSemaphore &semaphore;
-};
-
 // Dedicated GPU-submission companion thread for a row-order-stream-accumulate reader thread. Pops
 // decoded chunks off event_queue and calls pipeline.accumulate_row_order_column() for each column,
 // exactly like the reader thread used to do inline -- the only change is that this now runs on its
 // own thread, so a stall waiting for a free GPU streaming-staging slot (cudaEventSynchronize inside
 // accumulate_row_order_column) no longer blocks the parquet scan that's feeding the next chunk.
-// Holds a GpuSubmitSemaphore token for its whole lifetime, admitting only a bounded number of
-// tenants' worth of concurrent GPU submission at a time (see GpuSubmitSemaphore above).
 static void RunRowOrderAccumulateWorker(FusedLatAggMultiDirectPipelineFuncs pipeline, void *handle,
                                         BlockingQueue<RowOrderAccumulateEvent> &event_queue,
                                         BlockingQueue<DirectMultiPipelineInputBatch> &input_queue,
                                         double &pop_elapsed, double &work_elapsed, double &push_elapsed,
                                         std::exception_ptr &error_out, std::mutex &error_lock) {
-	GpuSubmitSemaphoreGuard admission_guard(GetGpuSubmitSemaphore());
 	try {
 		RowOrderAccumulateEvent event;
 		while (true) {
@@ -5267,6 +5247,69 @@ static py::dict DBSGPUFusedLatMulti(const py::iterable &fact_paths_p, const py::
 	return result;
 }
 
+static py::dict DBSGPUNormalizeTensor(py::array_t<float, py::array::c_style | py::array::forcecast> input,
+                                      const string &lib_path, double eps) {
+	auto info = input.request();
+	if (info.ndim != 4) {
+		throw InvalidInputException("dbs_gpu_normalize_tensor expects a float32 tensor shaped [file, grid, variable, level]");
+	}
+	for (auto dim : info.shape) {
+		if (dim <= 0) {
+			throw InvalidInputException("dbs_gpu_normalize_tensor dimensions must be positive");
+		}
+	}
+	if (eps < 0) {
+		throw InvalidInputException("dbs_gpu_normalize_tensor eps must be non-negative");
+	}
+
+	auto file_count = static_cast<uint64_t>(info.shape[0]);
+	auto grid_count = static_cast<uint64_t>(info.shape[1]);
+	auto var_count = static_cast<uint64_t>(info.shape[2]);
+	auto level_count = static_cast<uint64_t>(info.shape[3]);
+	auto outer_count = file_count * grid_count;
+
+	vector<ssize_t> output_shape;
+	for (auto dim : info.shape) {
+		output_shape.push_back(dim);
+	}
+	vector<ssize_t> stats_shape {info.shape[2], info.shape[3]};
+
+	py::array_t<float> output(output_shape);
+	py::array_t<float> mean(stats_shape);
+	py::array_t<float> stddev(stats_shape);
+
+	auto input_data = static_cast<const float *>(info.ptr);
+	auto output_data = static_cast<float *>(output.request().ptr);
+	auto mean_data = static_cast<float *>(mean.request().ptr);
+	auto stddev_data = static_cast<float *>(stddev.request().ptr);
+
+	auto normalize_func = LoadNormalizeFloatTensor(lib_path);
+
+	auto normalize_start = std::chrono::steady_clock::now();
+	int rc = 0;
+	{
+		py::gil_scoped_release release;
+		rc = normalize_func(input_data, outer_count, var_count, level_count, static_cast<float>(eps), output_data,
+		                    mean_data, stddev_data);
+	}
+	auto normalize_time =
+	    std::chrono::duration<double>(std::chrono::steady_clock::now() - normalize_start).count();
+	if (rc != 0) {
+		throw InvalidInputException("GPU normalization failed");
+	}
+
+	py::dict result;
+	result["normalized"] = output;
+	result["mean"] = mean;
+	result["std"] = stddev;
+	result["file_count"] = py::int_(file_count);
+	result["grid_count"] = py::int_(grid_count);
+	result["variable_count"] = py::int_(var_count);
+	result["level_count"] = py::int_(level_count);
+	result["normalization_time"] = py::float_(normalize_time);
+	return result;
+}
+
 } // namespace
 
 void RegisterDBSGPUFused(py::module_ &m) {
@@ -5283,6 +5326,8 @@ void RegisterDBSGPUFused(py::module_ &m) {
 	      py::arg("group_column") = "lats", py::arg("dimension_file") = "grid.parquet",
 	      py::arg("read_mode") = "per-file", py::arg("reuse_dimension_mapping") = false,
 	      py::arg("assume_payload_all_valid") = false);
+	m.def("dbs_gpu_normalize_tensor", &DBSGPUNormalizeTensor, py::arg("input"), py::arg("lib_path") = "",
+	      py::arg("eps") = 1.0e-6);
 }
 
 } // namespace duckdb

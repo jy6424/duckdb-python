@@ -110,6 +110,66 @@ __device__ double BenchmarkAggregateValue(double value, int benchmark_mode) {
 	return value + value * value + derived;
 }
 
+__global__ void DuckDBGpuNormalizeStatsFloatKernel(const float *input, uint64_t outer_count, uint64_t stat_count,
+                                                   double *sums, double *sumsq, unsigned long long *counts) {
+	const auto row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	const auto total_count = outer_count * stat_count;
+	if (row >= total_count) {
+		return;
+	}
+
+	const auto stat_idx = row % stat_count;
+	const auto value = input[row];
+	if (!isfinite(value)) {
+		return;
+	}
+	const auto value_d = static_cast<double>(value);
+	atomicAdd(sums + stat_idx, value_d);
+	atomicAdd(sumsq + stat_idx, value_d * value_d);
+	atomicAdd(counts + stat_idx, 1ULL);
+}
+
+__global__ void DuckDBGpuNormalizeFinalizeFloatKernel(uint64_t stat_count, const double *sums, const double *sumsq,
+                                                      const unsigned long long *counts, float eps, float *mean,
+                                                      float *stddev) {
+	const auto stat_idx = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	if (stat_idx >= stat_count) {
+		return;
+	}
+
+	const auto count = counts[stat_idx];
+	if (count == 0) {
+		mean[stat_idx] = NAN;
+		stddev[stat_idx] = NAN;
+		return;
+	}
+
+	const auto mean_d = sums[stat_idx] / static_cast<double>(count);
+	auto variance = (sumsq[stat_idx] / static_cast<double>(count)) - (mean_d * mean_d);
+	if (variance < 0.0) {
+		variance = 0.0;
+	}
+	mean[stat_idx] = static_cast<float>(mean_d);
+	stddev[stat_idx] = static_cast<float>(sqrt(variance) + static_cast<double>(eps));
+}
+
+__global__ void DuckDBGpuNormalizeApplyFloatKernel(const float *input, uint64_t outer_count, uint64_t stat_count,
+                                                   const float *mean, const float *stddev, float *output) {
+	const auto row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+	const auto total_count = outer_count * stat_count;
+	if (row >= total_count) {
+		return;
+	}
+
+	const auto stat_idx = row % stat_count;
+	const auto value = input[row];
+	if (!isfinite(value) || !isfinite(mean[stat_idx]) || !isfinite(stddev[stat_idx])) {
+		output[row] = NAN;
+		return;
+	}
+	output[row] = (value - mean[stat_idx]) / stddev[stat_idx];
+}
+
 __global__ void DuckDBGpuProbeI64Kernel(const int64_t *keys, const uint8_t *validity, uint64_t count,
                                         int64_t min_value, int64_t max_value, const uint8_t *build_bitmap,
                                         uint64_t build_size, uint32_t *probe_sel_out, uint32_t *build_sel_out,
@@ -681,6 +741,16 @@ struct GroupByStatsDoubleBuffers {
 	DeviceBuffer unique_count;
 };
 
+struct NormalizeFloatBuffers {
+	DeviceBuffer input;
+	DeviceBuffer output;
+	DeviceBuffer sums;
+	DeviceBuffer sumsq;
+	DeviceBuffer counts;
+	DeviceBuffer mean;
+	DeviceBuffer stddev;
+};
+
 struct GroupByDictStatsDoubleBuffers {
 	MappedHostBuffer group_ids;
 	MappedHostBuffer values;
@@ -1159,6 +1229,71 @@ extern "C" int duckdb_gpu_groupby_stats_double(const uint64_t *addresses, const 
 	error |= CheckCuda(cudaMemcpy(maxs_out, d_maxs, result_count * sizeof(double), cudaMemcpyDeviceToHost),
 	                   "copy groupby stats maxs to host");
 	*unique_count_out = static_cast<uint64_t>(result_count);
+	return error ? 1 : 0;
+}
+
+extern "C" int duckdb_gpu_normalize_float_tensor(const float *input, uint64_t outer_count, uint64_t var_count,
+                                                uint64_t level_count, float eps, float *output, float *mean_out,
+                                                float *stddev_out) {
+	if (!input || !output || !mean_out || !stddev_out || outer_count == 0 || var_count == 0 || level_count == 0) {
+		return 1;
+	}
+
+	const auto stat_count = var_count * level_count;
+	const auto total_count = outer_count * stat_count;
+	const auto input_bytes = total_count * sizeof(float);
+	const auto stats_double_bytes = stat_count * sizeof(double);
+	const auto stats_count_bytes = stat_count * sizeof(unsigned long long);
+	const auto stats_float_bytes = stat_count * sizeof(float);
+
+	thread_local NormalizeFloatBuffers buffers;
+	if (buffers.input.Ensure(input_bytes, "resize normalize input") ||
+	    buffers.output.Ensure(input_bytes, "resize normalize output") ||
+	    buffers.sums.Ensure(stats_double_bytes, "resize normalize sums") ||
+	    buffers.sumsq.Ensure(stats_double_bytes, "resize normalize sumsq") ||
+	    buffers.counts.Ensure(stats_count_bytes, "resize normalize counts") ||
+	    buffers.mean.Ensure(stats_float_bytes, "resize normalize mean") ||
+	    buffers.stddev.Ensure(stats_float_bytes, "resize normalize stddev")) {
+		return 1;
+	}
+
+	int error = 0;
+	auto d_input = buffers.input.As<float>();
+	auto d_output = buffers.output.As<float>();
+	auto d_sums = buffers.sums.As<double>();
+	auto d_sumsq = buffers.sumsq.As<double>();
+	auto d_counts = buffers.counts.As<unsigned long long>();
+	auto d_mean = buffers.mean.As<float>();
+	auto d_stddev = buffers.stddev.As<float>();
+
+	error |= CheckCuda(cudaMemcpy(d_input, input, input_bytes, cudaMemcpyHostToDevice), "copy normalize input");
+	error |= CheckCuda(cudaMemset(d_sums, 0, stats_double_bytes), "clear normalize sums");
+	error |= CheckCuda(cudaMemset(d_sumsq, 0, stats_double_bytes), "clear normalize sumsq");
+	error |= CheckCuda(cudaMemset(d_counts, 0, stats_count_bytes), "clear normalize counts");
+	if (error) {
+		return 1;
+	}
+
+	constexpr int THREADS_PER_BLOCK = 256;
+	const auto total_blocks = static_cast<unsigned int>((total_count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+	const auto stats_blocks = static_cast<unsigned int>((stat_count + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+	DuckDBGpuNormalizeStatsFloatKernel<<<total_blocks, THREADS_PER_BLOCK>>>(d_input, outer_count, stat_count, d_sums,
+	                                                                        d_sumsq, d_counts);
+	error |= CheckCuda(cudaGetLastError(), "launch normalize stats kernel");
+	DuckDBGpuNormalizeFinalizeFloatKernel<<<stats_blocks, THREADS_PER_BLOCK>>>(stat_count, d_sums, d_sumsq, d_counts,
+	                                                                           eps, d_mean, d_stddev);
+	error |= CheckCuda(cudaGetLastError(), "launch normalize finalize kernel");
+	DuckDBGpuNormalizeApplyFloatKernel<<<total_blocks, THREADS_PER_BLOCK>>>(d_input, outer_count, stat_count, d_mean,
+	                                                                        d_stddev, d_output);
+	error |= CheckCuda(cudaGetLastError(), "launch normalize apply kernel");
+	if (error) {
+		return 1;
+	}
+
+	error |= CheckCuda(cudaMemcpy(output, d_output, input_bytes, cudaMemcpyDeviceToHost), "copy normalize output");
+	error |= CheckCuda(cudaMemcpy(mean_out, d_mean, stats_float_bytes, cudaMemcpyDeviceToHost), "copy normalize mean");
+	error |= CheckCuda(cudaMemcpy(stddev_out, d_stddev, stats_float_bytes, cudaMemcpyDeviceToHost),
+	                   "copy normalize stddev");
 	return error ? 1 : 0;
 }
 
