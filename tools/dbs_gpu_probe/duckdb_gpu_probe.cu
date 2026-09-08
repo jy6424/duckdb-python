@@ -22,6 +22,10 @@ bool AssumePayloadAllValid() {
 	return EnvFlag("DUCKDB_GPU_ASSUME_PAYLOAD_ALL_VALID");
 }
 
+__device__ double AtomicAddDouble(double *address, double value);
+__device__ double AtomicMinDouble(double *address, double value);
+__device__ double AtomicMaxDouble(double *address, double value);
+
 uint32_t EnvUInt(const char *name, uint32_t default_value) {
 	const auto value = std::getenv(name);
 	if (!value || value[0] == '\0') {
@@ -124,8 +128,8 @@ __global__ void DuckDBGpuNormalizeStatsFloatKernel(const float *input, uint64_t 
 		return;
 	}
 	const auto value_d = static_cast<double>(value);
-	atomicAdd(sums + stat_idx, value_d);
-	atomicAdd(sumsq + stat_idx, value_d * value_d);
+	AtomicAddDouble(sums + stat_idx, value_d);
+	AtomicAddDouble(sumsq + stat_idx, value_d * value_d);
 	atomicAdd(counts + stat_idx, 1ULL);
 }
 
@@ -321,10 +325,6 @@ __global__ void DuckDBGpuGroupByStatsDoubleKernel(const uint64_t *addresses, con
 	mins_out[out_idx] = local_min;
 	maxs_out[out_idx] = local_max;
 }
-
-__device__ double AtomicAddDouble(double *address, double value);
-__device__ double AtomicMinDouble(double *address, double value);
-__device__ double AtomicMaxDouble(double *address, double value);
 
 __global__ void DuckDBGpuInitDictStatsDoubleKernel(uint64_t group_count, double *sums_out,
                                                    unsigned long long *counts_out,
