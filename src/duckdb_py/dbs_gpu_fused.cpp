@@ -5397,6 +5397,10 @@ static py::dict DBSGPUReadNormalizeTensor(const py::iterable &fact_paths_p, cons
 	uint64_t rows_scanned_total = 0;
 	uint64_t rows_selected_total = 0;
 	uint64_t scan_calls = 0;
+	vector<double> per_file_read_times(file_count, 0);
+	vector<uint64_t> per_file_rows_scanned(file_count, 0);
+	vector<uint64_t> per_file_rows_selected(file_count, 0);
+	vector<uint64_t> per_file_scan_calls(file_count, 0);
 	{
 		py::gil_scoped_release release;
 		DuckDB db(nullptr);
@@ -5421,6 +5425,8 @@ static py::dict DBSGPUReadNormalizeTensor(const py::iterable &fact_paths_p, cons
 
 			idx_t scanned_row_base = 0;
 			idx_t copied_rows = 0;
+			uint64_t file_rows_scanned = 0;
+			uint64_t file_scan_calls = 0;
 			while (true) {
 				idx_t rows_out = 0;
 				auto scan_result = reader.ScanDirectDoubles(context, scan_state, scan_outputs.data(),
@@ -5428,6 +5434,7 @@ static py::dict DBSGPUReadNormalizeTensor(const py::iterable &fact_paths_p, cons
 				if (scan_result.GetResultType() == AsyncResultType::BLOCKED) {
 					scan_result.ExecuteTasksSynchronously();
 				}
+				file_scan_calls++;
 				scan_calls++;
 				if (scan_result.GetResultType() == AsyncResultType::FINISHED) {
 					break;
@@ -5455,10 +5462,16 @@ static py::dict DBSGPUReadNormalizeTensor(const py::iterable &fact_paths_p, cons
 					copied_rows += copy_end - copy_start;
 				}
 				scanned_row_base += rows_out;
+				file_rows_scanned += rows_out;
 				rows_scanned_total += rows_out;
 			}
-			direct_read_time +=
+			auto file_read_time =
 			    std::chrono::duration<double>(std::chrono::steady_clock::now() - read_start).count();
+			direct_read_time += file_read_time;
+			per_file_read_times[file_idx] = file_read_time;
+			per_file_rows_scanned[file_idx] = file_rows_scanned;
+			per_file_rows_selected[file_idx] = copied_rows;
+			per_file_scan_calls[file_idx] = file_scan_calls;
 			if (copied_rows != grid_count * level_count) {
 				throw InvalidInputException("selected row count mismatch in '%s': expected %llu, copied %llu",
 				                            fact_paths[file_idx],
@@ -5493,6 +5506,18 @@ static py::dict DBSGPUReadNormalizeTensor(const py::iterable &fact_paths_p, cons
 	result["scan_calls"] = py::int_(scan_calls);
 	result["direct_read_time"] = py::float_(direct_read_time);
 	result["normalization_time"] = py::float_(normalize_time);
+	py::list per_file;
+	for (idx_t file_idx = 0; file_idx < file_count; file_idx++) {
+		py::dict item;
+		item["index"] = py::int_(file_idx);
+		item["path"] = py::str(fact_paths[file_idx]);
+		item["read_time"] = py::float_(per_file_read_times[file_idx]);
+		item["rows_scanned"] = py::int_(per_file_rows_scanned[file_idx]);
+		item["rows_selected"] = py::int_(per_file_rows_selected[file_idx]);
+		item["scan_calls"] = py::int_(per_file_scan_calls[file_idx]);
+		per_file.append(item);
+	}
+	result["per_file"] = per_file;
 	return result;
 }
 

@@ -266,6 +266,17 @@ def normalize_tensor_duckdb_gpu_direct(
     print(f"scan_calls: {result['scan_calls']}")
     print(f"mean_shape: {result['mean'].shape}")
     print(f"std_shape: {result['std'].shape}")
+    if "per_file" in result:
+        print("\n[Per-file direct read]")
+        for item in result["per_file"]:
+            print(
+                f"{item['index'] + 1}: "
+                f"read={item['read_time']:.6f}s "
+                f"rows_scanned={item['rows_scanned']} "
+                f"rows_selected={item['rows_selected']} "
+                f"scan_calls={item['scan_calls']} "
+                f"{item['path']}"
+            )
 
     return result["normalized"], result["mean"], result["std"], norm_time, result
 
