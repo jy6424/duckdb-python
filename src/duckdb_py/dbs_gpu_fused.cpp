@@ -16,6 +16,7 @@
 #include <dlfcn.h>
 #include <exception>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -2907,8 +2908,9 @@ static vector<idx_t> ResolveParquetPayloadColumnIds(const ParquetReader &reader,
 			throw InvalidInputException("Parquet file '%s' does not contain payload column '%s'", fact_path,
 			                            payload_column);
 		}
-		if (columns[column_id].type.id() != LogicalTypeId::DOUBLE) {
-			throw InvalidInputException("Payload column '%s' must be DOUBLE for direct parquet GPU decode, got %s",
+		if (columns[column_id].type.id() != LogicalTypeId::DOUBLE &&
+		    columns[column_id].type.id() != LogicalTypeId::FLOAT) {
+			throw InvalidInputException("Payload column '%s' must be FLOAT or DOUBLE for direct parquet GPU decode, got %s",
 			                            payload_column, columns[column_id].type.ToString());
 		}
 		column_ids.push_back(column_id);
@@ -5310,6 +5312,190 @@ static py::dict DBSGPUNormalizeTensor(py::array_t<float, py::array::c_style | py
 	return result;
 }
 
+static idx_t ReadSingleIdx(Connection &connection, const string &query, const string &label) {
+	auto result = connection.Query(query);
+	if (result->HasError()) {
+		result->ThrowError();
+	}
+	auto chunk = result->Fetch();
+	if (!chunk || chunk->size() == 0) {
+		throw InvalidInputException("metadata query returned no rows while reading %s", label);
+	}
+	return chunk->GetValue(0, 0).GetValue<idx_t>();
+}
+
+static py::dict DBSGPUReadNormalizeTensor(const py::iterable &fact_paths_p, const py::object &payload_columns_p,
+                                          idx_t grid_start, idx_t grid_count, const string &lib_path,
+                                          double eps) {
+	vector<string> fact_paths;
+	for (auto item : fact_paths_p) {
+		fact_paths.push_back(py::str(item));
+	}
+	if (fact_paths.empty()) {
+		throw InvalidInputException("fact_paths cannot be empty");
+	}
+	auto payload_columns = ParsePayloadColumns(payload_columns_p);
+	if (grid_count == 0) {
+		throw InvalidInputException("grid_count must be positive");
+	}
+	if (eps < 0) {
+		throw InvalidInputException("eps must be non-negative");
+	}
+
+	auto file_count = fact_paths.size();
+	auto column_count = payload_columns.size();
+
+	DuckDB metadata_db(nullptr);
+	Connection metadata_connection(metadata_db);
+	auto first_expr = BuildReadParquetExpressionForPath(fact_paths[0]);
+	auto level_count = ReadSingleIdx(metadata_connection,
+	                                 "SELECT COUNT(DISTINCT levs) FROM " + first_expr,
+	                                 "level count");
+	auto total_grid_count = ReadSingleIdx(metadata_connection,
+	                                      "SELECT COUNT(DISTINCT grid) FROM " + first_expr,
+	                                      "grid count");
+	if (level_count == 0 || total_grid_count == 0) {
+		throw InvalidInputException("input parquet files must contain non-empty grid and levs columns");
+	}
+	if (grid_start >= total_grid_count || grid_start + grid_count > total_grid_count) {
+		throw InvalidInputException("requested grid range [%llu, %llu) is outside available grid count %llu",
+		                            static_cast<unsigned long long>(grid_start),
+		                            static_cast<unsigned long long>(grid_start + grid_count),
+		                            static_cast<unsigned long long>(total_grid_count));
+	}
+
+	vector<ssize_t> tensor_shape {static_cast<ssize_t>(file_count), static_cast<ssize_t>(grid_count),
+	                              static_cast<ssize_t>(column_count), static_cast<ssize_t>(level_count)};
+	vector<ssize_t> stats_shape {static_cast<ssize_t>(column_count), static_cast<ssize_t>(level_count)};
+	py::array_t<float> raw(tensor_shape);
+	py::array_t<float> normalized(tensor_shape);
+	py::array_t<float> mean(stats_shape);
+	py::array_t<float> stddev(stats_shape);
+
+	auto raw_data = static_cast<float *>(raw.request().ptr);
+	auto normalized_data = static_cast<float *>(normalized.request().ptr);
+	auto mean_data = static_cast<float *>(mean.request().ptr);
+	auto stddev_data = static_cast<float *>(stddev.request().ptr);
+	const auto total_values = file_count * grid_count * column_count * level_count;
+	std::fill(raw_data, raw_data + total_values, std::numeric_limits<float>::quiet_NaN());
+
+	auto direct_scan_rows = ReadEnvIdx("DUCKDB_GPU_PARQUET_DIRECT_SCAN_ROWS", STANDARD_VECTOR_SIZE);
+	if (direct_scan_rows == 0) {
+		direct_scan_rows = STANDARD_VECTOR_SIZE;
+	}
+	vector<vector<double>> scan_columns(column_count);
+	vector<double *> scan_outputs(column_count);
+	for (idx_t column = 0; column < column_count; column++) {
+		scan_columns[column].resize(direct_scan_rows);
+		scan_outputs[column] = scan_columns[column].data();
+	}
+
+	auto normalize_func = LoadNormalizeFloatTensor(lib_path);
+
+	double direct_read_time = 0;
+	double normalize_time = 0;
+	uint64_t rows_scanned_total = 0;
+	uint64_t rows_selected_total = 0;
+	uint64_t scan_calls = 0;
+	{
+		py::gil_scoped_release release;
+		DuckDB db(nullptr);
+		Connection connection(db);
+		auto &context = *connection.context;
+		ParquetOptions parquet_options(context);
+
+		const auto start_row = grid_start * level_count;
+		const auto end_row = (grid_start + grid_count) * level_count;
+		for (idx_t file_idx = 0; file_idx < fact_paths.size(); file_idx++) {
+			auto read_start = std::chrono::steady_clock::now();
+			ParquetReader reader(context, OpenFileInfo(fact_paths[file_idx]), parquet_options);
+			auto projected_column_ids = ResolveParquetPayloadColumnIds(reader, payload_columns, fact_paths[file_idx]);
+			ConfigureDirectParquetReaderProjection(reader, projected_column_ids);
+			ParquetReaderScanState scan_state;
+			vector<idx_t> groups_to_read;
+			groups_to_read.reserve(reader.NumRowGroups());
+			for (idx_t group = 0; group < reader.NumRowGroups(); group++) {
+				groups_to_read.push_back(group);
+			}
+			reader.InitializeScan(context, scan_state, std::move(groups_to_read));
+
+			idx_t scanned_row_base = 0;
+			idx_t copied_rows = 0;
+			while (true) {
+				idx_t rows_out = 0;
+				auto scan_result = reader.ScanDirectDoubles(context, scan_state, scan_outputs.data(),
+				                                            scan_outputs.size(), direct_scan_rows, rows_out);
+				if (scan_result.GetResultType() == AsyncResultType::BLOCKED) {
+					scan_result.ExecuteTasksSynchronously();
+				}
+				scan_calls++;
+				if (scan_result.GetResultType() == AsyncResultType::FINISHED) {
+					break;
+				}
+				if (rows_out == 0) {
+					continue;
+				}
+				auto chunk_start = scanned_row_base;
+				auto chunk_end = scanned_row_base + rows_out;
+				if (chunk_end > start_row && chunk_start < end_row) {
+					auto copy_start = MaxValue<idx_t>(chunk_start, start_row);
+					auto copy_end = MinValue<idx_t>(chunk_end, end_row);
+					for (idx_t row = copy_start; row < copy_end; row++) {
+						auto local_row = row - chunk_start;
+						auto selected_row = row - start_row;
+						auto grid_idx = selected_row / level_count;
+						auto level_idx = selected_row % level_count;
+						for (idx_t column = 0; column < column_count; column++) {
+							auto output_offset =
+							    (((file_idx * grid_count + grid_idx) * column_count + column) * level_count) +
+							    level_idx;
+							raw_data[output_offset] = static_cast<float>(scan_columns[column][local_row]);
+						}
+					}
+					copied_rows += copy_end - copy_start;
+				}
+				scanned_row_base += rows_out;
+				rows_scanned_total += rows_out;
+			}
+			direct_read_time +=
+			    std::chrono::duration<double>(std::chrono::steady_clock::now() - read_start).count();
+			if (copied_rows != grid_count * level_count) {
+				throw InvalidInputException("selected row count mismatch in '%s': expected %llu, copied %llu",
+				                            fact_paths[file_idx],
+				                            static_cast<unsigned long long>(grid_count * level_count),
+				                            static_cast<unsigned long long>(copied_rows));
+			}
+			rows_selected_total += copied_rows;
+		}
+
+		auto normalize_start = std::chrono::steady_clock::now();
+		auto rc = normalize_func(raw_data, static_cast<uint64_t>(file_count * grid_count),
+		                         static_cast<uint64_t>(column_count), static_cast<uint64_t>(level_count),
+		                         static_cast<float>(eps), normalized_data, mean_data, stddev_data);
+		normalize_time =
+		    std::chrono::duration<double>(std::chrono::steady_clock::now() - normalize_start).count();
+		if (rc != 0) {
+			throw InvalidInputException("GPU direct-read normalization failed");
+		}
+	}
+
+	py::dict result;
+	result["normalized"] = normalized;
+	result["raw"] = raw;
+	result["mean"] = mean;
+	result["std"] = stddev;
+	result["file_count"] = py::int_(file_count);
+	result["grid_count"] = py::int_(grid_count);
+	result["variable_count"] = py::int_(column_count);
+	result["level_count"] = py::int_(level_count);
+	result["rows_scanned"] = py::int_(rows_scanned_total);
+	result["rows_selected"] = py::int_(rows_selected_total);
+	result["scan_calls"] = py::int_(scan_calls);
+	result["direct_read_time"] = py::float_(direct_read_time);
+	result["normalization_time"] = py::float_(normalize_time);
+	return result;
+}
+
 } // namespace
 
 void RegisterDBSGPUFused(py::module_ &m) {
@@ -5327,6 +5513,10 @@ void RegisterDBSGPUFused(py::module_ &m) {
 	      py::arg("read_mode") = "per-file", py::arg("reuse_dimension_mapping") = false,
 	      py::arg("assume_payload_all_valid") = false);
 	m.def("dbs_gpu_normalize_tensor", &DBSGPUNormalizeTensor, py::arg("input"), py::arg("lib_path") = "",
+	      py::arg("eps") = 1.0e-6);
+	m.def("dbs_gpu_read_normalize_tensor", &DBSGPUReadNormalizeTensor, py::arg("fact_paths"),
+	      py::arg("payload_columns") = py::make_tuple("T", "u", "v", "qv", "hgt", "p"),
+	      py::arg("grid_start") = 0, py::arg("grid_count") = 15002, py::arg("lib_path") = "",
 	      py::arg("eps") = 1.0e-6);
 }
 

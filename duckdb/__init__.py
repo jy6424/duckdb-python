@@ -417,3 +417,10 @@ try:
     __all__.append("dbs_gpu_normalize_tensor")
 except ImportError:
     pass
+
+try:
+    from _duckdb import dbs_gpu_read_normalize_tensor
+
+    __all__.append("dbs_gpu_read_normalize_tensor")
+except ImportError:
+    pass

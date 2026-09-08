@@ -225,6 +225,51 @@ def normalize_tensor_duckdb_gpu(data, eps=1.0e-6, lib_path="", activation="none"
     return normalized, mean, std, norm_time
 
 
+def normalize_tensor_duckdb_gpu_direct(
+    paths,
+    variables,
+    grid_start=0,
+    grid_count=15002,
+    eps=1.0e-6,
+    lib_path="",
+    activation="none",
+):
+    norm_start = tic()
+
+    old_activation = os.environ.get("DUCKDB_GPU_NORMALIZE_ACTIVATION")
+    os.environ["DUCKDB_GPU_NORMALIZE_ACTIVATION"] = activation
+    try:
+        result = duckdb.dbs_gpu_read_normalize_tensor(
+            paths,
+            tuple(variables),
+            grid_start=grid_start,
+            grid_count=grid_count,
+            lib_path=lib_path,
+            eps=eps,
+        )
+    finally:
+        if old_activation is None:
+            os.environ.pop("DUCKDB_GPU_NORMALIZE_ACTIVATION", None)
+        else:
+            os.environ["DUCKDB_GPU_NORMALIZE_ACTIVATION"] = old_activation
+
+    norm_time = tic() - norm_start
+
+    print("\n[Normalization]")
+    print("backend: duckdb-gpu-direct")
+    print(f"activation: {activation}")
+    print(f"direct_read_time: {result['direct_read_time']:.6f}s")
+    print(f"gpu_kernel_total: {result['normalization_time']:.6f}s")
+    print(f"normalization_total: {norm_time:.6f}s")
+    print(f"rows_scanned: {result['rows_scanned']}")
+    print(f"rows_selected: {result['rows_selected']}")
+    print(f"scan_calls: {result['scan_calls']}")
+    print(f"mean_shape: {result['mean'].shape}")
+    print(f"std_shape: {result['std'].shape}")
+
+    return result["normalized"], result["mean"], result["std"], norm_time, result
+
+
 def read_training_data_duckdb(
     parquet_path,
     variables=DEFAULT_VARIABLES,
@@ -359,6 +404,42 @@ def read_many_training_files_duckdb(
     if not paths:
         raise FileNotFoundError(f"No Parquet files found: {parquet_pattern}")
 
+    if use_all_variables:
+        con = duckdb.connect()
+        try:
+            variables = tuple(get_all_double_variables(con, paths[0]))
+        finally:
+            con.close()
+    else:
+        variables = tuple(variables)
+
+    if normalize and normalize_backend == "duckdb-gpu-direct":
+        data, mean, std, normalize_time, direct_result = normalize_tensor_duckdb_gpu_direct(
+            paths,
+            variables,
+            grid_start=grid_start,
+            grid_count=grid_count,
+            lib_path=gpu_lib_path,
+            activation=normalize_activation,
+        )
+        total_time = tic() - total_start
+
+        print("\n==================================================")
+        print("[Overall Summary]")
+        print("==================================================")
+        print(f"number_of_files: {len(paths)}")
+        print(f"variable_count: {len(variables)}")
+        print("sum_file_times: 0.000000s")
+        print("avg_file_time: 0.000000s")
+        print("min_file_time: 0.000000s")
+        print("max_file_time: 0.000000s")
+        print("final_stack_time: 0.000000s")
+        print(f"normalization_time: {normalize_time:.6f}s")
+        print(f"total_time: {total_time:.6f}s")
+        print(f"final_shape: {data.shape}")
+        print(f"levels_shape: ({direct_result['level_count']},)")
+        return data, None, variables, mean, std
+
     all_stacked = []
     levels_ref = None
     variables_ref = None
@@ -458,7 +539,11 @@ def parse_args():
     parser.add_argument("--grid-count", type=int, default=15002)
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--normalize", action="store_true")
-    parser.add_argument("--normalize-backend", choices=["numpy", "cupy", "duckdb-gpu"], default="numpy")
+    parser.add_argument(
+        "--normalize-backend",
+        choices=["numpy", "cupy", "duckdb-gpu", "duckdb-gpu-direct"],
+        default="numpy",
+    )
     parser.add_argument(
         "--normalize-activation",
         choices=["none", "sigmoid", "relu", "tanh", "gelu", "softplus"],
