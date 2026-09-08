@@ -1,5 +1,6 @@
 import argparse
 import glob
+import os
 import time
 
 import duckdb
@@ -60,7 +61,57 @@ def build_clean_expr(name):
     )
 
 
-def normalize_tensor_numpy(data, eps=1.0e-6):
+def apply_activation_numpy(data, activation):
+    if activation == "none":
+        return data
+    if activation == "sigmoid":
+        return (1.0 / (1.0 + np.exp(-data))).astype(np.float32)
+    if activation == "relu":
+        return np.maximum(data, 0.0).astype(np.float32)
+    if activation == "tanh":
+        return np.tanh(data).astype(np.float32)
+    if activation == "gelu":
+        cubed = data * data * data
+        return (
+            0.5
+            * data
+            * (1.0 + np.tanh(0.7978845608028654 * (data + 0.044715 * cubed)))
+        ).astype(np.float32)
+    if activation == "softplus":
+        return np.where(
+            data > 0.0,
+            data + np.log1p(np.exp(-data)),
+            np.log1p(np.exp(data)),
+        ).astype(np.float32)
+    raise ValueError(f"unknown normalize activation: {activation}")
+
+
+def apply_activation_cupy(data, activation, cp):
+    if activation == "none":
+        return data
+    if activation == "sigmoid":
+        return (1.0 / (1.0 + cp.exp(-data))).astype(cp.float32)
+    if activation == "relu":
+        return cp.maximum(data, 0.0).astype(cp.float32)
+    if activation == "tanh":
+        return cp.tanh(data).astype(cp.float32)
+    if activation == "gelu":
+        cubed = data * data * data
+        return (
+            0.5
+            * data
+            * (1.0 + cp.tanh(0.7978845608028654 * (data + 0.044715 * cubed)))
+        ).astype(cp.float32)
+    if activation == "softplus":
+        return cp.where(
+            data > 0.0,
+            data + cp.log1p(cp.exp(-data)),
+            cp.log1p(cp.exp(data)),
+        ).astype(cp.float32)
+    raise ValueError(f"unknown normalize activation: {activation}")
+
+
+def normalize_tensor_numpy(data, eps=1.0e-6, activation="none"):
     norm_start = tic()
 
     stats_start = tic()
@@ -70,12 +121,14 @@ def normalize_tensor_numpy(data, eps=1.0e-6):
 
     apply_start = tic()
     normalized = ((data - mean) / (std + eps)).astype(np.float32)
+    normalized = apply_activation_numpy(normalized, activation)
     apply_time = tic() - apply_start
 
     norm_time = tic() - norm_start
 
     print("\n[Normalization]")
     print("backend: numpy")
+    print(f"activation: {activation}")
     print(f"stats_mean_std: {stats_time:.6f}s")
     print(f"apply_normalization: {apply_time:.6f}s")
     print(f"normalization_total: {norm_time:.6f}s")
@@ -85,7 +138,7 @@ def normalize_tensor_numpy(data, eps=1.0e-6):
     return normalized, mean, std, norm_time
 
 
-def normalize_tensor_cupy(data, eps=1.0e-6, return_gpu=False):
+def normalize_tensor_cupy(data, eps=1.0e-6, return_gpu=False, activation="none"):
     import cupy as cp
 
     norm_start = tic()
@@ -103,6 +156,7 @@ def normalize_tensor_cupy(data, eps=1.0e-6, return_gpu=False):
 
     apply_start = tic()
     normalized = ((gpu_data - mean) / (std + eps)).astype(cp.float32)
+    normalized = apply_activation_cupy(normalized, activation, cp)
     cp.cuda.Stream.null.synchronize()
     apply_time = tic() - apply_start
 
@@ -122,6 +176,7 @@ def normalize_tensor_cupy(data, eps=1.0e-6, return_gpu=False):
 
     print("\n[Normalization]")
     print("backend: cupy")
+    print(f"activation: {activation}")
     print(f"copy_to_gpu: {copy_to_gpu_time:.6f}s")
     print(f"stats_mean_std: {stats_time:.6f}s")
     print(f"apply_normalization: {apply_time:.6f}s")
@@ -133,7 +188,7 @@ def normalize_tensor_cupy(data, eps=1.0e-6, return_gpu=False):
     return normalized_out, mean_out, std_out, norm_time
 
 
-def normalize_tensor_duckdb_gpu(data, eps=1.0e-6, lib_path=""):
+def normalize_tensor_duckdb_gpu(data, eps=1.0e-6, lib_path="", activation="none"):
     norm_start = tic()
 
     input_start = tic()
@@ -141,7 +196,15 @@ def normalize_tensor_duckdb_gpu(data, eps=1.0e-6, lib_path=""):
     input_time = tic() - input_start
 
     call_start = tic()
-    result = duckdb.dbs_gpu_normalize_tensor(gpu_input, lib_path=lib_path, eps=eps)
+    old_activation = os.environ.get("DUCKDB_GPU_NORMALIZE_ACTIVATION")
+    os.environ["DUCKDB_GPU_NORMALIZE_ACTIVATION"] = activation
+    try:
+        result = duckdb.dbs_gpu_normalize_tensor(gpu_input, lib_path=lib_path, eps=eps)
+    finally:
+        if old_activation is None:
+            os.environ.pop("DUCKDB_GPU_NORMALIZE_ACTIVATION", None)
+        else:
+            os.environ["DUCKDB_GPU_NORMALIZE_ACTIVATION"] = old_activation
     call_time = tic() - call_start
 
     normalized = result["normalized"]
@@ -151,6 +214,7 @@ def normalize_tensor_duckdb_gpu(data, eps=1.0e-6, lib_path=""):
 
     print("\n[Normalization]")
     print("backend: duckdb-gpu")
+    print(f"activation: {activation}")
     print(f"prepare_contiguous_input: {input_time:.6f}s")
     print(f"gpu_call_wall: {call_time:.6f}s")
     print(f"gpu_kernel_total: {result['normalization_time']:.6f}s")
@@ -285,6 +349,7 @@ def read_many_training_files_duckdb(
     normalize_backend="numpy",
     normalize_return_gpu=False,
     gpu_lib_path="",
+    normalize_activation="none",
 ):
     total_start = tic()
 
@@ -336,16 +401,21 @@ def read_many_training_files_duckdb(
     normalize_time = 0.0
     if normalize:
         if normalize_backend == "numpy":
-            data, mean, std, normalize_time = normalize_tensor_numpy(data)
+            data, mean, std, normalize_time = normalize_tensor_numpy(
+                data,
+                activation=normalize_activation,
+            )
         elif normalize_backend == "cupy":
             data, mean, std, normalize_time = normalize_tensor_cupy(
                 data,
                 return_gpu=normalize_return_gpu,
+                activation=normalize_activation,
             )
         elif normalize_backend == "duckdb-gpu":
             data, mean, std, normalize_time = normalize_tensor_duckdb_gpu(
                 data,
                 lib_path=gpu_lib_path,
+                activation=normalize_activation,
             )
         else:
             raise ValueError(f"unknown normalize_backend: {normalize_backend}")
@@ -389,6 +459,11 @@ def parse_args():
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--normalize", action="store_true")
     parser.add_argument("--normalize-backend", choices=["numpy", "cupy", "duckdb-gpu"], default="numpy")
+    parser.add_argument(
+        "--normalize-activation",
+        choices=["none", "sigmoid", "relu", "tanh", "gelu", "softplus"],
+        default="none",
+    )
     parser.add_argument("--gpu-lib-path", default="")
     parser.add_argument(
         "--normalize-return-gpu",
@@ -413,4 +488,5 @@ if __name__ == "__main__":
         normalize_backend=args.normalize_backend,
         normalize_return_gpu=args.normalize_return_gpu,
         gpu_lib_path=args.gpu_lib_path,
+        normalize_activation=args.normalize_activation,
     )

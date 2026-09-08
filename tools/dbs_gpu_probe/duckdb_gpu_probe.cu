@@ -157,8 +157,67 @@ __global__ void DuckDBGpuNormalizeFinalizeFloatKernel(uint64_t stat_count, const
 	stddev[stat_idx] = static_cast<float>(sqrt(variance) + static_cast<double>(eps));
 }
 
+// Which nonlinearity (if any) DuckDBGpuNormalizeApplyFloatKernel applies to each normalized value,
+// controlled by DUCKDB_GPU_NORMALIZE_ACTIVATION. Plain normalization (mean-center + scale) is a
+// single subtract and divide per element -- very low arithmetic intensity, so it's memory-bandwidth
+// bound and can never dominate an I/O-bound pipeline no matter how it's scheduled. Applying a real
+// nonlinearity (transcendental functions cost far more cycles per element than a subtract/divide)
+// raises the compute-per-byte enough that the normalization step can actually become compute-bound,
+// which is where offloading it to the GPU should show a real advantage over CPU/numpy.
+int NormalizeActivationMode() {
+	const auto value = std::getenv("DUCKDB_GPU_NORMALIZE_ACTIVATION");
+	if (!value || value[0] == '\0' || std::strcmp(value, "none") == 0) {
+		return 0;
+	}
+	if (std::strcmp(value, "sigmoid") == 0) {
+		return 1;
+	}
+	if (std::strcmp(value, "relu") == 0) {
+		return 2;
+	}
+	if (std::strcmp(value, "tanh") == 0) {
+		return 3;
+	}
+	if (std::strcmp(value, "gelu") == 0) {
+		return 4;
+	}
+	if (std::strcmp(value, "softplus") == 0) {
+		return 5;
+	}
+	return 0;
+}
+
+__device__ float ApplyNormalizeActivation(float value, int activation_mode) {
+	if (activation_mode == 0) {
+		return value;
+	}
+	if (activation_mode == 1) {
+		// Sigmoid: 1 / (1 + e^-x)
+		return 1.0f / (1.0f + expf(-value));
+	}
+	if (activation_mode == 2) {
+		// ReLU: max(0, x)
+		return value > 0.0f ? value : 0.0f;
+	}
+	if (activation_mode == 3) {
+		return tanhf(value);
+	}
+	if (activation_mode == 4) {
+		// GELU (tanh approximation), as used in e.g. BERT/GPT-2:
+		// 0.5x * (1 + tanh(sqrt(2/pi) * (x + 0.044715x^3)))
+		const auto cubed = value * value * value;
+		return 0.5f * value * (1.0f + tanhf(0.7978845608028654f * (value + 0.044715f * cubed)));
+	}
+	if (activation_mode == 5) {
+		// Softplus: ln(1 + e^x), computed in a form stable for large |x|
+		return value > 0.0f ? value + log1pf(expf(-value)) : log1pf(expf(value));
+	}
+	return value;
+}
+
 __global__ void DuckDBGpuNormalizeApplyFloatKernel(const float *input, uint64_t outer_count, uint64_t stat_count,
-                                                   const float *mean, const float *stddev, float *output) {
+                                                   const float *mean, const float *stddev, float *output,
+                                                   int activation_mode) {
 	const auto row = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 	const auto total_count = outer_count * stat_count;
 	if (row >= total_count) {
@@ -171,7 +230,8 @@ __global__ void DuckDBGpuNormalizeApplyFloatKernel(const float *input, uint64_t 
 		output[row] = NAN;
 		return;
 	}
-	output[row] = (value - mean[stat_idx]) / stddev[stat_idx];
+	const auto normalized = (value - mean[stat_idx]) / stddev[stat_idx];
+	output[row] = ApplyNormalizeActivation(normalized, activation_mode);
 }
 
 __global__ void DuckDBGpuProbeI64Kernel(const int64_t *keys, const uint8_t *validity, uint64_t count,
@@ -1283,8 +1343,9 @@ extern "C" int duckdb_gpu_normalize_float_tensor(const float *input, uint64_t ou
 	DuckDBGpuNormalizeFinalizeFloatKernel<<<stats_blocks, THREADS_PER_BLOCK>>>(stat_count, d_sums, d_sumsq, d_counts,
 	                                                                           eps, d_mean, d_stddev);
 	error |= CheckCuda(cudaGetLastError(), "launch normalize finalize kernel");
+	const auto activation_mode = NormalizeActivationMode();
 	DuckDBGpuNormalizeApplyFloatKernel<<<total_blocks, THREADS_PER_BLOCK>>>(d_input, outer_count, stat_count, d_mean,
-	                                                                        d_stddev, d_output);
+	                                                                        d_stddev, d_output, activation_mode);
 	error |= CheckCuda(cudaGetLastError(), "launch normalize apply kernel");
 	if (error) {
 		return 1;
