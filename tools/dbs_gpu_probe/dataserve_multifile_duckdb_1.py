@@ -233,6 +233,8 @@ def normalize_tensor_duckdb_gpu_direct(
     eps=1.0e-6,
     lib_path="",
     activation="none",
+    reader_threads=1,
+    pipeline_slots=2,
 ):
     norm_start = tic()
 
@@ -246,6 +248,8 @@ def normalize_tensor_duckdb_gpu_direct(
             grid_count=grid_count,
             lib_path=lib_path,
             eps=eps,
+            reader_threads=reader_threads,
+            pipeline_slots=pipeline_slots,
         )
     finally:
         if old_activation is None:
@@ -258,7 +262,10 @@ def normalize_tensor_duckdb_gpu_direct(
     print("\n[Normalization]")
     print("backend: duckdb-gpu-direct")
     print(f"activation: {activation}")
-    print(f"direct_read_time: {result['direct_read_time']:.6f}s")
+    print(f"reader_threads: {result['reader_threads']}")
+    print(f"pipeline_slots: {result['pipeline_slots']}")
+    print(f"direct_read_time (wall): {result['direct_read_time']:.6f}s")
+    print(f"direct_read_time (sum over files): {result['direct_read_sum_time']:.6f}s")
     print(f"gpu_kernel_total: {result['normalization_time']:.6f}s")
     print(f"normalization_total: {norm_time:.6f}s")
     print(f"rows_scanned: {result['rows_scanned']}")
@@ -406,6 +413,8 @@ def read_many_training_files_duckdb(
     normalize_return_gpu=False,
     gpu_lib_path="",
     normalize_activation="none",
+    reader_threads=1,
+    pipeline_slots=2,
 ):
     total_start = tic()
 
@@ -432,6 +441,8 @@ def read_many_training_files_duckdb(
             grid_count=grid_count,
             lib_path=gpu_lib_path,
             activation=normalize_activation,
+            reader_threads=reader_threads,
+            pipeline_slots=pipeline_slots,
         )
         total_time = tic() - total_start
 
@@ -440,11 +451,15 @@ def read_many_training_files_duckdb(
         print("==================================================")
         print(f"number_of_files: {len(paths)}")
         print(f"variable_count: {len(variables)}")
-        print("sum_file_times: 0.000000s")
+        print(f"reader_threads: {direct_result['reader_threads']}")
+        print(f"pipeline_slots: {direct_result['pipeline_slots']}")
+        print(f"sum_file_times: {direct_result['direct_read_sum_time']:.6f}s")
         print("avg_file_time: 0.000000s")
         print("min_file_time: 0.000000s")
         print("max_file_time: 0.000000s")
         print("final_stack_time: 0.000000s")
+        print(f"read_time: {direct_result['direct_read_time']:.6f}s")
+        print(f"calculation_time: {direct_result['normalization_time']:.6f}s")
         print(f"normalization_time: {normalize_time:.6f}s")
         print(f"total_time: {total_time:.6f}s")
         print(f"final_shape: {data.shape}")
@@ -524,6 +539,8 @@ def read_many_training_files_duckdb(
     print(f"min_file_time: {np.min(file_times):.6f}s")
     print(f"max_file_time: {np.max(file_times):.6f}s")
     print(f"final_stack_time: {final_stack_time:.6f}s")
+    print(f"read_time: {sum(file_times) + final_stack_time:.6f}s")
+    print(f"calculation_time: {normalize_time:.6f}s")
     print(f"normalization_time: {normalize_time:.6f}s")
     print(f"total_time: {total_time:.6f}s")
     print(f"final_shape: {data.shape}")
@@ -566,6 +583,18 @@ def parse_args():
         action="store_true",
         help="keep normalized output as a CuPy array when --normalize-backend=cupy",
     )
+    parser.add_argument(
+        "--reader-threads",
+        type=int,
+        default=1,
+        help="duckdb-gpu-direct only: number of files decoded concurrently in the read pipeline",
+    )
+    parser.add_argument(
+        "--pipeline-slots",
+        type=int,
+        default=2,
+        help="duckdb-gpu-direct only: number of in-flight scan buffers shared by the reader threads",
+    )
     return parser.parse_args()
 
 
@@ -585,4 +614,6 @@ if __name__ == "__main__":
         normalize_return_gpu=args.normalize_return_gpu,
         gpu_lib_path=args.gpu_lib_path,
         normalize_activation=args.normalize_activation,
+        reader_threads=args.reader_threads,
+        pipeline_slots=args.pipeline_slots,
     )

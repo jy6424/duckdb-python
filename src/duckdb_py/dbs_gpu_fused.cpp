@@ -5325,8 +5325,8 @@ static idx_t ReadSingleIdx(Connection &connection, const string &query, const st
 }
 
 static py::dict DBSGPUReadNormalizeTensor(const py::iterable &fact_paths_p, const py::object &payload_columns_p,
-                                          idx_t grid_start, idx_t grid_count, const string &lib_path,
-                                          double eps) {
+                                          idx_t grid_start, idx_t grid_count, const string &lib_path, double eps,
+                                          idx_t reader_threads, idx_t pipeline_slots) {
 	vector<string> fact_paths;
 	for (auto item : fact_paths_p) {
 		fact_paths.push_back(py::str(item));
@@ -5341,9 +5341,17 @@ static py::dict DBSGPUReadNormalizeTensor(const py::iterable &fact_paths_p, cons
 	if (eps < 0) {
 		throw InvalidInputException("eps must be non-negative");
 	}
+	if (reader_threads == 0) {
+		reader_threads = 1;
+	}
+	if (pipeline_slots == 0) {
+		pipeline_slots = 1;
+	}
 
 	auto file_count = fact_paths.size();
 	auto column_count = payload_columns.size();
+	// No point spawning more reader threads than there are files to hand out.
+	reader_threads = MinValue<idx_t>(reader_threads, static_cast<idx_t>(file_count));
 
 	DuckDB metadata_db(nullptr);
 	Connection metadata_connection(metadata_db);
@@ -5383,102 +5391,179 @@ static py::dict DBSGPUReadNormalizeTensor(const py::iterable &fact_paths_p, cons
 	if (direct_scan_rows == 0) {
 		direct_scan_rows = STANDARD_VECTOR_SIZE;
 	}
-	vector<vector<double>> scan_columns(column_count);
-	vector<double *> scan_outputs(column_count);
-	for (idx_t column = 0; column < column_count; column++) {
-		scan_columns[column].resize(direct_scan_rows);
-		scan_outputs[column] = scan_columns[column].data();
+
+	// pipeline_slots bounds how many files can be actively decoding at once, independent of how many
+	// reader threads exist to pick up work: a scratch buffer (one per slot) is only released back to
+	// free_slots once its file is fully scanned, so extra reader_threads beyond pipeline_slots simply
+	// queue up on free_slots.Pop() instead of each allocating their own scan buffer. This mirrors how
+	// pipeline_slots bounds in-flight GPU input batches in DBSGPUFusedLatMulti's reader/GPU pipeline
+	// (see PrepareDirectMultiPipelineChunkBatches above).
+	struct NormalizeScanScratch {
+		vector<vector<double>> columns;
+		vector<double *> outputs;
+	};
+	vector<NormalizeScanScratch> scratch_pool(pipeline_slots);
+	for (auto &scratch : scratch_pool) {
+		scratch.columns.resize(column_count);
+		scratch.outputs.resize(column_count);
+		for (idx_t column = 0; column < column_count; column++) {
+			scratch.columns[column].resize(direct_scan_rows);
+			scratch.outputs[column] = scratch.columns[column].data();
+		}
 	}
 
 	auto normalize_func = LoadNormalizeFloatTensor(lib_path);
 
 	double direct_read_time = 0;
+	double direct_read_sum_time = 0;
 	double normalize_time = 0;
-	uint64_t rows_scanned_total = 0;
-	uint64_t rows_selected_total = 0;
-	uint64_t scan_calls = 0;
+	std::atomic<uint64_t> rows_scanned_total {0};
+	std::atomic<uint64_t> rows_selected_total {0};
+	std::atomic<uint64_t> scan_calls {0};
 	vector<double> per_file_read_times(file_count, 0);
 	vector<uint64_t> per_file_rows_scanned(file_count, 0);
 	vector<uint64_t> per_file_rows_selected(file_count, 0);
 	vector<uint64_t> per_file_scan_calls(file_count, 0);
 	{
 		py::gil_scoped_release release;
+		// Shared DuckDB instance, but every reader thread opens its own Connection/ClientContext below --
+		// same pattern as ReadMultiPipelineChunkBatchWorker's multi-reader mode.
 		DuckDB db(nullptr);
-		Connection connection(db);
-		auto &context = *connection.context;
-		ParquetOptions parquet_options(context);
 
 		const auto start_row = grid_start * level_count;
 		const auto end_row = (grid_start + grid_count) * level_count;
-		for (idx_t file_idx = 0; file_idx < fact_paths.size(); file_idx++) {
-			auto read_start = std::chrono::steady_clock::now();
-			ParquetReader reader(context, OpenFileInfo(fact_paths[file_idx]), parquet_options);
-			auto projected_column_ids = ResolveParquetPayloadColumnIds(reader, payload_columns, fact_paths[file_idx]);
-			ConfigureDirectParquetReaderProjection(reader, projected_column_ids);
-			ParquetReaderScanState scan_state;
-			vector<idx_t> groups_to_read;
-			groups_to_read.reserve(reader.NumRowGroups());
-			for (idx_t group = 0; group < reader.NumRowGroups(); group++) {
-				groups_to_read.push_back(group);
-			}
-			reader.InitializeScan(context, scan_state, std::move(groups_to_read));
 
-			idx_t scanned_row_base = 0;
-			idx_t copied_rows = 0;
-			uint64_t file_rows_scanned = 0;
-			uint64_t file_scan_calls = 0;
-			while (true) {
-				idx_t rows_out = 0;
-				auto scan_result = reader.ScanDirectDoubles(context, scan_state, scan_outputs.data(),
-				                                            scan_outputs.size(), direct_scan_rows, rows_out);
-				if (scan_result.GetResultType() == AsyncResultType::BLOCKED) {
-					scan_result.ExecuteTasksSynchronously();
-				}
-				file_scan_calls++;
-				scan_calls++;
-				if (scan_result.GetResultType() == AsyncResultType::FINISHED) {
-					break;
-				}
-				if (rows_out == 0) {
-					continue;
-				}
-				auto chunk_start = scanned_row_base;
-				auto chunk_end = scanned_row_base + rows_out;
-				if (chunk_end > start_row && chunk_start < end_row) {
-					auto copy_start = MaxValue<idx_t>(chunk_start, start_row);
-					auto copy_end = MinValue<idx_t>(chunk_end, end_row);
-					for (idx_t row = copy_start; row < copy_end; row++) {
-						auto local_row = row - chunk_start;
-						auto selected_row = row - start_row;
-						auto grid_idx = selected_row / level_count;
-						auto level_idx = selected_row % level_count;
-						for (idx_t column = 0; column < column_count; column++) {
-							auto output_offset =
-							    (((file_idx * grid_count + grid_idx) * column_count + column) * level_count) +
-							    level_idx;
-							raw_data[output_offset] = static_cast<float>(scan_columns[column][local_row]);
-						}
+		BlockingQueue<idx_t> free_slots(pipeline_slots);
+		for (idx_t slot = 0; slot < pipeline_slots; slot++) {
+			free_slots.Push(slot);
+		}
+		BlockingQueue<idx_t> file_index_queue(0);
+		for (idx_t file_idx = 0; file_idx < file_count; file_idx++) {
+			file_index_queue.Push(file_idx);
+		}
+		file_index_queue.Close();
+
+		std::exception_ptr worker_error;
+		std::mutex worker_error_lock;
+
+		struct SlotGuard {
+			BlockingQueue<idx_t> &free_slots;
+			idx_t slot;
+			~SlotGuard() {
+				free_slots.Push(slot);
+			}
+		};
+
+		auto reader_worker = [&]() {
+			try {
+				Connection connection(db);
+				auto &context = *connection.context;
+				ParquetOptions parquet_options(context);
+
+				idx_t file_idx;
+				while (file_index_queue.Pop(file_idx)) {
+					idx_t slot = 0;
+					free_slots.Pop(slot);
+					SlotGuard slot_guard {free_slots, slot};
+					auto &scratch = scratch_pool[slot];
+
+					auto read_start = std::chrono::steady_clock::now();
+					ParquetReader reader(context, OpenFileInfo(fact_paths[file_idx]), parquet_options);
+					auto projected_column_ids =
+					    ResolveParquetPayloadColumnIds(reader, payload_columns, fact_paths[file_idx]);
+					ConfigureDirectParquetReaderProjection(reader, projected_column_ids);
+					ParquetReaderScanState scan_state;
+					vector<idx_t> groups_to_read;
+					groups_to_read.reserve(reader.NumRowGroups());
+					for (idx_t group = 0; group < reader.NumRowGroups(); group++) {
+						groups_to_read.push_back(group);
 					}
-					copied_rows += copy_end - copy_start;
+					reader.InitializeScan(context, scan_state, std::move(groups_to_read));
+
+					idx_t scanned_row_base = 0;
+					idx_t copied_rows = 0;
+					uint64_t file_rows_scanned = 0;
+					uint64_t file_scan_calls = 0;
+					while (true) {
+						idx_t rows_out = 0;
+						auto scan_result = reader.ScanDirectDoubles(context, scan_state, scratch.outputs.data(),
+						                                            scratch.outputs.size(), direct_scan_rows,
+						                                            rows_out);
+						if (scan_result.GetResultType() == AsyncResultType::BLOCKED) {
+							scan_result.ExecuteTasksSynchronously();
+						}
+						file_scan_calls++;
+						scan_calls++;
+						if (scan_result.GetResultType() == AsyncResultType::FINISHED) {
+							break;
+						}
+						if (rows_out == 0) {
+							continue;
+						}
+						auto chunk_start = scanned_row_base;
+						auto chunk_end = scanned_row_base + rows_out;
+						if (chunk_end > start_row && chunk_start < end_row) {
+							auto copy_start = MaxValue<idx_t>(chunk_start, start_row);
+							auto copy_end = MinValue<idx_t>(chunk_end, end_row);
+							for (idx_t row = copy_start; row < copy_end; row++) {
+								auto local_row = row - chunk_start;
+								auto selected_row = row - start_row;
+								auto grid_idx = selected_row / level_count;
+								auto level_idx = selected_row % level_count;
+								for (idx_t column = 0; column < column_count; column++) {
+									// file_idx makes this range disjoint from every other reader thread's
+									// output range, so concurrent writes into raw_data need no locking.
+									auto output_offset = (((file_idx * grid_count + grid_idx) * column_count +
+									                        column) *
+									                       level_count) +
+									                      level_idx;
+									raw_data[output_offset] = static_cast<float>(scratch.columns[column][local_row]);
+								}
+							}
+							copied_rows += copy_end - copy_start;
+						}
+						scanned_row_base += rows_out;
+						file_rows_scanned += rows_out;
+						rows_scanned_total += rows_out;
+					}
+					auto file_read_time =
+					    std::chrono::duration<double>(std::chrono::steady_clock::now() - read_start).count();
+					per_file_read_times[file_idx] = file_read_time;
+					per_file_rows_scanned[file_idx] = file_rows_scanned;
+					per_file_rows_selected[file_idx] = copied_rows;
+					per_file_scan_calls[file_idx] = file_scan_calls;
+					if (copied_rows != grid_count * level_count) {
+						throw InvalidInputException("selected row count mismatch in '%s': expected %llu, copied %llu",
+						                            fact_paths[file_idx],
+						                            static_cast<unsigned long long>(grid_count * level_count),
+						                            static_cast<unsigned long long>(copied_rows));
+					}
+					rows_selected_total += copied_rows;
 				}
-				scanned_row_base += rows_out;
-				file_rows_scanned += rows_out;
-				rows_scanned_total += rows_out;
+			} catch (...) {
+				std::lock_guard<std::mutex> guard(worker_error_lock);
+				if (!worker_error) {
+					worker_error = std::current_exception();
+				}
 			}
-			auto file_read_time =
-			    std::chrono::duration<double>(std::chrono::steady_clock::now() - read_start).count();
-			direct_read_time += file_read_time;
-			per_file_read_times[file_idx] = file_read_time;
-			per_file_rows_scanned[file_idx] = file_rows_scanned;
-			per_file_rows_selected[file_idx] = copied_rows;
-			per_file_scan_calls[file_idx] = file_scan_calls;
-			if (copied_rows != grid_count * level_count) {
-				throw InvalidInputException("selected row count mismatch in '%s': expected %llu, copied %llu",
-				                            fact_paths[file_idx],
-				                            static_cast<unsigned long long>(grid_count * level_count),
-				                            static_cast<unsigned long long>(copied_rows));
-			}
-			rows_selected_total += copied_rows;
+		};
+
+		auto pass1_start = std::chrono::steady_clock::now();
+		vector<std::thread> readers;
+		readers.reserve(reader_threads);
+		for (idx_t t = 0; t < reader_threads; t++) {
+			readers.emplace_back(reader_worker);
+		}
+		for (auto &reader_thread : readers) {
+			reader_thread.join();
+		}
+		direct_read_time = std::chrono::duration<double>(std::chrono::steady_clock::now() - pass1_start).count();
+		for (auto &file_read_time : per_file_read_times) {
+			direct_read_sum_time += file_read_time;
+		}
+
+		if (worker_error) {
+			std::rethrow_exception(worker_error);
 		}
 
 		auto normalize_start = std::chrono::steady_clock::now();
@@ -5501,10 +5586,13 @@ static py::dict DBSGPUReadNormalizeTensor(const py::iterable &fact_paths_p, cons
 	result["grid_count"] = py::int_(grid_count);
 	result["variable_count"] = py::int_(column_count);
 	result["level_count"] = py::int_(level_count);
-	result["rows_scanned"] = py::int_(rows_scanned_total);
-	result["rows_selected"] = py::int_(rows_selected_total);
-	result["scan_calls"] = py::int_(scan_calls);
+	result["rows_scanned"] = py::int_(rows_scanned_total.load());
+	result["rows_selected"] = py::int_(rows_selected_total.load());
+	result["scan_calls"] = py::int_(scan_calls.load());
 	result["direct_read_time"] = py::float_(direct_read_time);
+	result["direct_read_sum_time"] = py::float_(direct_read_sum_time);
+	result["reader_threads"] = py::int_(reader_threads);
+	result["pipeline_slots"] = py::int_(pipeline_slots);
 	result["normalization_time"] = py::float_(normalize_time);
 	py::list per_file;
 	for (idx_t file_idx = 0; file_idx < file_count; file_idx++) {
@@ -5542,7 +5630,7 @@ void RegisterDBSGPUFused(py::module_ &m) {
 	m.def("dbs_gpu_read_normalize_tensor", &DBSGPUReadNormalizeTensor, py::arg("fact_paths"),
 	      py::arg("payload_columns") = py::make_tuple("T", "u", "v", "qv", "hgt", "p"),
 	      py::arg("grid_start") = 0, py::arg("grid_count") = 15002, py::arg("lib_path") = "",
-	      py::arg("eps") = 1.0e-6);
+	      py::arg("eps") = 1.0e-6, py::arg("reader_threads") = 1, py::arg("pipeline_slots") = 2);
 }
 
 } // namespace duckdb
