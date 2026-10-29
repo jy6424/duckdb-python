@@ -113,7 +113,7 @@ def main():
     print("[number of input file]: {}".format(len(parquet_paths)))
     print("[read mode]: {}".format(args.read_mode))
     print("[gpu mode]: {}".format(args.mode))
-    print("[payload columns]: {}".format(",".join(result["payload_columns"])))
+    print("[variable count]: {}".format(len(result["payload_columns"])))
     print("[query time]: {:.6f}s".format(float(result["query_time"])))
     print("[wrapper time]: {:.6f}s".format(elapsed))
 

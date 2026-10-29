@@ -81,7 +81,7 @@ def main():
     print("\n[Row Count]")
     print(result["row_count"])
     print("[number of input file]: {}".format(result["input_file_count"]))
-    print("[payload columns]: {}".format(",".join(result["payload_columns"])))
+    print("[variable count]: {}".format(len(result["payload_columns"])))
     print("[query time]: {:.6f}s".format(float(result["query_time"])))
     print("[wrapper time]: {:.6f}s".format(elapsed))
 
